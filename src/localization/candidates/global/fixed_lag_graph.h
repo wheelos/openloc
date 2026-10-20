@@ -37,6 +37,8 @@ class FixedLagGraph {
   Result Initialize(const LocalState& local, const GlobalObservation& anchor);
   Result AddLocal(const LocalState& local, const MotionIncrement& motion);
   // Only exact retained measurement times; never use a nearest keyframe.
+  // Point factors constrain only the supplied XY/XYZ antenna coordinates.
+  // Partial observations neither bootstrap nor renew the full-pose lease.
   Result Observe(const GlobalObservation& observation);
   bool initialized() const;
   const GlobalState& state() const;

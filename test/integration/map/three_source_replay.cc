@@ -12,45 +12,20 @@
 #include <vector>
 
 #include "candidates/global/global_alignment.h"
+#include "candidates/global/map_observation_adapter.h"
 #include "openloc/localization/map/scan_to_map.h"
 #include "pcl/io/pcd_io.h"
+#include "test/integration/map/replay_csv.h"
 
 namespace {
 namespace u = openloc::localization::unified;
 namespace m = openloc::localization::map;
-
-bool ReadLine(std::istream& input, std::string* line) {
-  if (!std::getline(input, *line)) return false;
-  if (!line->empty() && line->back() == '\r') line->pop_back();
-  return true;
-}
-
-std::vector<std::string> Fields(const std::string& line) {
-  std::istringstream input(line);
-  std::vector<std::string> result;
-  std::string field;
-  while (std::getline(input, field, ',')) {
-    if (!field.empty() && field.back() == '\r') field.pop_back();
-    result.push_back(field);
-  }
-  return result;
-}
-
-double Number(const std::string& field) {
-  std::size_t used = 0;
-  const double value = std::stod(field, &used);
-  if (used != field.size() || !std::isfinite(value))
-    throw std::runtime_error("invalid finite scalar");
-  return value;
-}
-
-int64_t Time(const std::string& field) {
-  std::size_t used = 0;
-  const int64_t value = std::stoll(field, &used);
-  if (used != field.size() || value <= 0)
-    throw std::runtime_error("invalid integer timestamp");
-  return value;
-}
+using openloc::replay::Fields;
+using openloc::replay::Matrix;
+using openloc::replay::Number;
+using openloc::replay::ReadLine;
+using openloc::replay::Text;
+using openloc::replay::Time;
 
 Eigen::Isometry3d Pose(const std::vector<std::string>& fields,
                        std::size_t offset) {
@@ -67,28 +42,6 @@ Eigen::Isometry3d Pose(const std::vector<std::string>& fields,
 
 void Require(const u::Result& result) {
   if (!result.ok()) throw std::runtime_error(result.message);
-}
-
-void Text(std::ostream& output, const std::string& value) {
-  output << '"';
-  for (char c : value) {
-    if (c == '"') output << '"';
-    output << c;
-  }
-  output << '"';
-}
-
-void Matrix(std::ostream& output, const Eigen::MatrixXd& matrix) {
-  std::ostringstream values;
-  values << std::setprecision(17);
-  for (Eigen::Index row = 0; row < matrix.rows(); ++row) {
-    if (row) values << '|';
-    for (Eigen::Index col = 0; col < matrix.cols(); ++col) {
-      if (col) values << ';';
-      values << matrix(row, col);
-    }
-  }
-  Text(output, values.str());
 }
 
 int Replay(char** argv) {
@@ -115,6 +68,9 @@ int Replay(char** argv) {
   u::GlobalConfig config;
   config.map_id = "frozen-map";
   config.map_version = "v1";
+  config.map_content_id = "caller-hash-pinned";
+  config.map_frame = "map";
+  config.base_frame = "body";
   config.calibration_id = "manual-unqualified";
   config.diagnostic_only = true;
   // Sparse sampling is not an online freshness qualification.
@@ -124,6 +80,7 @@ int Replay(char** argv) {
   m::ScanToMapConfig matcher_config;
   matcher_config.map_frame = "map";
   matcher_config.base_frame = matcher_config.cloud_frame = "body";
+  matcher_config.calibration_id = config.calibration_id;
   matcher_config.separate_ndt_support = true;
   m::ScanToMapLocalizer matcher(matcher_config);
   if (mode == "map" || mode == "all") {
@@ -142,6 +99,13 @@ int Replay(char** argv) {
     if (!matcher.Configure(metadata, cloud, &error))
       throw std::runtime_error(error);
   }
+  u::MapObservationContract map_contract;
+  map_contract.map_id = config.map_id;
+  map_contract.map_version = config.map_version;
+  map_contract.map_content_id = "caller-hash-pinned";
+  map_contract.map_frame = matcher_config.map_frame;
+  map_contract.base_frame = matcher_config.base_frame;
+  map_contract.calibration_id = config.calibration_id;
   std::ofstream output(argv[4]);
   if (!output) throw std::runtime_error("cannot open output");
   output << std::setprecision(17);
@@ -154,15 +118,14 @@ int Replay(char** argv) {
             "alignment_covariance,correction_translation_m,"
             "correction_rotation_rad,alignment_initialized,global_trusted,"
             "odom_qx,odom_qy,odom_qz,odom_qw\n";
-  int64_t first = 0, previous = 0;
+  int64_t previous = 0;
   uint64_t sequence = 0;
   while (ReadLine(input, &line)) {
     const auto f = Fields(line);
     if (f.size() != 15) throw std::runtime_error("invalid field count");
     const int64_t ns = Time(f[0]);
     if (ns <= previous) throw std::runtime_error("nonmonotonic event");
-    if (first == 0) first = ns;
-    const double time = 1.0 + static_cast<double>(ns - first) * 1e-9;
+    const double time = static_cast<double>(ns) * 1e-9;
     const auto odom = Pose(f, 1);
     const double pos_variance = Number(f[13]);
     const double rot_variance = Number(f[14]);
@@ -191,9 +154,14 @@ int Replay(char** argv) {
     const auto before = owner.Predict(time).map_to_odom * odom;
     u::GlobalObservation observation;
     observation.stamp = local.stamp;
+    observation.measurement_timestamp_ns = ns;
+    observation.receive_timestamp_ns = ns;
     observation.epoch = local.epoch;
     observation.map_id = config.map_id;
     observation.map_version = config.map_version;
+    observation.map_content_id = config.map_content_id;
+    observation.map_frame = config.map_frame;
+    observation.base_frame = config.base_frame;
     observation.calibration_id = config.calibration_id;
     observation.quality_valid = true;
     observation.uncertainty_qualified = false;
@@ -235,21 +203,20 @@ int Replay(char** argv) {
       match = matcher.Match(request);
       map_reason = match.reason;
       if (match.valid) {
-        observation.source = "map";
-        observation.point_in_base.setZero();
-        observation.pose = match.map_from_base;
-        observation.kind = match.geometry_full_rank
-                               ? u::GlobalObservation::Kind::POSE
-                               : u::GlobalObservation::Kind::PROJECTED_POSE;
-        observation.covariance = match.covariance;
-        observation.projection = match.observed_projection;
-        observation.projected_covariance = match.observed_covariance;
-        const auto status = owner.Observe(observation);
-        map_accepted = status.ok();
-        map_reason = u::ReasonName(status.reason);
-        if (!status.ok() && status.reason != u::Reason::INNOVATION_REJECTED &&
-            status.reason != u::Reason::RELOCALIZATION_VERIFYING)
-          Require(status);
+        u::GlobalObservation map_observation;
+        const auto adapted = u::AdaptScanToMapObservation(
+            match, local, map_contract, u::MapObservationTiming{ns, sequence},
+            &map_observation);
+        if (!adapted.ok()) {
+          map_reason = u::ReasonName(adapted.reason);
+        } else {
+          const auto status = owner.Observe(map_observation);
+          map_accepted = status.ok();
+          map_reason = u::ReasonName(status.reason);
+          if (!status.ok() && status.reason != u::Reason::INNOVATION_REJECTED &&
+              status.reason != u::Reason::RELOCALIZATION_VERIFYING)
+            Require(status);
+        }
       }
     }
     u::LocalState retained;

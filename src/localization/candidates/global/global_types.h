@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <optional>
+
 #include "candidates/common/types.h"
 
 namespace openloc {
@@ -16,6 +18,9 @@ struct GlobalConfig {
   std::string clock_id = "unix";
   std::string map_id;
   std::string map_version;
+  std::string map_content_id;
+  std::string map_frame;
+  std::string base_frame;
   std::string calibration_id;
   double history_duration = 3.0;
   double max_interpolation_gap = 0.05;
@@ -49,11 +54,19 @@ struct GlobalObservation {
   enum class Kind { POSE, POSITION, PROJECTED_POSE, HORIZONTAL_POSITION };
   Kind kind = Kind::POSE;
   Stamp stamp;
+  // Exact source times, when supplied. Stamp remains the legacy double-second
+  // backend representation, not a nanosecond-precision history.
+  std::optional<int64_t> measurement_timestamp_ns;
+  std::optional<int64_t> receive_timestamp_ns;
   Epoch epoch;
   std::string source;
   std::string map_id;
   std::string map_version;
+  std::string map_content_id;
+  std::string map_frame;
+  std::string base_frame;
   std::string calibration_id;
+  std::string covariance_source;
   Eigen::Isometry3d pose = Eigen::Isometry3d::Identity();
   Matrix6d covariance = Matrix6d::Zero();
   // POSITION measures this body-fixed point, not an invented base orientation.
@@ -64,6 +77,10 @@ struct GlobalObservation {
   // Caller source checks passed; this does not imply receiver quality or
   // covariance calibration.
   bool quality_valid = false;
+  bool covariance_calibrated = false;
+  bool diagnostic_only = false;
+  bool physical_up_qualified = false;
+  bool independent_reference = false;
   // True only when the source covariance model is calibrated for this use.
   // Diagnostic replay may consume unqualified covariance, but cannot publish
   // trusted output.
@@ -93,6 +110,9 @@ struct GlobalEvidence {
   GlobalObservation observation;
   LocalState local;
 };
+
+bool ValidGlobalPose(const Eigen::Isometry3d& pose);
+bool ValidGlobalObservationGeometry(const GlobalObservation& observation);
 
 Matrix6d TransformCovarianceBound(const Eigen::Isometry3d& map_base,
                                   const LocalState& local,

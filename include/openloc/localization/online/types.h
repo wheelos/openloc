@@ -23,6 +23,20 @@ struct Timestamp {
   ClockDomain clock_domain = ClockDomain::kUnixEpoch;
 };
 
+enum class GnssCarrierSolution {
+  kInvalid,
+  kFloat,
+  kFixed,
+};
+
+struct GnssReceiverQuality {
+  GnssCarrierSolution carrier_solution = GnssCarrierSolution::kInvalid;
+  uint32_t satellite_count = 0;
+  double hdop = 0.0;
+  double differential_age_seconds = 0.0;
+  double horizontal_accuracy_m = 0.0;
+};
+
 struct FrameId {
   std::string value;
 };

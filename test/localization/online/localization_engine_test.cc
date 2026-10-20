@@ -93,6 +93,7 @@ GnssHeading Heading(int64_t timestamp_ns, double azimuth_rad) {
 LocalizationConfig TestConfig() {
   LocalizationConfig config;
   config.map_reference = SyntheticMapReference();
+  config.odom_gravity_contract = OdomGravityContract::kGravityAligned;
   config.gnss_baseline_in_base = Eigen::Vector3d(1.0, 0.0, 0.0);
   config.fixed_solution_stability_ns = 0;
   config.minimum_heading_admission_interval_ns = 0;
@@ -125,6 +126,14 @@ bool TestDualAntennaHeadingInitializationAndGate() {
   LocalizationResult result;
   if (!Expect(engine.GetResult(&result).ok() && result.heading_initialized,
               "accepted heading should set heading_initialized") ||
+      !Expect(
+          result.observability.heading &&
+              !result.observability.horizontal_position &&
+              !result.observability.vertical_position &&
+              result.calibration_state == GeodeticReferenceState::kVerified &&
+              result.odom_gravity_contract ==
+                  OdomGravityContract::kGravityAligned,
+          "result must report only directly observed alignment components") ||
       !Expect(!result.global_alignment_valid,
               "heading alone must not initialize global position") ||
       !Expect(std::abs(result.map_from_odom[3] - expected_heading) < 0.02,
@@ -230,6 +239,50 @@ bool TestPositionOnlyConfigurationNeedsNoHeadingBaseline() {
   LocalizationResult result;
   return Expect(engine.GetResult(&result).ok() && result.global_alignment_valid,
                 "position-only alignment should become globally valid");
+}
+
+bool TestGravityFrameContractAndRollPitchOdometry() {
+  LocalizationConfig unspecified = TestConfig();
+  unspecified.odom_gravity_contract = OdomGravityContract::kUnspecified;
+  if (!Expect(LocalizationEngine().Configure(unspecified).code() ==
+                  StatusCode::kInvalidArgument,
+              "4DoF alignment must reject an unspecified ODOM gravity frame")) {
+    return false;
+  }
+
+  LocalizationConfig config = TestConfig();
+  config.gnss_antenna_in_base.setZero();
+  LocalizationEngine engine;
+  OdometrySample first = Odometry(kStartTimeNs, 0.0);
+  first.pose.rotation = Eigen::AngleAxisd(0.12, Eigen::Vector3d::UnitX()) *
+                        Eigen::AngleAxisd(-0.08, Eigen::Vector3d::UnitY());
+  OdometrySample second = Odometry(kStartTimeNs + 1'000'000'000LL, 1.0);
+  second.pose.rotation = Eigen::AngleAxisd(-0.1, Eigen::Vector3d::UnitX()) *
+                         Eigen::AngleAxisd(0.06, Eigen::Vector3d::UnitY());
+  if (!Expect(
+          engine.Configure(config).ok() && engine.AddOdometry(first).ok() &&
+              engine
+                  .SubmitGnssHorizontalFix(HorizontalFix(
+                      first.timestamp.nanoseconds, Eigen::Vector2d::Zero()))
+                  .ok() &&
+              engine.AddOdometry(second).ok() &&
+              engine
+                  .SubmitGnssHorizontalFix(HorizontalFix(
+                      second.timestamp.nanoseconds, Eigen::Vector2d(1.0, 0.0)))
+                  .ok(),
+          "horizontal consistency must use the declared level ODOM axes "
+          "without assuming a level body pose")) {
+    return false;
+  }
+  LocalizationResult result;
+  return Expect(
+      engine.GetResult(&result).ok() &&
+          result.observability.horizontal_position &&
+          !result.observability.vertical_position &&
+          !result.observability.heading &&
+          result.calibration_state == GeodeticReferenceState::kVerified,
+      "diagnostic observability must report only directly measured "
+      "alignment components");
 }
 
 bool TestHorizontalFixSharesAdmissionWithoutInventingHeight() {
@@ -1532,6 +1585,7 @@ int main() {
   using openloc::localization::TestFirstQualifiedFixInitializesGlobalAlignment;
   using openloc::localization::TestGeodeticReferenceConfigurationIsFailClosed;
   using openloc::localization::TestGnssUpdateLeavesOdometryInputUnchanged;
+  using openloc::localization::TestGravityFrameContractAndRollPitchOdometry;
   using openloc::localization::
       TestHorizontalFixPreservesPreviouslyObservedHeight;
   using openloc::localization::
@@ -1562,6 +1616,7 @@ int main() {
                  TestTranslatedOdometryOriginPreservesPhysicalEstimateAndCovariance() &&
                  TestTrackingIsBoundedAndStopsOnStaleEvidence() &&
                  TestConfigurationAndLifecycle() &&
+                 TestGravityFrameContractAndRollPitchOdometry() &&
                  TestDualAntennaHeadingInitializationAndGate() &&
                  TestPendingFixUsesSensorTimestampAndBracket() &&
                  TestFirstQualifiedFixInitializesGlobalAlignment() &&

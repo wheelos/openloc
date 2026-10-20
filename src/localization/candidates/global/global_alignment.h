@@ -32,6 +32,7 @@ class GlobalAlignment {
   Result AddLocal(const LocalState& state,
                   const MotionIncrement* motion = nullptr);
   Result Lookup(double time, LocalState* state) const;
+  Result LookupExact(double time, LocalState* state) const;
   Result Observe(const GlobalObservation& observation);
   Result Evaluate(double now) const;
   GlobalState Predict(double time) const;

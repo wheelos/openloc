@@ -44,6 +44,59 @@ Status ValidateFrameId(const FrameId& frame) {
   return Status::Ok();
 }
 
+Status ValidateGeodeticReference(const GeodeticReference& reference) {
+  const auto finite = [](const std::optional<double>& value) {
+    return !value.has_value() || std::isfinite(*value);
+  };
+  const auto has_text = [](const std::string& value) {
+    return value.find_first_not_of(" \t\r\n") != std::string::npos;
+  };
+  const bool has_origin = reference.enu_origin_latitude_deg.has_value() &&
+                          reference.enu_origin_longitude_deg.has_value() &&
+                          reference.enu_origin_height_m.has_value();
+  const bool has_partial_origin =
+      reference.enu_origin_latitude_deg.has_value() ||
+      reference.enu_origin_longitude_deg.has_value() ||
+      reference.enu_origin_height_m.has_value();
+  if (!finite(reference.coordinate_epoch_decimal_year) ||
+      !finite(reference.enu_origin_latitude_deg) ||
+      !finite(reference.enu_origin_longitude_deg) ||
+      !finite(reference.enu_origin_height_m) ||
+      has_partial_origin != has_origin ||
+      (has_origin && (*reference.enu_origin_latitude_deg < -90.0 ||
+                      *reference.enu_origin_latitude_deg > 90.0 ||
+                      *reference.enu_origin_longitude_deg < -180.0 ||
+                      *reference.enu_origin_longitude_deg > 180.0))) {
+    return Invalid(StatusCode::kInvalidArgument,
+                   "geodetic reference contains invalid coordinates");
+  }
+  switch (reference.state) {
+    case GeodeticReferenceState::kVerified:
+      if (!has_text(reference.horizontal_crs_realization) ||
+          !reference.coordinate_epoch_decimal_year.has_value() ||
+          *reference.coordinate_epoch_decimal_year <= 0.0 ||
+          !has_text(reference.vertical_datum) || !has_origin) {
+        return Invalid(
+            StatusCode::kInvalidArgument,
+            "verified geodetic reference requires CRS realization, epoch, "
+            "vertical datum, and ENU origin");
+      }
+      return Status::Ok();
+    case GeodeticReferenceState::kDiagnosticOnly:
+      if (reference.coordinate_epoch_decimal_year.has_value() &&
+          *reference.coordinate_epoch_decimal_year <= 0.0) {
+        return Invalid(StatusCode::kInvalidArgument,
+                       "diagnostic geodetic reference has invalid epoch");
+      }
+      return Status::Ok();
+    case GeodeticReferenceState::kUnspecified:
+      return Invalid(StatusCode::kInvalidArgument,
+                     "geodetic reference state must be explicit");
+  }
+  return Invalid(StatusCode::kInvalidArgument,
+                 "geodetic reference state is invalid");
+}
+
 Status ValidatePose(const Pose& pose, double quaternion_norm_tolerance) {
   if (!pose.translation.allFinite() || !pose.rotation.coeffs().allFinite()) {
     return Invalid(StatusCode::kInvalidArgument,

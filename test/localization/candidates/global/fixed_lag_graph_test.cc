@@ -5,9 +5,13 @@
 // http://www.apache.org/licenses/LICENSE-2.0
 
 #include "candidates/global/fixed_lag_graph.h"
-#include "candidates/global/global_alignment.h"
+
+#include <cmath>
+#include <limits>
 
 #include "gtest/gtest.h"
+
+#include "candidates/global/global_alignment.h"
 
 namespace openloc {
 namespace localization {
@@ -66,11 +70,104 @@ TEST(FixedLagGraphTest, PositionOrCorrelatedEvidenceCannotCreateAnAnchor) {
   EXPECT_EQ(Reason::GLOBAL_UNAVAILABLE,
             graph.Initialize(Local(0), observation).reason);
   EXPECT_FALSE(graph.initialized());
+  observation.kind = GlobalObservation::Kind::HORIZONTAL_POSITION;
+  EXPECT_EQ(Reason::GLOBAL_UNAVAILABLE,
+            graph.Initialize(Local(0), observation).reason);
+  EXPECT_FALSE(graph.initialized());
   observation.kind = GlobalObservation::Kind::POSE;
   observation.independent_of_local = false;
   EXPECT_EQ(Reason::INVALID_INPUT,
             graph.Initialize(Local(0), observation).reason);
   EXPECT_FALSE(graph.state().valid);
+}
+
+TEST(FixedLagGraphTest, HorizontalEvidencePreservesTheUnobservedSubspace) {
+  FixedLagGraph graph(Policy());
+  ASSERT_TRUE(graph.Initialize(Local(0), Observation(Local(0), 1)).ok());
+  const auto before = graph.state();
+  auto fix = Observation(Local(0), 1);
+  fix.source = "independent-gnss-xy";
+  fix.kind = GlobalObservation::Kind::HORIZONTAL_POSITION;
+  fix.pose.translation().head<2>() = Eigen::Vector2d(100.03, 0.04);
+  // Only XY and its 2x2 covariance are observations, not these unused fields.
+  fix.pose.translation().z() = std::numeric_limits<double>::quiet_NaN();
+  fix.pose.linear().setConstant(std::numeric_limits<double>::quiet_NaN());
+  fix.covariance.setConstant(std::numeric_limits<double>::quiet_NaN());
+  fix.covariance.topLeftCorner<2, 2>() << 0.02, 0.005, 0.005, 0.01;
+  const auto observed = graph.Observe(fix);
+  ASSERT_TRUE(observed.ok()) << observed.message;
+  const auto& after = graph.state();
+  EXPECT_GT(after.map_to_odom.translation().x(), 100.0);
+  EXPECT_GT(after.map_to_odom.translation().y(), 0.0);
+  EXPECT_NEAR(before.map_to_odom.translation().z(),
+              after.map_to_odom.translation().z(), 1e-8);
+  EXPECT_TRUE(
+      before.map_to_odom.linear().isApprox(after.map_to_odom.linear(), 1e-8));
+  EXPECT_NEAR(before.covariance(2, 2), after.covariance(2, 2), 1e-8);
+  EXPECT_TRUE((before.covariance.bottomRightCorner<3, 3>().isApprox(
+      after.covariance.bottomRightCorner<3, 3>(), 1e-8)));
+  EXPECT_GT(std::abs(after.covariance(0, 1)), 1e-8);
+  EXPECT_DOUBLE_EQ(before.last_full_observation, after.last_full_observation);
+  EXPECT_EQ(before.correction_id + 1, after.correction_id);
+}
+
+TEST(FixedLagGraphTest, DelayedHorizontalFactorUsesItsHistoricalAntennaPose) {
+  FixedLagGraph graph(Policy());
+  auto first = Local(0);
+  first.position = Eigen::Vector3d(1.0, 2.0, 3.0);
+  auto anchor = Observation(first, 1);
+  anchor.pose = Pose(first);
+  anchor.pose.translation().x() += 100.0;
+  ASSERT_TRUE(graph.Initialize(first, anchor).ok());
+  auto previous = first;
+  for (uint64_t index = 1; index <= 3; ++index) {
+    auto local = Local(index);
+    local.position = first.position + Eigen::Vector3d(index, 0.0, 0.0);
+    local.orientation = Eigen::Quaterniond(
+        Eigen::AngleAxisd(0.1 * index, Eigen::Vector3d::UnitZ()));
+    const auto motion = Motion(previous, local);
+    ASSERT_TRUE(graph.AddLocal(local, motion).ok());
+    previous = local;
+  }
+  auto historical = Local(1);
+  historical.position = first.position + Eigen::Vector3d(1.0, 0.0, 0.0);
+  historical.orientation =
+      Eigen::Quaterniond(Eigen::AngleAxisd(0.1, Eigen::Vector3d::UnitZ()));
+  auto fix = Observation(historical, 1);
+  fix.source = "independent-delayed-xy";
+  fix.kind = GlobalObservation::Kind::HORIZONTAL_POSITION;
+  fix.point_in_base = Eigen::Vector3d(1.2, -0.3, 0.4);
+  const Eigen::Vector3d measured =
+      Eigen::Vector3d(100.0, 0.0, 0.0) + Pose(historical) * fix.point_in_base;
+  fix.pose.translation().head<2>() = measured.head<2>();
+  fix.stamp.receive_time = previous.stamp.time;
+  const auto before = graph.state();
+  const auto observed = graph.Observe(fix);
+  ASSERT_TRUE(observed.ok()) << observed.message;
+  EXPECT_TRUE(before.map_to_odom.matrix().isApprox(
+      graph.state().map_to_odom.matrix(), 1e-6));
+  EXPECT_DOUBLE_EQ(first.stamp.time, graph.state().last_full_observation);
+  EXPECT_DOUBLE_EQ(historical.stamp.time, graph.state().last_observation);
+  EXPECT_DOUBLE_EQ(previous.stamp.time, graph.state().covariance_time);
+  EXPECT_EQ(Reason::DUPLICATE, graph.Observe(fix).reason);
+}
+
+TEST(FixedLagGraphTest, InvalidHorizontalNoiseDoesNotConsumeTheObservation) {
+  FixedLagGraph graph(Policy());
+  ASSERT_TRUE(graph.Initialize(Local(0), Observation(Local(0), 1)).ok());
+  auto fix = Observation(Local(0), 1);
+  fix.source = "independent-xy";
+  fix.kind = GlobalObservation::Kind::HORIZONTAL_POSITION;
+  fix.covariance.topLeftCorner<2, 2>() << 1.0, 2.0, 2.0, 1.0;
+  const auto before = graph.state();
+  EXPECT_EQ(Reason::INVALID_INPUT, graph.Observe(fix).reason);
+  EXPECT_EQ(before.correction_id, graph.state().correction_id);
+  EXPECT_TRUE(before.covariance.isApprox(graph.state().covariance, 0.0));
+  fix.covariance.topLeftCorner<2, 2>().setIdentity();
+  fix.independent_of_local = false;
+  EXPECT_EQ(Reason::INVALID_INPUT, graph.Observe(fix).reason);
+  fix.independent_of_local = true;
+  EXPECT_TRUE(graph.Observe(fix).ok());
 }
 
 TEST(FixedLagGraphTest, UnmodeledLocalCovarianceCannotAnchorOrAdvanceGraph) {
@@ -91,7 +188,8 @@ TEST(FixedLagGraphTest, UnmodeledLocalCovarianceCannotAnchorOrAdvanceGraph) {
       graph.state().map_to_odom.matrix()));
 }
 
-TEST(FixedLagGraphTest, DelayedPositionUsesItsOwnStateWithoutRefreshingFullLease) {
+TEST(FixedLagGraphTest,
+     DelayedPositionUsesItsOwnStateWithoutRefreshingFullLease) {
   FixedLagGraph graph(Policy());
   ASSERT_TRUE(graph.Initialize(Local(0), Observation(Local(0), 1)).ok());
   for (uint64_t index = 1; index <= 3; ++index) {
@@ -148,13 +246,39 @@ TEST(FixedLagGraphTest, RejectedUpdatesLeaveTheCommittedSnapshotUntouched) {
   wrong_epoch.epoch.generation = 2;
   EXPECT_EQ(Reason::EPOCH_MISMATCH,
             graph.AddLocal(wrong_epoch, Motion(local, Local(1))).reason);
-  EXPECT_TRUE(before.map_to_odom.matrix().isApprox(
-      graph.state().map_to_odom.matrix()));
+  EXPECT_TRUE(
+      before.map_to_odom.matrix().isApprox(graph.state().map_to_odom.matrix()));
   EXPECT_TRUE(before.covariance.isApprox(graph.state().covariance));
   EXPECT_EQ(before.correction_id, graph.state().correction_id);
   EXPECT_EQ(before.last_observation, graph.state().last_observation);
   EXPECT_TRUE(local.position.isZero());
   EXPECT_TRUE(local.covariance.isApprox(Local(0).covariance));
+}
+
+TEST(FixedLagGraphTest,
+     RejectsMapContentAndFrameChangesWithoutConsumingIdentity) {
+  FixedLagGraph graph(Policy());
+  auto anchor = Observation(Local(0), 1);
+  anchor.map_content_id = "survey-content";
+  anchor.map_frame = "map";
+  anchor.base_frame = "body";
+  ASSERT_TRUE(graph.Initialize(Local(0), anchor).ok());
+  auto observation = anchor;
+  observation.source = "independent-survey-2";
+  const auto revision = graph.state().correction_id;
+  observation.map_content_id = "other-content";
+  EXPECT_EQ(Reason::MAP_MISMATCH, graph.Observe(observation).reason);
+  observation = anchor;
+  observation.source = "independent-survey-2";
+  observation.map_frame = "another-map-frame";
+  EXPECT_EQ(Reason::MAP_MISMATCH, graph.Observe(observation).reason);
+  observation.map_frame = anchor.map_frame;
+  observation.base_frame = "another-body-frame";
+  EXPECT_EQ(Reason::MAP_MISMATCH, graph.Observe(observation).reason);
+  EXPECT_EQ(revision, graph.state().correction_id);
+  observation.base_frame = anchor.base_frame;
+  ASSERT_TRUE(graph.Observe(observation).ok());
+  EXPECT_EQ(revision + 1, graph.state().correction_id);
 }
 
 TEST(FixedLagGraphTest, ProjectedEvidenceDoesNotClaimTheNullDirection) {
@@ -183,12 +307,14 @@ TEST(FixedLagGraphTest, OwnerRequiresExplicitMotionQualification) {
   config.map_version = "v1";
   config.calibration_id = "calibrated";
   config.enable_fixed_lag_graph = true;
-  EXPECT_EQ(Reason::CONFIG_INVALID, GlobalAlignment(config).ValidateConfig().reason);
+  EXPECT_EQ(Reason::CONFIG_INVALID,
+            GlobalAlignment(config).ValidateConfig().reason);
   config.motion_error_model_qualified = true;
   EXPECT_TRUE(GlobalAlignment(config).ValidateConfig().ok());
 }
 
-TEST(FixedLagGraphTest, GlobalOwnerRecoversAfterLostMotionWithoutResettingOdom) {
+TEST(FixedLagGraphTest,
+     GlobalOwnerRecoversAfterLostMotionWithoutResettingOdom) {
   GlobalConfig config;
   config.map_id = "site";
   config.map_version = "v1";
@@ -209,7 +335,8 @@ TEST(FixedLagGraphTest, GlobalOwnerRecoversAfterLostMotionWithoutResettingOdom) 
   // Miss Local(2) on the transport. Do not request a local reset or freeze
   // the global history forever at Local(1).
   motion = Motion(Local(2), Local(3));
-  EXPECT_EQ(Reason::HISTORY_UNAVAILABLE, owner.AddLocal(Local(3), &motion).reason);
+  EXPECT_EQ(Reason::HISTORY_UNAVAILABLE,
+            owner.AddLocal(Local(3), &motion).reason);
   EXPECT_FALSE(owner.state().valid);
   ASSERT_NE(nullptr, owner.latest_local());
   EXPECT_DOUBLE_EQ(Local(3).stamp.time, owner.latest_local()->stamp.time);
@@ -221,6 +348,71 @@ TEST(FixedLagGraphTest, GlobalOwnerRecoversAfterLostMotionWithoutResettingOdom) 
   ASSERT_TRUE(owner.Observe(Observation(Local(4), 4)).ok());
   EXPECT_TRUE(owner.state().valid);
   EXPECT_EQ(Local(0).epoch, owner.state().epoch);
+}
+
+TEST(FixedLagGraphTest, GlobalOwnerRoutesMapAndHorizontalFactorsToOneGraph) {
+  GlobalConfig config;
+  config.map_id = "site";
+  config.map_version = "v1";
+  config.calibration_id = "calibrated";
+  config.enable_fixed_lag_graph = true;
+  config.motion_error_model_qualified = true;
+  config.graph_solve_budget_ms = 100000.0;
+  config.verification_frames = 2;
+  GlobalAlignment owner(config);
+  ASSERT_TRUE(owner.AddLocal(Local(0)).ok());
+  EXPECT_EQ(Reason::RELOCALIZATION_VERIFYING,
+            owner.Observe(Observation(Local(0), 1)).reason);
+  auto motion = Motion(Local(0), Local(1));
+  ASSERT_TRUE(owner.AddLocal(Local(1), &motion).ok());
+  ASSERT_TRUE(owner.Observe(Observation(Local(1), 2)).ok());
+  const auto revision = owner.state().correction_id;
+  auto fix = Observation(Local(1), 1);
+  fix.source = "independent-gnss-xy";
+  fix.kind = GlobalObservation::Kind::HORIZONTAL_POSITION;
+  fix.pose.translation().y() = 0.01;
+  ASSERT_TRUE(owner.Observe(fix).ok());
+  EXPECT_EQ(revision + 1, owner.state().correction_id);
+  EXPECT_DOUBLE_EQ(Local(1).stamp.time, owner.state().last_full_observation);
+  EXPECT_EQ(1u, owner.sources().at(fix.source).accepted);
+  LocalState retained;
+  ASSERT_TRUE(owner.Lookup(Local(1).stamp.time, &retained).ok());
+  EXPECT_TRUE(retained.position.isApprox(Local(1).position, 0.0));
+  EXPECT_TRUE(retained.covariance.isApprox(Local(1).covariance, 0.0));
+  EXPECT_EQ(Local(1).epoch, retained.epoch);
+}
+
+TEST(FixedLagGraphTest, FailedBootstrapDoesNotCommitACorrectionRevision) {
+  GlobalConfig config;
+  config.map_id = "site";
+  config.map_version = "v1";
+  config.calibration_id = "calibrated";
+  config.enable_fixed_lag_graph = true;
+  config.motion_error_model_qualified = true;
+  config.graph_solve_budget_ms = 100000.0;
+  config.verification_frames = 2;
+  GlobalAlignment owner(config);
+  auto local = Local(0);
+  // Pose covariance is positive but the full local error model is not SPD.
+  local.covariance(3, 3) = -1.0;
+  ASSERT_TRUE(owner.AddLocal(local).ok());
+  EXPECT_EQ(Reason::RELOCALIZATION_VERIFYING,
+            owner.Observe(Observation(local, 1)).reason);
+  local = Local(1);
+  local.covariance(3, 3) = -1.0;
+  auto motion = MotionIncrement{};
+  motion.epoch = local.epoch;
+  motion.start = Local(0).stamp;
+  motion.end = local.stamp;
+  ASSERT_TRUE(owner.AddLocal(local, &motion).ok());
+  const auto before = owner.state();
+  EXPECT_EQ(Reason::GLOBAL_UNAVAILABLE,
+            owner.Observe(Observation(local, 2)).reason);
+  EXPECT_FALSE(owner.state().valid);
+  EXPECT_EQ(before.correction_id, owner.state().correction_id);
+  EXPECT_TRUE(before.map_to_odom.matrix().isApprox(
+      owner.state().map_to_odom.matrix(), 0.0));
+  EXPECT_TRUE(before.covariance.isApprox(owner.state().covariance, 0.0));
 }
 
 }  // namespace

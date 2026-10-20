@@ -8,6 +8,7 @@ namespace localization {
 
 Status ValidateTimestamp(const Timestamp& timestamp);
 Status ValidateFrameId(const FrameId& frame);
+Status ValidateGeodeticReference(const GeodeticReference& reference);
 Status ValidatePose(const Pose& pose, double quaternion_norm_tolerance = 1e-6);
 Status ValidateCovariance(const Eigen::MatrixXd& covariance,
                           Eigen::Index dimension);

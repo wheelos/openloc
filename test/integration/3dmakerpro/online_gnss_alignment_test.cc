@@ -408,6 +408,7 @@ TEST(OpenLocDatasetDiagnostic, ReplaysGnssOffOdomWithSameRecordGnss) {
   config.map_frame = "enu";
   config.odom_frame = "camera_init";
   config.base_frame = "body";
+  config.odom_gravity_contract = OdomGravityContract::kDiagnosticAssumption;
   config.map_reference = kDiagnosticMapReference;
   config.gnss_antenna_in_base = kGnssAntennaInFastLioBodyMeters;
   config.odometry_buffer.maximum_interpolation_gap_ns =

@@ -14,20 +14,6 @@
 namespace openloc {
 namespace localization {
 
-enum class GnssCarrierSolution {
-  kInvalid,
-  kFloat,
-  kFixed,
-};
-
-struct GnssReceiverQuality {
-  GnssCarrierSolution carrier_solution = GnssCarrierSolution::kInvalid;
-  uint32_t satellite_count = 0;
-  double hdop = 0.0;
-  double differential_age_seconds = 0.0;
-  double horizontal_accuracy_m = 0.0;
-};
-
 struct GnssFix {
   Timestamp timestamp;
   FrameId frame;
@@ -66,11 +52,21 @@ enum class LargeCorrectionPolicy {
   kRateLimitedTracking,
 };
 
+enum class OdomGravityContract {
+  kUnspecified,
+  kGravityAligned,
+  kDiagnosticAssumption,
+};
+
 struct LocalizationConfig {
   /// Name of the configured global frame (for example, a local ENU frame).
   std::string map_frame = "map";
   std::string odom_frame = "odom";
   std::string base_frame = "base_link";
+  /// The global 4DoF backend assumes ODOM XY is horizontal and +Z is up.
+  /// Callers must assert verified gravity alignment or label the assumption
+  /// diagnostic-only; body roll/pitch does not identify the ODOM frame axes.
+  OdomGravityContract odom_gravity_contract = OdomGravityContract::kUnspecified;
   MapReference map_reference;
   Eigen::Vector3d gnss_antenna_in_base = Eigen::Vector3d::Zero();
   /// Optional heading baseline; required only when submitting GNSS headings.
@@ -149,6 +145,19 @@ struct LocalizationResult {
   OdometryEpoch odometry_epoch;
   /// Identity of the configured global-frame origin and conventions.
   MapReference map_reference;
+  /// Geodetic-reference declaration only; it does not qualify sensor
+  /// calibration, covariance, integrity, or absolute accuracy.
+  GeodeticReferenceState calibration_state =
+      GeodeticReferenceState::kUnspecified;
+  /// Caller gravity declaration; diagnostic assumptions do not qualify axes.
+  OdomGravityContract odom_gravity_contract = OdomGravityContract::kUnspecified;
+  struct Observability {
+    /// Accepted absolute factors directly constrained these components;
+    /// this is not a numerical rank or accuracy certificate.
+    bool horizontal_position = false;
+    bool vertical_position = false;
+    bool heading = false;
+  } observability;
   /// Configured global-frame-from-odom transform; the global frame may be ENU.
   Eigen::Vector4d map_from_odom = Eigen::Vector4d::Zero();
   Eigen::Vector4d backend_map_from_odom = Eigen::Vector4d::Zero();

@@ -12,6 +12,7 @@
 #include "gtest/gtest.h"
 
 #include "Eigen/Cholesky"
+#include "candidates/global/map_observation_adapter.h"
 
 namespace openloc {
 namespace localization {
@@ -164,6 +165,7 @@ TEST(ScanToMapTest, EmitsTimestampedDiagnosticMatchFromBoundedMapWindow) {
   ASSERT_GT(map->size(), local_points);
 
   ScanToMapConfig config = TestConfig();
+  config.calibration_id = "synthetic-calibration";
   const Eigen::Isometry3d base_from_cloud =
       Eigen::Translation3d(0.2, -0.1, 0.05) *
       Eigen::AngleAxisd(0.02, Eigen::Vector3d::UnitZ());
@@ -202,7 +204,9 @@ TEST(ScanToMapTest, EmitsTimestampedDiagnosticMatchFromBoundedMapWindow) {
   EXPECT_EQ("v1", result.map_version);
   EXPECT_EQ("map", result.map_frame);
   EXPECT_EQ("base_link", result.base_frame);
+  EXPECT_EQ("synthetic-calibration", result.calibration_id);
   EXPECT_EQ("pcl_ndt_fitness", result.score_type);
+  EXPECT_EQ("scan_matcher_residual_scaled_hessian", result.covariance_source);
   EXPECT_LT(result.map_window_points, map->size());
   EXPECT_EQ(scan->size(), result.source_points);
   EXPECT_GE(result.matched_points, config.minimum_points);
@@ -222,6 +226,32 @@ TEST(ScanToMapTest, EmitsTimestampedDiagnosticMatchFromBoundedMapWindow) {
   EXPECT_TRUE(std::isfinite(result.processing_time_ms));
   EXPECT_TRUE(result.converged);
   EXPECT_TRUE(result.observability_available);
+  unified::LocalState local;
+  local.stamp = {static_cast<double>(request.timestamp_ns) * 1e-9,
+                 static_cast<double>(request.timestamp_ns) * 1e-9, 1,
+                 request.clock_domain};
+  local.epoch = {"scan-to-map-test", 1};
+  local.valid = true;
+  unified::MapObservationContract contract;
+  contract.map_id = "synthetic-map";
+  contract.map_version = "v1";
+  contract.map_content_id = "content-hash";
+  contract.map_frame = "map";
+  contract.base_frame = "base_link";
+  contract.calibration_id = "synthetic-calibration";
+  unified::GlobalObservation observation;
+  ASSERT_TRUE(unified::AdaptScanToMapObservation(
+                  result, local, contract,
+                  unified::MapObservationTiming{request.timestamp_ns, 1},
+                  &observation)
+                  .ok());
+  EXPECT_EQ(result.geometry_full_rank
+                ? unified::GlobalObservation::Kind::POSE
+                : unified::GlobalObservation::Kind::PROJECTED_POSE,
+            observation.kind);
+  EXPECT_FALSE(observation.uncertainty_qualified);
+  EXPECT_FALSE(observation.independent_of_local);
+  EXPECT_EQ(result.observed_projection.rows(), observation.projection.rows());
   EXPECT_LT(
       (result.map_from_base.translation() - map_from_base.translation()).norm(),
       0.12);
@@ -265,6 +295,7 @@ TEST(ScanToMapTest, SelectsPointToPlaneIcpBackendAndReportsMetricType) {
   ASSERT_EQ(MatchStatus::kMatched, result.status) << result.reason;
   EXPECT_TRUE(result.converged);
   EXPECT_EQ("point_to_plane_rmse_m", result.score_type);
+  EXPECT_EQ("scan_matcher_residual_scaled_hessian", result.covariance_source);
   EXPECT_GE(result.source_overlap, config.icp_minimum_source_overlap);
   EXPECT_GE(result.target_overlap, config.icp_minimum_target_overlap);
   EXPECT_FALSE(result.covariance_calibrated);

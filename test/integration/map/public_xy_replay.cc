@@ -145,6 +145,8 @@ int Replay(char** argv) {
     throw std::runtime_error("explicit diagnostic profile and arm required");
   }
   loc::LocalizationConfig config;
+  config.odom_gravity_contract =
+      loc::OdomGravityContract::kDiagnosticAssumption;
   config.map_reference = {"prepared-xy", "v1", "declared-diagnostic-lever"};
   config.map_reference.geodetic.state =
       loc::GeodeticReferenceState::kDiagnosticOnly;

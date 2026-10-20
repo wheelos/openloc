@@ -64,6 +64,7 @@ struct MapMetadata {
 struct ScanToMapConfig {
   std::string map_frame;
   std::string base_frame;
+  std::string calibration_id;
   std::string score_type = "pcl_ndt_fitness";
   ScanMatchingAlgorithm algorithm = ScanMatchingAlgorithm::kPclNdt;
   std::string cloud_frame;
@@ -136,9 +137,11 @@ struct ScanToMapResult {
   std::string map_content_id;
   std::string map_frame;
   std::string base_frame;
+  std::string calibration_id;
   Eigen::Isometry3d map_from_base = Eigen::Isometry3d::Identity();
   Eigen::Matrix<double, 6, 6> covariance = Eigen::Matrix<double, 6, 6>::Zero();
   std::string score_type;
+  std::string covariance_source;
   bool covariance_calibrated = false;
   bool observability_available = false;
   Eigen::MatrixXd observed_projection;

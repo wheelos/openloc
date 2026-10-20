@@ -152,6 +152,17 @@ cc_library(
 )
 
 cc_library(
+    name = "global_map_observation_adapter",
+    srcs = ["src/localization/candidates/global/map_observation_adapter.cc"],
+    hdrs = ["src/localization/candidates/global/map_observation_adapter.h"],
+    includes = ["src/localization"],
+    deps = [
+        ":global_alignment",
+        ":scan_to_map",
+    ],
+)
+
+cc_library(
     name = "lane_relative",
     srcs = ["src/localization/candidates/relative/lane_relative.cc"],
     hdrs = ["src/localization/candidates/relative/lane_relative.h"],
@@ -248,6 +259,76 @@ cc_library(
 )
 
 cc_library(
+    name = "global_observation_types",
+    hdrs = ["include/openloc/localization/global/observation_types.h"],
+    includes = ["include"],
+    visibility = ["//visibility:public"],
+    deps = [":online_localization_types"],
+)
+
+cc_library(
+    name = "global_alignment_bridge",
+    hdrs = ["src/localization/online/global_alignment_bridge.h"],
+    includes = ["src/localization"],
+    visibility = ["//visibility:private"],
+    deps = [
+        ":global_observation_types",
+        ":global_types",
+    ],
+)
+
+cc_library(
+    name = "diagnostic_global_alignment",
+    srcs = ["src/localization/online/diagnostic_alignment.cc"],
+    hdrs = ["include/openloc/localization/global/diagnostic_alignment.h"],
+    includes = ["include"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":global_alignment",
+        ":global_alignment_bridge",
+        ":global_observation_types",
+        ":online_localization_types",
+        "@eigen",
+    ],
+)
+
+cc_library(
+    name = "fixed_lag_global_alignment",
+    srcs = ["src/localization/online/fixed_lag_alignment.cc"],
+    hdrs = ["include/openloc/localization/global/fixed_lag_alignment.h"],
+    includes = ["include"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":global_alignment",
+        ":global_alignment_bridge",
+        ":global_observation_types",
+        ":local_motion",
+        ":online_localization_types",
+        "@eigen",
+    ],
+)
+
+cc_test(
+    name = "fixed_lag_global_alignment_test",
+    size = "small",
+    srcs = ["test/localization/online/fixed_lag_alignment_test.cc"],
+    deps = [
+        ":fixed_lag_global_alignment",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "diagnostic_global_alignment_test",
+    size = "small",
+    srcs = ["test/localization/online/diagnostic_alignment_test.cc"],
+    deps = [
+        ":diagnostic_global_alignment",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "online_odometry_buffer",
     srcs = ["src/localization/online/odometry_buffer.cc"],
     hdrs = ["include/openloc/localization/online/odometry_buffer.h"],
@@ -278,12 +359,25 @@ cc_library(
 )
 
 cc_library(
+    name = "online_gnss_quality",
+    srcs = ["src/localization/online/gnss_quality_gate.cc"],
+    hdrs = ["src/localization/online/gnss_quality_gate.h"],
+    includes = [
+        "include",
+        "src/localization/online",
+    ],
+    visibility = ["//visibility:private"],
+    deps = [":online_localization_types"],
+)
+
+cc_library(
     name = "localization_online",
     srcs = ["src/localization/online/localization_engine.cc"],
     hdrs = ["include/openloc/localization/online/localization_engine.h"],
     includes = ["include"],
     visibility = ["//visibility:public"],
     deps = [
+        ":online_gnss_quality",
         ":online_alignment_smoother",
         ":online_localization_types",
         ":online_odometry_buffer",
@@ -431,6 +525,16 @@ cc_test(
 )
 
 cc_test(
+    name = "online_gnss_quality_test",
+    size = "small",
+    srcs = ["test/localization/online/gnss_quality_gate_test.cc"],
+    deps = [
+        ":online_gnss_quality",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
     name = "online_gtsam_fixed_lag_spike_test",
     size = "small",
     srcs = ["test/localization/online/gtsam_fixed_lag_spike_test.cc"],
@@ -465,6 +569,7 @@ cc_test(
         ":continuous_output",
         ":four_wheel_kinematics",
         ":global_alignment",
+        ":global_map_observation_adapter",
         ":planar_wheel_dr",
         ":lane_relative",
         ":local_estimator",
@@ -509,6 +614,7 @@ cc_test(
     size = "small",
     srcs = ["test/localization/candidates/map/scan_to_map_test.cc"],
     deps = [
+        ":global_map_observation_adapter",
         ":scan_to_map",
         "@com_google_googletest//:gtest_main",
     ],
@@ -538,10 +644,24 @@ cc_binary(
 )
 
 cc_binary(
+    name = "diagnostic_alignment_replay",
+    testonly = True,
+    srcs = [
+        "test/integration/map/diagnostic_alignment_replay.cc",
+        "test/integration/map/replay_csv.h",
+    ],
+    deps = [":diagnostic_global_alignment"],
+)
+
+cc_binary(
     name = "three_source_dataset_replay",
-    srcs = ["test/integration/map/three_source_replay.cc"],
+    srcs = [
+        "test/integration/map/replay_csv.h",
+        "test/integration/map/three_source_replay.cc",
+    ],
     deps = [
         ":global_alignment",
+        ":global_map_observation_adapter",
         ":scan_to_map",
         "@local_config_pcl//:io",
     ],

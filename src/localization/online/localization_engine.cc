@@ -10,6 +10,7 @@
 
 #include "alignment_recovery.h"
 #include "alignment_smoother.h"
+#include "gnss_quality_gate.h"
 #include "openloc/localization/online/validation.h"
 
 namespace openloc {
@@ -32,57 +33,6 @@ struct PositionFix {
 
 Status Invalid(const std::string& message) {
   return Status(StatusCode::kInvalidArgument, message);
-}
-
-bool HasText(const std::string& value) {
-  return value.find_first_not_of(" \t\r\n") != std::string::npos;
-}
-
-bool IsFinite(const std::optional<double>& value) {
-  return !value.has_value() || std::isfinite(*value);
-}
-
-Status ValidateGeodeticReference(const GeodeticReference& reference) {
-  const bool has_origin = reference.enu_origin_latitude_deg.has_value() &&
-                          reference.enu_origin_longitude_deg.has_value() &&
-                          reference.enu_origin_height_m.has_value();
-  const bool has_partial_origin =
-      reference.enu_origin_latitude_deg.has_value() ||
-      reference.enu_origin_longitude_deg.has_value() ||
-      reference.enu_origin_height_m.has_value();
-  if (!IsFinite(reference.coordinate_epoch_decimal_year) ||
-      !IsFinite(reference.enu_origin_latitude_deg) ||
-      !IsFinite(reference.enu_origin_longitude_deg) ||
-      !IsFinite(reference.enu_origin_height_m) ||
-      has_partial_origin != has_origin ||
-      (has_origin && (*reference.enu_origin_latitude_deg < -90.0 ||
-                      *reference.enu_origin_latitude_deg > 90.0 ||
-                      *reference.enu_origin_longitude_deg < -180.0 ||
-                      *reference.enu_origin_longitude_deg > 180.0))) {
-    return Invalid("geodetic reference contains invalid coordinates");
-  }
-
-  switch (reference.state) {
-    case GeodeticReferenceState::kVerified:
-      if (!HasText(reference.horizontal_crs_realization) ||
-          !reference.coordinate_epoch_decimal_year.has_value() ||
-          *reference.coordinate_epoch_decimal_year <= 0.0 ||
-          !HasText(reference.vertical_datum) || !has_origin) {
-        return Invalid(
-            "verified geodetic reference requires CRS realization, epoch, "
-            "vertical datum, and ENU origin");
-      }
-      return Status::Ok();
-    case GeodeticReferenceState::kDiagnosticOnly:
-      if (reference.coordinate_epoch_decimal_year.has_value() &&
-          *reference.coordinate_epoch_decimal_year <= 0.0) {
-        return Invalid("diagnostic geodetic reference has invalid epoch");
-      }
-      return Status::Ok();
-    case GeodeticReferenceState::kUnspecified:
-      return Invalid("geodetic reference state must be explicit");
-  }
-  return Invalid("geodetic reference state is invalid");
 }
 
 double WrappedAngle(double angle) { return std::remainder(angle, 2.0 * kPi); }
@@ -109,6 +59,22 @@ Eigen::Vector4d PoseDifference(const Eigen::Vector4d& candidate,
   return difference;
 }
 
+internal::GnssQualityGatePolicy GnssQualityPolicy(
+    const LocalizationConfig& config) {
+  internal::GnssQualityGatePolicy policy{};
+  policy.minimum_satellites = config.minimum_satellites;
+  policy.maximum_hdop = config.maximum_hdop;
+  policy.maximum_differential_age_seconds =
+      config.maximum_differential_age_seconds;
+  policy.maximum_horizontal_accuracy_m = config.maximum_horizontal_accuracy_m;
+  policy.maximum_heading_accuracy_rad = config.maximum_heading_accuracy_rad;
+  policy.maximum_baseline_length_error_m =
+      config.maximum_baseline_length_error_m;
+  policy.fixed_solution_stability_ns = config.fixed_solution_stability_ns;
+  policy.maximum_fixed_solution_gap_ns = config.maximum_fixed_solution_gap_ns;
+  return policy;
+}
+
 }  // namespace
 
 class LocalizationEngine::Impl {
@@ -125,6 +91,12 @@ class LocalizationEngine::Impl {
             LargeCorrectionPolicy::kRateLimitedTracking) {
       return Invalid("unknown large correction policy");
     }
+    if (config.odom_gravity_contract != OdomGravityContract::kGravityAligned &&
+        config.odom_gravity_contract !=
+            OdomGravityContract::kDiagnosticAssumption) {
+      return Invalid(
+          "4DoF alignment requires an explicit ODOM gravity contract");
+    }
     if (config.map_reference.id.empty() ||
         config.map_reference.version.empty() ||
         config.map_reference.calibration_id.empty()) {
@@ -134,6 +106,11 @@ class LocalizationEngine::Impl {
         ValidateGeodeticReference(config.map_reference.geodetic);
     if (!geodetic_status.ok()) {
       return geodetic_status;
+    }
+    const Status quality_status =
+        internal::ValidateGnssQualityGatePolicy(GnssQualityPolicy(config));
+    if (!quality_status.ok()) {
+      return quality_status;
     }
     if (config.map_frame.empty() || config.odom_frame.empty() ||
         config.base_frame.empty() || config.map_frame == config.odom_frame ||
@@ -160,18 +137,6 @@ class LocalizationEngine::Impl {
         config.horizontal_innovation_gate_threshold <= 0.0 ||
         !std::isfinite(config.heading_innovation_gate_threshold) ||
         config.heading_innovation_gate_threshold <= 0.0 ||
-        config.minimum_satellites == 0 || !std::isfinite(config.maximum_hdop) ||
-        config.maximum_hdop <= 0.0 ||
-        !std::isfinite(config.maximum_differential_age_seconds) ||
-        config.maximum_differential_age_seconds <= 0.0 ||
-        !std::isfinite(config.maximum_horizontal_accuracy_m) ||
-        config.maximum_horizontal_accuracy_m <= 0.0 ||
-        !std::isfinite(config.maximum_heading_accuracy_rad) ||
-        config.maximum_heading_accuracy_rad <= 0.0 ||
-        !std::isfinite(config.maximum_baseline_length_error_m) ||
-        config.maximum_baseline_length_error_m < 0.0 ||
-        config.fixed_solution_stability_ns < 0 ||
-        config.maximum_fixed_solution_gap_ns <= 0 ||
         config.minimum_gnss_admission_interval_ns < 0 ||
         config.minimum_heading_admission_interval_ns < 0 ||
         !std::isfinite(config.cross_check_absolute_distance_error_m) ||
@@ -216,6 +181,10 @@ class LocalizationEngine::Impl {
       return Invalid("localization engine configuration is immutable");
     }
     Status status = ValidateConfig(requested_config);
+    if (!status.ok()) {
+      return status;
+    }
+    status = quality_gate_.Configure(GnssQualityPolicy(requested_config));
     if (!status.ok()) {
       return status;
     }
@@ -431,13 +400,12 @@ class LocalizationEngine::Impl {
     factor_records_.clear();
     has_odometry_ = false;
     has_submitted_fix_ = false;
-    has_fixed_receiver_solution_ = false;
+    quality_gate_.Reset();
     has_previous_quality_fix_ = false;
     has_admitted_fix_ = false;
     has_admitted_vertical_fix_ = false;
     has_published_alignment_ = false;
     has_submitted_heading_ = false;
-    has_fixed_heading_solution_ = false;
     has_admitted_heading_ = false;
     heading_initialized_ = false;
     distance_since_segment_m_ = 0.0;
@@ -450,18 +418,14 @@ class LocalizationEngine::Impl {
     alignment_revision_ = 0;
     publication_state_ = CorrectionPublicationState::kUninitialized;
     recovery_.Reset();
-    fixed_solution_start_ = 0;
     latest_odometry_timestamp_ns_ = 0;
     last_published_timestamp_ns_ = 0;
     last_submitted_fix_ = Timestamp{};
     last_submitted_heading_ = Timestamp{};
-    last_fixed_timestamp_ = Timestamp{};
-    last_fixed_heading_timestamp_ = Timestamp{};
     last_admitted_fix_ = Timestamp{};
     last_admitted_heading_ = Timestamp{};
     previous_odometry_ = OdometrySample{};
     last_good_fix_ = PositionFix{};
-    heading_solution_start_ns_ = 0;
     result_ = LocalizationResult{};
     result_.reset_event = true;
     const uint32_t next_reset_counter = reset_counter_;
@@ -601,14 +565,17 @@ class LocalizationEngine::Impl {
       AddRejectionRecord(fix, 0, reason, latency_ms);
     };
     std::string rejection_reason;
-    Status status = CheckReceiverQuality(fix, &rejection_reason);
-    if (!status.ok()) {
+    const auto quality =
+        quality_gate_.CheckPosition(fix.timestamp, fix.receiver);
+    if (!quality.status.ok()) {
       // Stability waiting admits no observation, but previously qualified
       // recovery evidence can survive a report gap within its total-age bound.
-      // An actual quality failure clears the fixed flag and recovery history.
-      record_rejection(rejection_reason, !has_fixed_receiver_solution_);
-      return status;
+      record_rejection(quality.status.message(),
+                       quality.outcome !=
+                           internal::GnssQualityOutcome::kWaitingForStability);
+      return quality.status;
     }
+    Status status;
 
     if (!has_odometry_) {
       record_rejection("odometry_unavailable");
@@ -794,11 +761,13 @@ class LocalizationEngine::Impl {
                                     std::chrono::steady_clock::now() - start)
                                     .count());
     };
-    std::string rejection_reason;
-    Status status = CheckHeadingQuality(heading, &rejection_reason);
-    if (!status.ok()) {
-      record_rejection(rejection_reason);
-      return status;
+    const auto quality = quality_gate_.CheckHeading(
+        heading.timestamp, heading.receiver, heading.accuracy_rad,
+        heading.measured_baseline_length_m,
+        config_.gnss_baseline_in_base.norm());
+    if (!quality.status.ok()) {
+      record_rejection(quality.status.message());
+      return quality.status;
     }
     if (!has_odometry_) {
       record_rejection("odometry_unavailable");
@@ -812,7 +781,7 @@ class LocalizationEngine::Impl {
                     "heading and odometry clock domains differ");
     }
     OdometrySample odometry_at_heading;
-    status =
+    Status status =
         odometry_buffer_->Interpolate(heading.timestamp, &odometry_at_heading);
     if (!status.ok()) {
       record_rejection(status.message());
@@ -885,88 +854,6 @@ class LocalizationEngine::Impl {
     has_admitted_heading_ = true;
     last_admitted_heading_ = heading.timestamp;
     return RefreshEstimate();
-  }
-
-  Status CheckHeadingQuality(const GnssHeading& heading,
-                             std::string* rejection_reason) {
-    const GnssReceiverQuality& receiver = heading.receiver;
-    const double configured_baseline_length =
-        config_.gnss_baseline_in_base.norm();
-    if (receiver.carrier_solution != GnssCarrierSolution::kFixed) {
-      has_fixed_heading_solution_ = false;
-      *rejection_reason = "carrier_solution_not_fixed";
-    } else if (receiver.satellite_count < config_.minimum_satellites) {
-      has_fixed_heading_solution_ = false;
-      *rejection_reason = "insufficient_satellites";
-    } else if (receiver.hdop >= config_.maximum_hdop) {
-      has_fixed_heading_solution_ = false;
-      *rejection_reason = "hdop_exceeds_limit";
-    } else if (receiver.differential_age_seconds >=
-               config_.maximum_differential_age_seconds) {
-      has_fixed_heading_solution_ = false;
-      *rejection_reason = "differential_age_exceeds_limit";
-    } else if (heading.accuracy_rad > config_.maximum_heading_accuracy_rad) {
-      has_fixed_heading_solution_ = false;
-      *rejection_reason = "heading_accuracy_exceeds_limit";
-    } else if (std::abs(heading.measured_baseline_length_m -
-                        configured_baseline_length) >
-               config_.maximum_baseline_length_error_m) {
-      has_fixed_heading_solution_ = false;
-      *rejection_reason = "baseline_length_mismatch";
-    } else {
-      if (!has_fixed_heading_solution_ ||
-          heading.timestamp.nanoseconds -
-                  last_fixed_heading_timestamp_.nanoseconds >
-              config_.maximum_fixed_solution_gap_ns) {
-        heading_solution_start_ns_ = heading.timestamp.nanoseconds;
-      }
-      has_fixed_heading_solution_ = true;
-      last_fixed_heading_timestamp_ = heading.timestamp;
-      if (heading.timestamp.nanoseconds - heading_solution_start_ns_ <
-          config_.fixed_solution_stability_ns) {
-        *rejection_reason = "fixed_solution_not_stable";
-      } else {
-        return Status::Ok();
-      }
-    }
-    return Status(StatusCode::kRejectedMeasurement, *rejection_reason);
-  }
-
-  Status CheckReceiverQuality(const PositionFix& fix,
-                              std::string* rejection_reason) {
-    if (fix.receiver.carrier_solution != GnssCarrierSolution::kFixed) {
-      has_fixed_receiver_solution_ = false;
-      *rejection_reason = "carrier_solution_not_fixed";
-    } else if (fix.receiver.satellite_count < config_.minimum_satellites) {
-      has_fixed_receiver_solution_ = false;
-      *rejection_reason = "insufficient_satellites";
-    } else if (fix.receiver.hdop >= config_.maximum_hdop) {
-      has_fixed_receiver_solution_ = false;
-      *rejection_reason = "hdop_exceeds_limit";
-    } else if (fix.receiver.differential_age_seconds >=
-               config_.maximum_differential_age_seconds) {
-      has_fixed_receiver_solution_ = false;
-      *rejection_reason = "differential_age_exceeds_limit";
-    } else if (fix.receiver.horizontal_accuracy_m >
-               config_.maximum_horizontal_accuracy_m) {
-      has_fixed_receiver_solution_ = false;
-      *rejection_reason = "horizontal_accuracy_exceeds_limit";
-    } else {
-      if (!has_fixed_receiver_solution_ ||
-          fix.timestamp.nanoseconds - last_fixed_timestamp_.nanoseconds >
-              config_.maximum_fixed_solution_gap_ns) {
-        fixed_solution_start_ = fix.timestamp.nanoseconds;
-      }
-      has_fixed_receiver_solution_ = true;
-      last_fixed_timestamp_ = fix.timestamp;
-      if (fix.timestamp.nanoseconds - fixed_solution_start_ <
-          config_.fixed_solution_stability_ns) {
-        *rejection_reason = "fixed_solution_not_stable";
-      } else {
-        return Status::Ok();
-      }
-    }
-    return Status(StatusCode::kRejectedMeasurement, *rejection_reason);
   }
 
   Status CheckOdometryConsistency(const PositionFix& fix,
@@ -1273,6 +1160,11 @@ class LocalizationEngine::Impl {
                                   previous_odometry_.timestamp.clock_domain};
     result_.odometry_epoch = previous_odometry_.epoch;
     result_.map_reference = config_.map_reference;
+    result_.calibration_state = config_.map_reference.geodetic.state;
+    result_.odom_gravity_contract = config_.odom_gravity_contract;
+    result_.observability.horizontal_position = has_admitted_fix_;
+    result_.observability.vertical_position = has_admitted_vertical_fix_;
+    result_.observability.heading = heading_initialized_;
     result_.map_from_odom = published_alignment_;
     result_.backend_map_from_odom = estimate.map_from_odom;
     result_.alignment_covariance = estimate.covariance;
@@ -1312,6 +1204,7 @@ class LocalizationEngine::Impl {
   std::unique_ptr<OdometryBuffer> odometry_buffer_;
   std::unique_ptr<internal::AlignmentSmoother> smoother_;
   internal::GnssAlignmentRecovery recovery_;
+  internal::GnssQualityGate quality_gate_;
   std::vector<Segment> segments_;
   std::deque<PositionFix> pending_fixes_;
   std::deque<GnssHeading> pending_headings_;
@@ -1320,16 +1213,12 @@ class LocalizationEngine::Impl {
   OdometrySample previous_odometry_;
   PositionFix last_good_fix_;
   Timestamp last_submitted_heading_;
-  Timestamp last_fixed_heading_timestamp_;
   Timestamp last_admitted_heading_;
   Timestamp last_submitted_fix_;
-  Timestamp last_fixed_timestamp_;
   Timestamp last_admitted_fix_;
   Eigen::Vector4d published_alignment_ = Eigen::Vector4d::Zero();
   Eigen::Vector3d alignment_reference_in_odom_ = Eigen::Vector3d::Zero();
   Eigen::Vector4d pending_large_reset_alignment_ = Eigen::Vector4d::Zero();
-  int64_t fixed_solution_start_ = 0;
-  int64_t heading_solution_start_ns_ = 0;
   int64_t latest_odometry_timestamp_ns_ = 0;
   int64_t last_published_timestamp_ns_ = 0;
   double distance_since_segment_m_ = 0.0;
@@ -1344,13 +1233,11 @@ class LocalizationEngine::Impl {
   bool has_odometry_ = false;
   bool has_submitted_fix_ = false;
   bool has_submitted_heading_ = false;
-  bool has_fixed_receiver_solution_ = false;
   bool has_previous_quality_fix_ = false;
   bool has_admitted_fix_ = false;
   bool has_admitted_vertical_fix_ = false;
   bool has_admitted_heading_ = false;
   bool has_published_alignment_ = false;
-  bool has_fixed_heading_solution_ = false;
   bool heading_initialized_ = false;
 };
 

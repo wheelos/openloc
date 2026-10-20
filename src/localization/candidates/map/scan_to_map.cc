@@ -394,10 +394,12 @@ ScanToMapResult ScanToMapLocalizer::Match(const ScanToMapRequest& request) {
   output.map_content_id = metadata_.content_id;
   output.map_frame = config_.map_frame;
   output.base_frame = config_.base_frame;
+  output.calibration_id = config_.calibration_id;
   output.score_type =
       config_.algorithm == ScanMatchingAlgorithm::kPointToPlaneIcp
           ? "point_to_plane_rmse_m"
           : "pcl_ndt_fitness";
+  output.covariance_source = "scan_matcher_residual_scaled_hessian";
   output.diagnostic_only =
       config_.separate_ndt_support ||
       metadata_.reference_state == MapReferenceState::kDiagnosticOnly ||

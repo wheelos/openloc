@@ -28,38 +28,10 @@ Eigen::Matrix<double, 6, 1> Difference(const Eigen::Isometry3d& a,
   return difference;
 }
 
-bool ValidPose(const Eigen::Isometry3d& pose) {
-  return pose.matrix().allFinite() &&
-         (pose.linear().transpose() * pose.linear())
-             .isApprox(Eigen::Matrix3d::Identity(), 1e-6) &&
-         std::abs(pose.linear().determinant() - 1.0) < 1e-6 &&
-         pose.matrix().row(3).isApprox(Eigen::RowVector4d(0.0, 0.0, 0.0, 1.0),
-                                       1e-9);
-}
-
-bool ValidPartial(const GlobalObservation& observation) {
-  if (observation.kind == GlobalObservation::Kind::HORIZONTAL_POSITION) {
-    const Eigen::Matrix2d covariance =
-        observation.covariance.topLeftCorner<2, 2>();
-    return observation.pose.translation().head<2>().allFinite() &&
-           observation.point_in_base.allFinite() && covariance.allFinite() &&
-           covariance.isApprox(covariance.transpose(), 1e-9) &&
-           covariance.llt().info() == Eigen::Success;
-  }
-  if (observation.kind == GlobalObservation::Kind::POSITION) {
-    const Eigen::Matrix3d covariance =
-        observation.covariance.topLeftCorner<3, 3>();
-    return observation.pose.translation().allFinite() &&
-           observation.point_in_base.allFinite() && covariance.allFinite() &&
-           covariance.isApprox(covariance.transpose(), 1e-9) &&
-           covariance.llt().info() == Eigen::Success;
-  }
-  const auto& h = observation.projection;
-  const auto& r = observation.projected_covariance;
-  return ValidPose(observation.pose) && h.cols() == 6 && h.rows() > 0 &&
-         h.rows() < 6 && r.rows() == h.rows() && r.cols() == h.rows() &&
-         h.allFinite() && r.allFinite() && h.fullPivLu().rank() == h.rows() &&
-         r.isApprox(r.transpose(), 1e-9) && r.llt().info() == Eigen::Success;
+bool ValidExactTime(const std::optional<int64_t>& nanoseconds, double seconds) {
+  return !nanoseconds.has_value() ||
+         (*nanoseconds > 0 &&
+          static_cast<double>(*nanoseconds) * 1e-9 == seconds);
 }
 
 }  // namespace
@@ -148,7 +120,8 @@ Result GlobalAlignment::AddLocal(const LocalState& local,
       local.stamp.time - local.stamp.receive_time > config_.future_tolerance ||
       !local.orientation.coeffs().allFinite() ||
       std::abs(local.orientation.norm() - 1.0) > 1e-6 ||
-      !ValidPose(Pose(local)) || !ValidCovariance(PoseCovariance(local))) {
+      !ValidGlobalPose(Pose(local)) ||
+      !ValidCovariance(PoseCovariance(local))) {
     Invalidate(Reason::INVALID_INPUT);
     return {Reason::INVALID_INPUT, "invalid local snapshot"};
   }
@@ -244,7 +217,7 @@ Result GlobalAlignment::SeedDiagnostic(const Eigen::Isometry3d& map_to_odom,
   if (!config_.diagnostic_only || config_.enable_fixed_lag_graph ||
       !ValidateConfig().ok() || history_.empty() || state_.valid ||
       !sources_.empty() || time != history_.back().stamp.time ||
-      !ValidPose(map_to_odom) || !ValidCovariance(covariance)) {
+      !ValidGlobalPose(map_to_odom) || !ValidCovariance(covariance)) {
     return {Reason::INVALID_INPUT, "invalid diagnostic prior or owner mode"};
   }
   state_.map_to_odom = map_to_odom;
@@ -335,6 +308,21 @@ Result GlobalAlignment::Lookup(double time, LocalState* local) const {
   return {};
 }
 
+Result GlobalAlignment::LookupExact(double time, LocalState* local) const {
+  if (!std::isfinite(time)) {
+    return {Reason::INVALID_INPUT, "Invalid exact lookup time"};
+  }
+  const auto found =
+      std::lower_bound(history_.begin(), history_.end(), time,
+                       [](const LocalState& state, double stamp) {
+                         return state.stamp.time < stamp;
+                       });
+  if (found == history_.end() || found->stamp.time != time) {
+    return {Reason::HISTORY_UNAVAILABLE, "No exact retained local snapshot"};
+  }
+  return Lookup(time, local);
+}
+
 Result GlobalAlignment::Observe(const GlobalObservation& observation) {
   const auto existing = evidence_.find(observation.source);
   if (!config_.enable_fixed_lag_graph || existing == evidence_.end() ||
@@ -350,19 +338,19 @@ Result GlobalAlignment::Observe(const GlobalObservation& observation) {
     return Reject(valid_config.reason, valid_config.message, &source);
   }
   if (observation.source.empty() || !observation.quality_valid ||
-      (config_.enable_fixed_lag_graph &&
-       observation.kind == GlobalObservation::Kind::HORIZONTAL_POSITION) ||
       (config_.enable_fixed_lag_graph && !observation.independent_of_local) ||
-      (observation.kind == GlobalObservation::Kind::POSE
-           ? (!ValidPose(observation.pose) ||
-              !ValidCovariance(observation.covariance))
-           : !ValidPartial(observation)) ||
+      !ValidGlobalObservationGeometry(observation) ||
       observation.stamp.sequence == 0 ||
       !std::isfinite(observation.stamp.time) || observation.stamp.time <= 0.0 ||
-      !std::isfinite(observation.stamp.receive_time)) {
+      !std::isfinite(observation.stamp.receive_time) ||
+      !ValidExactTime(observation.measurement_timestamp_ns,
+                      observation.stamp.time) ||
+      !ValidExactTime(observation.receive_timestamp_ns,
+                      observation.stamp.receive_time)) {
     return Reject(Reason::INVALID_INPUT, "invalid global evidence", &source);
   }
-  if (!config_.diagnostic_only && !observation.uncertainty_qualified) {
+  if (!config_.diagnostic_only &&
+      (!observation.uncertainty_qualified || observation.diagnostic_only)) {
     return Reject(Reason::UNCERTAINTY_UNQUALIFIED,
                   "global observation covariance is unqualified", &source);
   }
@@ -376,7 +364,13 @@ Result GlobalAlignment::Observe(const GlobalObservation& observation) {
   }
   if (observation.map_id != config_.map_id ||
       observation.map_version != config_.map_version ||
-      observation.calibration_id != config_.calibration_id) {
+      observation.calibration_id != config_.calibration_id ||
+      (!config_.map_content_id.empty() &&
+       observation.map_content_id != config_.map_content_id) ||
+      (!config_.map_frame.empty() &&
+       observation.map_frame != config_.map_frame) ||
+      (!config_.base_frame.empty() &&
+       observation.base_frame != config_.base_frame)) {
     return Reject(Reason::MAP_MISMATCH, "map/calibration identity mismatch",
                   &source);
   }
@@ -412,7 +406,9 @@ Result GlobalAlignment::Observe(const GlobalObservation& observation) {
                   &source);
   }
   LocalState local;
-  const auto lookup = Lookup(observation.stamp.time, &local);
+  const auto lookup = config_.enable_fixed_lag_graph
+                          ? LookupExact(observation.stamp.time, &local)
+                          : Lookup(observation.stamp.time, &local);
   if (!lookup.ok()) {
     return Reject(lookup.reason, lookup.message, &source);
   }
@@ -489,21 +485,22 @@ Result GlobalAlignment::Observe(const GlobalObservation& observation) {
       return Reject(Reason::RELOCALIZATION_VERIFYING,
                     "waiting for distinct consistent frames", &source);
     }
-    state_.map_to_odom = candidate_;
-    state_.covariance = candidate_covariance_;
-    state_.covariance_time = observation.stamp.time;
-    state_.georeferenced = candidate_georeferenced_;
-    state_.valid = true;
-    state_.verifying = false;
-    candidate_frames_ = 0;
-    ++state_.correction_id;
     if (config_.enable_fixed_lag_graph) {
       const auto initialized = InitializeGraph(observation, local);
       if (!initialized.ok()) {
         state_.valid = false;
         return Reject(initialized.reason, initialized.message, &source);
       }
+    } else {
+      state_.map_to_odom = candidate_;
+      state_.covariance = candidate_covariance_;
+      state_.covariance_time = observation.stamp.time;
+      state_.georeferenced = candidate_georeferenced_;
+      state_.valid = true;
+      ++state_.correction_id;
     }
+    state_.verifying = false;
+    candidate_frames_ = 0;
   } else {
     if (observation.stamp.time < state_.last_observation) {
       return Reject(Reason::TIMESTAMP_REGRESSION,
