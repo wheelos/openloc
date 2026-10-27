@@ -144,8 +144,10 @@ Detailed inputs and outputs are retained in
 including `results_loose_tolerance.csv`, `results_200iter.csv`,
 `self_match_result.csv`, and `result_first_50k_rmse025.csv`. The reverse split,
 its same-scan biased-seed control, and its attempt record are under
-`.agents/notes/boreas_openloc_baseline/runs/pilot_v3/`; `prepared/` there is an
-incomplete preparation artifact and must not be used. Use `prepared_reverse/`.
+`.agents/notes/boreas_openloc_baseline/runs/pilot_v3/`; the unused incomplete
+`prepared/` output was removed after verifying its `incomplete_not_used` status
+and missing manifest. Its attempt record remains; use `prepared_reverse/` for
+the recorded run.
 The chronological Jan 15 / Jan 19 split, its selected-scan downloader,
 per-object download hashes, preparation wrapper, replay output, and diagnostics
 are under `.agents/notes/boreas_openloc_baseline/runs/pilot_v4/`. Only 50

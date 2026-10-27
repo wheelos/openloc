@@ -57,10 +57,9 @@ class GnssAlignmentRecovery {
  public:
   explicit GnssAlignmentRecovery(GnssAlignmentRecoveryConfig config = {});
 
-  Status AddRejectedObservation(
-      const GnssAlignmentRecoveryObservation& observation,
-      GnssAlignmentRecoveryDiagnostics* diagnostics,
-      GnssAlignmentRecoveryCandidate* candidate);
+  Status AddObservation(const GnssAlignmentRecoveryObservation& observation,
+                        GnssAlignmentRecoveryDiagnostics* diagnostics,
+                        GnssAlignmentRecoveryCandidate* candidate);
 
   void Reset();
 

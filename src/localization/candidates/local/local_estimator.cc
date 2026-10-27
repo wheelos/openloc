@@ -5,11 +5,13 @@
 // http://www.apache.org/licenses/LICENSE-2.0
 
 #include "candidates/local/local_estimator.h"
+#include "candidates/local/motion_bootstrap_error.h"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <limits>
+#include <map>
 #include <set>
 #include <utility>
 
@@ -118,13 +120,20 @@ LocalEstimator::LocalEstimator(const LocalConfig& config)
     : config_(config),
       stationarity_(config),
       lio_(config),
-      continuous_output_(config) {
+      continuous_output_(config),
+      joint_error_(config) {
   state_.epoch.session = config.session;
   state_.epoch.generation = 1;
   output_state_.epoch = state_.epoch;
 }
 
 Result LocalEstimator::ValidateConfig() const {
+  if (config_.enable_native_joint_error &&
+      (config_.native_joint_max_dimension < 15 ||
+       config_.native_joint_max_memory_rows < 48 ||
+       config_.native_joint_max_snapshots < 2 ||
+       config_.native_joint_max_dimension > config_.native_joint_max_memory_rows))
+    return {Reason::CONFIG_INVALID, "Invalid native joint-error resource bounds"};
   if (config_.session.empty() || config_.clock_id.empty() ||
       config_.stationary_samples == 0 || !Positive(config_.gravity) ||
       !Positive(config_.max_sample_age) ||
@@ -295,6 +304,8 @@ Result LocalEstimator::AddImu(const ImuSample& sample) {
   const bool had_imu = has_imu_;
   if (gap) {
     faulted_ = true;
+    joint_error_.Fail({Reason::IMU_GAP,
+                       "Native joint stochastic propagation cannot cross an IMU gap"});
     has_motion_ = false;
     motion_status_ = {Reason::IMU_GAP, "Motion cannot span an IMU gap"};
   }
@@ -310,6 +321,15 @@ Result LocalEstimator::AddImu(const ImuSample& sample) {
   has_imu_ = true;
   last_imu_sequence_ = sample.stamp.sequence;
   Accept(sample.stamp, &imu_health_);
+  if (!initialized_ && config_.enable_motion_initialization) {
+    if (gap) initialization_imu_.clear();
+    initialization_imu_.push_back(sample);
+    while (initialization_imu_.size() > config_.max_history_states ||
+           (initialization_imu_.size() > 2 &&
+            sample.stamp.time - initialization_imu_[1].stamp.time > 10.0)) {
+      initialization_imu_.pop_front();
+    }
+  }
 
   if (gap) {
     state_.valid = false;
@@ -339,6 +359,9 @@ Result LocalEstimator::AddImu(const ImuSample& sample) {
     const LocalState start_state = state_;
     const LocalState start_output = output_state_;
     LocalState working = state_;
+    if (joint_error_.active())
+      joint_error_.Set("previous_internal", joint_error_.Get("internal"));
+    joint_error_.BeginImu(interval_start, sample);
     Matrix15d error_transition = Matrix15d::Identity();
     std::vector<SourceSampleId> sources{{"imu", interval_start.stamp.sequence},
                                         {"imu", sample.stamp.sequence}};
@@ -352,7 +375,8 @@ Result LocalEstimator::AddImu(const ImuSample& sample) {
       pending_wheels_.pop_front();
       const ImuSample at_wheel =
           InterpolateImu(interval_start, sample, wheel.stamp.time);
-      result = Propagate(cursor, at_wheel, &working, &error_transition);
+      result = Propagate(cursor, at_wheel, &working, &error_transition,
+                         &joint_error_);
       if (!result.ok()) {
         faulted_ = true;
         state_.valid = false;
@@ -384,7 +408,7 @@ Result LocalEstimator::AddImu(const ImuSample& sample) {
         wheel_result = result;
       }
     }
-    result = Propagate(cursor, sample, &working, &error_transition);
+    result = Propagate(cursor, sample, &working, &error_transition, &joint_error_);
     if (!result.ok()) {
       faulted_ = true;
       state_.valid = false;
@@ -421,9 +445,22 @@ Result LocalEstimator::AddImu(const ImuSample& sample) {
         return output;
       }
       output_state_ = continuous_output_.state();
+      if (joint_error_.active()) {
+        ContinuousOutputErrorTransition transition;
+        const auto linearized =
+            continuous_output_.LinearizeLastStep(&transition);
+        if (linearized.ok()) joint_error_.AdvanceOutput(transition);
+        else joint_error_.Fail(linearized);
+      }
     } else {
       output_state_ = state_;
       continuous_output_.Reset(output_state_);
+      if (joint_error_.active()) {
+        Eigen::MatrixXd output = Eigen::MatrixXd::Zero(
+            18, joint_error_.Get("internal").cols());
+        output.topRows(15) = joint_error_.Get("internal");
+        joint_error_.Set("output", output);
+      }
     }
     state_.valid = EvaluateIntegrity(sample.stamp.receive_time).ok();
     output_state_.valid = state_.valid;
@@ -444,6 +481,8 @@ Result LocalEstimator::AddImu(const ImuSample& sample) {
                   start_output.covariance_model_valid &&
                       output_state_.covariance_model_valid);
     RecordInternalHistory();
+    SyncJointMemory();
+    joint_error_.Publish(output_state_, sources);
     pending_lidar_sources_.clear();
     if (!wheel_result.ok()) {
       return wheel_result;
@@ -461,6 +500,8 @@ Result LocalEstimator::AddImu(const ImuSample& sample) {
   output_state_.valid = state_.valid;
   RecordHistory();
   RecordInternalHistory();
+  SyncJointMemory();
+  joint_error_.Publish(output_state_, {});
   return Evaluate(sample.stamp.receive_time);
 }
 
@@ -511,6 +552,9 @@ Result LocalEstimator::Initialize(const ImuSample& sample) {
   output_state_ = initial;
   continuous_output_.Reset(output_state_);
   initialized_ = true;
+  joint_error_.InitializeStationary(
+      initial, acceleration, stationarity_.sample_count(),
+      stationarity_.last_mean_sequence() == sample.stamp.sequence);
   if (has_stationary_wheel_) {
     last_trusted_wheel_ = stationary_wheel_;
     has_trusted_wheel_ = true;
@@ -518,9 +562,102 @@ Result LocalEstimator::Initialize(const ImuSample& sample) {
   return {};
 }
 
+Result LocalEstimator::InitializeMotion(
+    const std::vector<RelativeLidarPose>& relative_poses,
+    MotionInitializationDiagnostics* diagnostics,
+    const RelativeBootstrapEvidence* evidence) {
+  if (diagnostics) *diagnostics = {};
+  if (!config_.enable_motion_initialization || !has_imu_ || initialized_ ||
+      faulted_) {
+    return {
+        Reason::INVALID_INPUT,
+        "Motion initialization requires an enabled, uninitialized IMU owner"};
+  }
+  if (relative_poses.empty() ||
+      relative_poses.back().time != previous_imu_.stamp.time) {
+    return {Reason::HISTORY_UNAVAILABLE,
+            "Motion initialization must commit at the actual IMU frontier"};
+  }
+  const auto valid = ValidateConfig();
+  if (!valid.ok()) return valid;
+  MotionInitializationConfig policy;
+  policy.gravity = config_.gravity;
+  policy.maximum_imu_gap = config_.max_imu_gap;
+  policy.allow_lidar_stationary_initialization =
+      config_.enable_lidar_stationary_initialization;
+  policy.maximum_stationary_speed = config_.stationary_speed;
+  policy.maximum_stationary_angular_speed = config_.stationary_gyro;
+  MotionInitialization aligned;
+  const std::vector<ImuSample> imu(initialization_imu_.begin(),
+                                   initialization_imu_.end());
+  const auto result =
+      InitializeFromRelativeMotion(policy, relative_poses, imu, &aligned,
+                                   diagnostics);
+  if (!result.ok()) return result;
+  LocalState initial;
+  initial.epoch = state_.epoch;
+  initial.stamp = previous_imu_.stamp;
+  initial.orientation = aligned.orientation;
+  initial.velocity = aligned.velocity;
+  initial.gyro_bias = aligned.gyro_bias;
+  initial.accel_bias = aligned.accel_bias;
+  initial.angular_velocity = previous_imu_.angular_velocity - initial.gyro_bias;
+  const double gauge_std = std::min(1e-6, config_.max_position_std * 0.5);
+  initial.covariance.diagonal().segment<3>(0).setConstant(gauge_std *
+                                                          gauge_std);
+  initial.covariance.diagonal().segment<3>(3).setConstant(
+      config_.initial_velocity_std * config_.initial_velocity_std);
+  initial.covariance.diagonal().segment<3>(6).setConstant(
+      config_.initial_attitude_std * config_.initial_attitude_std);
+  initial.covariance.diagonal().segment<3>(9).setConstant(
+      config_.initial_gyro_bias_std * config_.initial_gyro_bias_std);
+  initial.covariance.diagonal().segment<3>(12).setConstant(
+      config_.initial_accel_bias_std * config_.initial_accel_bias_std);
+  initial.covariance_model_valid = false;
+  initial.uncertainty_qualified = false;
+  initial.valid = true;
+  if (!FiniteState(initial))
+    return {Reason::INVALID_INPUT,
+            "Motion initialization produced invalid state"};
+  state_ = initial;
+  output_state_ = initial;
+  continuous_output_.Reset(initial);
+  initialized_ = true;
+  if (config_.enable_native_joint_error && evidence) {
+    Eigen::Matrix<double, 21, 21> covariance;
+    const auto modeled = RelativeBootstrapCovariance(
+        policy, config_, relative_poses, imu, aligned, *evidence, &covariance);
+    if (modeled.ok()) joint_error_.InitializeRelative(initial, covariance);
+    else joint_error_.RejectInitialization(modeled);
+  } else {
+    joint_error_.Initialize(initial);
+  }
+  history_.clear();
+  internal_history_.clear();
+  initialization_imu_.clear();
+  has_motion_ = false;
+  motion_status_ = {
+      Reason::CORRELATION_UNQUALIFIED,
+      aligned.lidar_stationary_initialization
+          ? "LiDAR-rest startup assumes zero accel bias; uncertainty unqualified"
+          : "Relative-motion startup has no qualified joint uncertainty model"};
+  RecordHistory(Matrix15d::Identity(), {}, false);
+  RecordInternalHistory();
+  if (joint_error_.active()) {
+    std::vector<SourceSampleId> sources;
+    for (const auto& sample : imu) sources.push_back({"imu", sample.stamp.sequence});
+    for (const auto& frame : evidence->frames)
+      sources.push_back({"lidar_raw", frame.scan.stamp.sequence});
+    SyncJointMemory();
+    joint_error_.Publish(output_state_, sources);
+  }
+  return {};
+}
+
 Result LocalEstimator::Propagate(const ImuSample& start, const ImuSample& end,
                                  LocalState* state,
-                                 Matrix15d* error_transition) const {
+                                 Matrix15d* error_transition,
+                                 NativeJointError* observer) const {
   // Inputs are already in body axes at the motion reference; the adapter owns
   // sensor rotation and lever-arm compensation.
   const double dt = end.stamp.time - start.stamp.time;
@@ -587,6 +724,33 @@ Result LocalEstimator::Propagate(const ImuSample& start, const ImuSample& end,
     return {Reason::INVALID_INPUT, "IMU propagation is not finite SPD"};
   }
   *state = next;
+  if (observer && observer->active()) {
+    const Eigen::Vector3d phi = rotation * dt;
+    const Eigen::Matrix3d half = ExpRotation(0.5 * phi).toRotationMatrix();
+    const Eigen::Matrix3d acceleration_attitude =
+        -body_to_local * Skew(acceleration) * half.transpose();
+    const Eigen::Matrix3d acceleration_gyro =
+        -body_to_local * Skew(acceleration) *
+        RightRotationJacobian(0.5 * phi) * (0.5 * dt);
+    Matrix15d exact = Matrix15d::Identity();
+    exact.block<3, 3>(0, 3) = dt * Eigen::Matrix3d::Identity();
+    exact.block<3, 3>(0, 6) = 0.5 * dt * dt * acceleration_attitude;
+    exact.block<3, 3>(3, 6) = dt * acceleration_attitude;
+    exact.block<3, 3>(0, 9) = -0.5 * dt * dt * acceleration_gyro;
+    exact.block<3, 3>(3, 9) = -dt * acceleration_gyro;
+    exact.block<3, 3>(0, 12) = -0.5 * dt * dt * body_to_local;
+    exact.block<3, 3>(3, 12) = -dt * body_to_local;
+    exact.block<3, 3>(6, 6) = ExpRotation(-phi).toRotationMatrix();
+    exact.block<3, 3>(6, 9) = -dt * RightRotationJacobian(phi);
+    Eigen::Matrix<double, 15, 6> input =
+        Eigen::Matrix<double, 15, 6>::Zero();
+    input.block<3, 3>(0, 0) = 0.25 * dt * dt * body_to_local;
+    input.block<3, 3>(3, 0) = 0.5 * dt * body_to_local;
+    input.block<3, 3>(0, 3) = 0.25 * dt * dt * acceleration_gyro;
+    input.block<3, 3>(3, 3) = 0.5 * dt * acceleration_gyro;
+    input.block<3, 3>(6, 3) = 0.5 * dt * RightRotationJacobian(phi);
+    observer->AdvanceImu(exact, input, input, start.stamp.time, end.stamp.time);
+  }
   *error_transition = (transition * *error_transition).eval();
   if (trace_callback_) {
     LocalEstimatorTrace trace;
@@ -635,6 +799,10 @@ Result LocalEstimator::Propagate(const ImuSample& start, const ImuSample& end,
     trace.orientation_before = state_before.orientation;
     trace.orientation_midpoint = midpoint;
     trace.orientation_after = state->orientation;
+    trace.gyro_bias_before = state_before.gyro_bias;
+    trace.gyro_bias_after = state->gyro_bias;
+    trace.accel_bias_before = state_before.accel_bias;
+    trace.accel_bias_after = state->accel_bias;
     trace_callback_(trace);
   }
   return {};
@@ -705,6 +873,8 @@ Result LocalEstimator::UpdateWheel(const WheelSample& sample,
                   &wheel_health_);
   }
   *state = next;
+  joint_error_.AdvanceInternal(
+      residual, gain * measurement_noise * gain.transpose());
   *error_transition = (residual * *error_transition).eval();
   if (trace_callback_) {
     LocalEstimatorTrace trace;
@@ -806,6 +976,8 @@ Result LocalEstimator::UpdateZeroVelocity(const ImuSample& imu,
                   "Zero-velocity update is not finite SPD", &zupt_health_);
   }
   *state = next;
+  joint_error_.AdvanceInternal(
+      residual, gain * measurement_noise * gain.transpose());
   *error_transition = (residual * *error_transition).eval();
   Accept(imu.stamp, &zupt_health_);
   return {};
@@ -859,8 +1031,7 @@ Result LocalEstimator::Evaluate(double now) const {
     return integrity;
   }
   if (lio_active_ && continuous_output_.correction_budget_exceeded()) {
-    return {Reason::CORRECTION_BUDGET_EXCEEDED,
-            "Local geometry correction exceeds the declared output envelope"};
+    return continuous_output_.correction_status();
   }
   if (!output_state_.covariance_model_valid) {
     return {Reason::CORRELATION_UNQUALIFIED,
@@ -942,9 +1113,12 @@ Result LocalEstimator::ResetStopped(double now) {
   pending_wheels_.clear();
   history_.clear();
   internal_history_.clear();
+  initialization_imu_.clear();
   lio_.Reset(epoch);
   continuous_output_.Reset(output_state_);
   lio_active_ = false;
+  joint_error_.Reset();
+  joint_scans_.clear();
   pending_lidar_sources_.clear();
   has_motion_ = false;
   last_motion_ = MotionIncrement();
@@ -969,67 +1143,206 @@ void LocalEstimator::RecordHistory(const Matrix15d& transition,
   }
 }
 
-void LocalEstimator::RecordInternalHistory() {
+void LocalEstimator::RecordInternalHistory(bool lidar_correction) {
   if (!state_.valid) {
     return;
   }
   if (!internal_history_.empty() &&
-      internal_history_.back().stamp.time == state_.stamp.time) {
-    internal_history_.back() = state_;
+      internal_history_.back().corrected.stamp.time == state_.stamp.time) {
+    if (joint_error_.active() && lidar_correction &&
+        !internal_history_.back().has_lidar_correction)
+      joint_error_.Set(
+          NativeJointError::History(state_.stamp.sequence, true),
+          joint_error_.Get(NativeJointError::History(state_.stamp.sequence)));
+    internal_history_.back().corrected = state_;
+    internal_history_.back().has_lidar_correction |= lidar_correction;
   } else {
-    internal_history_.push_back(state_);
+    internal_history_.push_back({state_, state_});
   }
+  if (joint_error_.active())
+    joint_error_.Set(NativeJointError::History(state_.stamp.sequence),
+                    joint_error_.Get("internal"));
   while (!internal_history_.empty() &&
-         (state_.stamp.time - internal_history_.front().stamp.time >
+         (state_.stamp.time - internal_history_.front().corrected.stamp.time >
               config_.history_duration ||
           internal_history_.size() > config_.max_history_states)) {
     internal_history_.pop_front();
   }
 }
 
-Result LocalEstimator::LookupInternal(double time, LocalState* state) const {
+Result LocalEstimator::LookupInternal(
+    double time, LocalState* state, InternalHistoryErrorMap* error_map) const {
   if (state == nullptr || !std::isfinite(time) || time <= 0.0 ||
       internal_history_.empty()) {
     return {Reason::HISTORY_UNAVAILABLE, "Invalid internal history request"};
   }
   const auto upper =
       std::lower_bound(internal_history_.begin(), internal_history_.end(), time,
-                       [](const LocalState& item, double stamp) {
-                         return item.stamp.time < stamp;
+                       [](const InternalHistoryEntry& item, double stamp) {
+                         return item.corrected.stamp.time < stamp;
                        });
-  if (upper != internal_history_.end() && upper->stamp.time == time) {
-    *state = *upper;
+  if (upper != internal_history_.end() && upper->corrected.stamp.time == time) {
+    if (error_map) {
+      InternalHistoryErrorMap next;
+      next.first = next.second = upper->corrected.stamp;
+      next.first_error.setIdentity();
+      *error_map = std::move(next);
+    }
+    *state = upper->corrected;
     return {};
   }
   if (upper == internal_history_.begin() || upper == internal_history_.end()) {
     return {Reason::HISTORY_UNAVAILABLE,
             "LiDAR point is outside bounded IMU history"};
   }
-  const auto lower = std::prev(upper);
-  const double dt = upper->stamp.time - lower->stamp.time;
+  // A same-time LiDAR correction is not motion over the preceding IMU
+  // interval. Interpolate to its propagated endpoint, not across the jump.
+  const auto& lower = std::prev(upper)->corrected;
+  const auto& endpoint = upper->propagated;
+  const double dt = endpoint.stamp.time - lower.stamp.time;
   if (dt <= 0.0 || dt > config_.max_imu_gap) {
     return {Reason::IMU_GAP, "LiDAR point brackets an IMU gap"};
   }
-  const double alpha = (time - lower->stamp.time) / dt;
-  LocalState interpolated = *lower;
+  const double alpha = (time - lower.stamp.time) / dt;
+  LocalState interpolated = lower;
   interpolated.stamp.time = time;
   interpolated.position =
-      (1.0 - alpha) * lower->position + alpha * upper->position;
+      (1.0 - alpha) * lower.position + alpha * endpoint.position;
   interpolated.velocity =
-      (1.0 - alpha) * lower->velocity + alpha * upper->velocity;
+      (1.0 - alpha) * lower.velocity + alpha * endpoint.velocity;
   interpolated.orientation =
-      lower->orientation.slerp(alpha, upper->orientation).normalized();
+      lower.orientation.slerp(alpha, endpoint.orientation).normalized();
   interpolated.gyro_bias =
-      (1.0 - alpha) * lower->gyro_bias + alpha * upper->gyro_bias;
+      (1.0 - alpha) * lower.gyro_bias + alpha * endpoint.gyro_bias;
   interpolated.accel_bias =
-      (1.0 - alpha) * lower->accel_bias + alpha * upper->accel_bias;
+      (1.0 - alpha) * lower.accel_bias + alpha * endpoint.accel_bias;
   interpolated.angular_velocity =
-      (1.0 - alpha) * lower->angular_velocity + alpha * upper->angular_velocity;
+      (1.0 - alpha) * lower.angular_velocity + alpha * endpoint.angular_velocity;
   interpolated.covariance =
-      (1.0 - alpha) * lower->covariance + alpha * upper->covariance;
+      (1.0 - alpha) * lower.covariance + alpha * endpoint.covariance;
   interpolated.covariance_model_valid =
-      lower->covariance_model_valid && upper->covariance_model_valid;
+      lower.covariance_model_valid && endpoint.covariance_model_valid;
+  if (error_map) {
+    Eigen::Matrix3d first_rotation, second_rotation;
+    const auto result = RotationInterpolationJacobians(
+        lower.orientation, endpoint.orientation, alpha,
+        &first_rotation, &second_rotation);
+    if (!result.ok()) return result;
+    InternalHistoryErrorMap map;
+    map.first = lower.stamp;
+    map.second = endpoint.stamp;
+    map.second_propagated = upper->has_lidar_correction;
+    map.first_error = (1.0 - alpha) * Matrix15d::Identity();
+    map.second_error = alpha * Matrix15d::Identity();
+    map.first_error.block<3, 3>(6, 6) = first_rotation;
+    map.second_error.block<3, 3>(6, 6) = second_rotation;
+    *error_map = std::move(map);
+  }
   *state = interpolated;
+  return {};
+}
+
+Result LocalEstimator::StoredGeometryErrorMap(
+    LidarStoredGeometryErrorMap* error_map) const {
+  if (!error_map)
+    return {Reason::INVALID_INPUT, "Stored-geometry error destination is missing"};
+  LidarStoredGeometryErrorMap next;
+  const auto result = lio_.GeometryErrorMap(&next.planes, &next.anchors);
+  if (!result.ok()) return result;
+  next.epoch = state_.epoch;
+  next.local_frontier = state_.stamp;
+  next.lidar_revision = lidar_health_.accepted;
+  *error_map = std::move(next);
+  return {};
+}
+
+Result LocalEstimator::DeskewErrorMap(
+    const LidarScan& scan, LidarDeskewErrorMap* error_map) const {
+  if (!error_map || !config_.enable_lidar ||
+      scan.points.size() > config_.lidar_max_points ||
+      !Positive(scan.stamp.time) || !Positive(scan.stamp.receive_time) ||
+      scan.stamp.sequence == 0)
+    return {Reason::INVALID_INPUT, "Invalid bounded LiDAR error-map request"};
+  if (!state_.valid || scan.epoch != state_.epoch)
+    return {Reason::EPOCH_MISMATCH, "LiDAR error map requires the active local epoch"};
+  if (scan.stamp.clock_id != config_.clock_id)
+    return {Reason::CLOCK_INVALID, "LiDAR error map clock does not match"};
+  if (scan.frame_id != config_.lidar_frame ||
+      scan.calibration_id != config_.lidar_calibration_id)
+    return {Reason::CONFIG_INVALID, "LiDAR error map calibration/frame does not match"};
+  std::map<double, InternalHistoryErrorMap> interpolation;
+  DeskewedScan deskewed;
+  std::vector<DeskewPointError> direct;
+  const auto result = DeskewLidarScan(
+      scan,
+      [&](double time, LocalState* state) {
+        InternalHistoryErrorMap map;
+        const auto status = LookupInternal(time, state, &map);
+        if (status.ok()) interpolation[time] = std::move(map);
+        return status;
+      },
+      &deskewed, &direct);
+  if (!result.ok()) return result;
+  LidarDeskewErrorMap next;
+  next.epoch = scan.epoch;
+  next.scan = scan.stamp;
+  next.local_frontier = state_.stamp;
+  next.lidar_revision = lidar_health_.accepted;
+  next.points.reserve(scan.points.size());
+  std::map<std::pair<double, bool>, std::size_t> indices;
+  const auto add_loading =
+      [&](const Stamp& stamp, bool propagated,
+          const Eigen::Matrix<double, 3, 15>& jacobian,
+          LidarDeskewPointError* point) -> Result {
+    if (jacobian.isZero(0)) return {};
+    const auto key = std::make_pair(stamp.time, propagated);
+    auto found = indices.find(key);
+    if (found == indices.end()) {
+      const auto history = std::lower_bound(
+          internal_history_.begin(), internal_history_.end(), stamp.time,
+          [](const InternalHistoryEntry& entry, double time) {
+            return entry.corrected.stamp.time < time;
+          });
+      if (history == internal_history_.end() ||
+          history->corrected.stamp.time != stamp.time)
+        return {Reason::HISTORY_UNAVAILABLE,
+                "LiDAR error map lost its exact retained history clone"};
+      found = indices.emplace(key, next.history.size()).first;
+      next.history.push_back(
+          {propagated ? history->propagated : history->corrected, propagated});
+    }
+    const auto loading = std::find_if(
+        point->history.begin(), point->history.end(),
+        [&](const LidarDeskewHistoryLoading& item) {
+          return item.history_index == found->second;
+        });
+    if (loading == point->history.end())
+      point->history.push_back({found->second, jacobian});
+    else
+      loading->jacobian += jacobian;
+    return {};
+  };
+  for (std::size_t index = 0; index < direct.size(); ++index) {
+    LidarDeskewPointError point;
+    point.time = direct[index].point_time;
+    point.point_in_end_base = deskewed.points_in_end_base[index];
+    point.raw_point = direct[index].raw_point;
+    const auto compose = [&](double time,
+                             const Eigen::Matrix<double, 3, 15>& jacobian) {
+      const auto& map = interpolation.at(time);
+      auto status = add_loading(map.first, false,
+                                jacobian * map.first_error, &point);
+      if (!status.ok()) return status;
+      return add_loading(map.second, map.second_propagated,
+                         jacobian * map.second_error, &point);
+    };
+    auto status = compose(point.time, direct[index].point_state);
+    if (!status.ok()) return status;
+    status = compose(scan.stamp.time, direct[index].end_state);
+    if (!status.ok()) return status;
+    next.points.push_back(std::move(point));
+  }
+  *error_map = std::move(next);
   return {};
 }
 
@@ -1088,14 +1401,35 @@ Result LocalEstimator::AddLidar(const LidarScan& scan) {
                   "LiDAR correction requires the exact committed IMU frontier",
                   &lidar_health_);
   }
+  std::optional<NativeJointError> joint_before;
+  LidarDeskewErrorMap joint_deskew;
+  std::vector<StoredPlaneError> joint_planes;
+  if (joint_error_.active()) {
+    joint_before = joint_error_;
+    const auto prepared = PrepareJointLidar(scan, &joint_deskew, &joint_planes);
+    if (!prepared.ok()) joint_error_.Fail(prepared);
+  }
   Result result = lio_.Observe(
       scan,
       [this](double time, LocalState* item) {
         return LookupInternal(time, item);
       },
-      &state_);
+      &state_,
+      [&](const LioUpdate& update, const LocalState& prior,
+          const LocalState& before, const LocalState& after) {
+        JointLidarIteration(update, prior, before, after,
+                            joint_deskew, joint_planes);
+      });
   if (!result.ok() && result.reason != Reason::GEOMETRY_UNAVAILABLE) {
+    if (joint_before) joint_error_ = *joint_before;
     return Reject(result.reason, result.message, &lidar_health_);
+  }
+  const auto stored = lio_.geometry_source_sequences();
+  if (std::find(stored.begin(), stored.end(), scan.stamp.sequence) != stored.end()) {
+    StoreJointLidar(scan, joint_deskew);
+    joint_error_.AddSource({"lidar_raw", scan.stamp.sequence});
+  } else if (joint_before) {
+    joint_error_ = *joint_before;
   }
   Accept(scan.stamp, &lidar_health_);
   if (result.ok()) {
@@ -1118,8 +1452,183 @@ Result LocalEstimator::AddLidar(const LidarScan& scan) {
   } else {
     lidar_health_.reason = result.reason;
   }
-  RecordInternalHistory();
+  RecordInternalHistory(result.ok());
+  SyncJointMemory();
   return result;
+}
+
+LocalEstimator::LidarTask::LidarTask(const LocalEstimator& owner,
+                                   const LidarScan& scan)
+    : scan_(scan),
+      lidar_before_(owner.lidar_health_) {
+  stochastic_fork_ = owner.joint_error_.PinFork();
+  snapshot_ = std::make_unique<LocalEstimator>(owner);
+  snapshot_->SetTraceCallback({});
+}
+
+Result LocalEstimator::LidarTask::Compute() {
+  if (computed_ || committed_) {
+    return {Reason::DUPLICATE, "LiDAR task can only be computed once"};
+  }
+  computed_ = true;
+  decision_ = snapshot_->AddLidar(scan_);
+  return decision_;
+}
+
+Result LocalEstimator::LidarTask::ReplayImu(const ImuSample& sample) {
+  if (!computed_ || committed_ ||
+      (!decision_.ok() && decision_.reason != Reason::GEOMETRY_UNAVAILABLE)) {
+    return {Reason::INVALID_INPUT,
+            "IMU catch-up requires an uncommitted accepted LiDAR task"};
+  }
+  return snapshot_->AddImu(sample);
+}
+
+Result LocalEstimator::PrepareStartupSnapshot(
+    std::unique_ptr<LocalEstimator>* snapshot) const {
+  if (!snapshot || *snapshot || !config_.enable_motion_initialization ||
+      !has_imu_ || initialized_ || faulted_ || has_received_wheel_ ||
+      !pending_wheels_.empty())
+    return {Reason::INVALID_INPUT,
+            "Startup snapshot requires an uninitialized IMU-only owner"};
+  *snapshot = std::make_unique<LocalEstimator>(*this);
+  (*snapshot)->SetTraceCallback({});
+  return {};
+}
+
+Result LocalEstimator::CommitStartupSnapshot(const LocalEstimator& candidate) {
+  if (candidate.owner_identity_ != owner_identity_ || initialized_ || faulted_ ||
+      candidate.faulted_ || has_received_wheel_ || candidate.has_received_wheel_ ||
+      !pending_wheels_.empty() || !candidate.pending_wheels_.empty())
+    return {Reason::INVALID_INPUT, "Startup snapshot owner is retired or initialized"};
+  if (candidate.state_.epoch != state_.epoch)
+    return {Reason::EPOCH_MISMATCH, "Startup snapshot belongs to an old epoch"};
+  const auto& live = previous_imu_;
+  const auto& replayed = candidate.previous_imu_;
+  if (imu_health_.accepted != candidate.imu_health_.accepted ||
+      imu_health_.rejected != candidate.imu_health_.rejected ||
+      live.stamp.time != replayed.stamp.time ||
+      live.stamp.receive_time != replayed.stamp.receive_time ||
+      live.stamp.sequence != replayed.stamp.sequence ||
+      live.stamp.clock_id != replayed.stamp.clock_id ||
+      (live.acceleration.array() != replayed.acceleration.array()).any() ||
+      (live.angular_velocity.array() != replayed.angular_velocity.array()).any())
+    return {Reason::HISTORY_UNAVAILABLE,
+            "Startup snapshot has not replayed the exact accepted IMU frontier"};
+  if (candidate.initialized_) {
+    auto callback = trace_callback_;
+    *this = candidate;
+    trace_callback_ = std::move(callback);
+  }
+  return {};
+}
+
+Result LocalEstimator::PrepareLidarTask(
+    const LidarScan& scan, std::unique_ptr<LidarTask>* task) const {
+  if (task == nullptr || *task != nullptr) {
+    return {Reason::INVALID_INPUT, "LiDAR task output must be empty"};
+  }
+  const Result integrity = EvaluateIntegrity(state_.stamp.receive_time);
+  if (!integrity.ok()) {
+    return integrity;
+  }
+  if (has_received_wheel_ || !pending_wheels_.empty()) {
+    return {Reason::CORRELATION_UNQUALIFIED,
+            "Asynchronous LiDAR has no wheel replay contract"};
+  }
+  if (!config_.enable_lidar || scan.epoch != state_.epoch ||
+      scan.stamp.time != state_.stamp.time) {
+    return {Reason::LIDAR_STALE,
+            "LiDAR task needs the current enabled same-epoch IMU frontier"};
+  }
+  if (scan.points.empty() || scan.points.size() > config_.lidar_max_points) {
+    return {Reason::INVALID_INPUT, "LiDAR task exceeds its point bounds"};
+  }
+  task->reset(new LidarTask(*this, scan));
+  return {};
+}
+
+Result LocalEstimator::CommitLidarTask(LidarTask* task) {
+  if (task == nullptr || !task->computed_ || task->committed_ ||
+      task->snapshot_->owner_identity_ != owner_identity_) {
+    return {Reason::INVALID_INPUT,
+            "LiDAR task is incomplete, consumed, or belongs to another owner"};
+  }
+  if (!task->decision_.ok() &&
+      task->decision_.reason != Reason::GEOMETRY_UNAVAILABLE) {
+    return task->decision_;
+  }
+  const auto& candidate = *task->snapshot_;
+  if (candidate.state_.epoch != state_.epoch) {
+    return {Reason::EPOCH_MISMATCH, "LiDAR task belongs to an old local epoch"};
+  }
+  if (has_received_wheel_ || !pending_wheels_.empty() ||
+      lidar_health_.accepted != task->lidar_before_.accepted ||
+      lidar_health_.rejected != task->lidar_before_.rejected ||
+      candidate.lidar_health_.accepted != task->lidar_before_.accepted + 1) {
+    return {Reason::LIDAR_STALE,
+            "LiDAR task crossed another local measurement update"};
+  }
+  const auto& live_imu = previous_imu_;
+  const auto& replayed_imu = candidate.previous_imu_;
+  if (candidate.state_.stamp.time != state_.stamp.time ||
+      candidate.imu_health_.accepted != imu_health_.accepted ||
+      replayed_imu.stamp.sequence != live_imu.stamp.sequence ||
+      replayed_imu.stamp.time != live_imu.stamp.time ||
+      replayed_imu.stamp.receive_time != live_imu.stamp.receive_time ||
+      replayed_imu.stamp.clock_id != live_imu.stamp.clock_id ||
+      (replayed_imu.acceleration.array() != live_imu.acceleration.array()).any() ||
+      (replayed_imu.angular_velocity.array() !=
+       live_imu.angular_velocity.array()).any()) {
+    return {Reason::HISTORY_UNAVAILABLE,
+            "LiDAR task has not replayed the exact live IMU frontier"};
+  }
+  if (state_.stamp.receive_time - task->scan_.stamp.time >
+      config_.lidar_max_scan_age) {
+    return {Reason::LIDAR_STALE, "Delayed LiDAR task exceeded its age budget"};
+  }
+  const Result live_integrity = EvaluateIntegrity(state_.stamp.receive_time);
+  if (!live_integrity.ok()) {
+    return live_integrity;
+  }
+  const Result candidate_integrity =
+      candidate.EvaluateIntegrity(state_.stamp.receive_time);
+  if (!candidate_integrity.ok()) {
+    return candidate_integrity;
+  }
+  // Only the private internal trajectory/geometry is replaced. The output
+  // smoother and all previously published pose/velocity samples remain live.
+  state_ = candidate.state_;
+  lio_ = candidate.lio_;
+  internal_history_ = candidate.internal_history_;
+  joint_scans_ = candidate.joint_scans_;
+  lidar_health_ = candidate.lidar_health_;
+  lio_active_ = candidate.lio_active_;
+  if (joint_error_.active()) {
+    const auto spliced = joint_error_.SpliceCandidate(
+        candidate.joint_error_, task->stochastic_fork_, task->scan_.stamp.sequence);
+    if (!spliced.ok()) joint_error_.Fail(spliced);
+  }
+  if (lio_active_) {
+    state_.covariance_model_valid = false;
+    output_state_.covariance_model_valid = false;
+    has_motion_ = false;
+    motion_status_ = {
+        Reason::CORRELATION_UNQUALIFIED,
+        "Delayed LIO correction has no qualified joint output error model"};
+    pending_lidar_sources_.clear();
+    for (uint64_t sequence : lio_.geometry_source_sequences()) {
+      pending_lidar_sources_.push_back({"lidar_local_geometry", sequence});
+    }
+    if (!history_.empty()) {
+      history_.back().state.covariance_model_valid = false;
+      history_.back().motion_qualified = false;
+    }
+  }
+  task->committed_ = true;
+  task->stochastic_fork_.reset();
+  SyncJointMemory();
+  return task->decision_;
 }
 
 Result LocalEstimator::Lookup(double time, LocalState* state) const {

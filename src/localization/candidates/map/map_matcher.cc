@@ -69,6 +69,7 @@ Result MapMatcher::ValidateConfig() const {
       config_.maximum_seeds < 2 || config_.minimum_overlap > 1.0 ||
       config_.maximum_condition < 1.0 ||
       config_.maximum_registration_points < config_.minimum_points ||
+      config_.maximum_error_points == 0 ||
       config_.normal_neighbors < 4 ||
       config_.normal_neighbors >
           static_cast<uint32_t>(std::numeric_limits<int>::max()) ||
@@ -119,8 +120,9 @@ Result MapMatcher::Load(const std::string& pcd_path) {
   return SetMap(cloud);
 }
 
-Result MapMatcher::SetMap(const Cloud::ConstPtr& cloud) {
+Result MapMatcher::SetMap(const Cloud::ConstPtr& cloud, bool retain_error_support) {
   ready_ = false;
+  raw_error_map_.reset();
   target_voxelization_ms_ = 0.0;
   target_kdtree_build_ms_ = 0.0;
   target_normal_estimation_ms_ = 0.0;
@@ -255,12 +257,15 @@ Result MapMatcher::SetMap(const Cloud::ConstPtr& cloud) {
         0.0, target_normal_estimation_ms_ - target_normal_neighbor_search_ms_);
   }
   ready_ = true;
+  if (retain_error_support && cloud->size() <= config_.maximum_error_points)
+    raw_error_map_ = cloud->makeShared();
   return {};
 }
 
 Result MapMatcher::MatchPointToPlaneIcp(const Cloud::ConstPtr& base_cloud,
                                         const Eigen::Isometry3d& initial,
-                                        MatchResult* result) const {
+                                        MatchResult* result,
+                                        std::vector<IcpErrorStep>* steps) const {
   Eigen::Isometry3d estimate = initial;
   bool converged = false;
   const double distance_squared =
@@ -273,6 +278,8 @@ Result MapMatcher::MatchPointToPlaneIcp(const Cloud::ConstPtr& base_cloud,
   std::vector<float> distances(1);
   for (uint32_t iteration = 0; iteration < config_.maximum_iterations;
        ++iteration) {
+    IcpErrorStep error_step;
+    if (steps) error_step.before = estimate;
     Eigen::Matrix<double, 6, 6> information =
         Eigen::Matrix<double, 6, 6>::Zero();
     Eigen::Matrix<double, 6, 6> observability_information =
@@ -283,7 +290,9 @@ Result MapMatcher::MatchPointToPlaneIcp(const Cloud::ConstPtr& base_cloud,
         profile ? std::chrono::steady_clock::now()
                 : std::chrono::steady_clock::time_point{};
     double iteration_search_ms = 0.0;
-    for (const auto& point : *base_cloud) {
+    for (std::size_t source_index = 0; source_index < base_cloud->size();
+         ++source_index) {
+      const auto& point = (*base_cloud)[source_index];
       const Eigen::Vector3d moved =
           estimate * Eigen::Vector3d(point.x, point.y, point.z);
       const pcl::PointXYZ query(static_cast<float>(moved.x()),
@@ -321,6 +330,9 @@ Result MapMatcher::MatchPointToPlaneIcp(const Cloud::ConstPtr& base_cloud,
       information.noalias() += weight * jacobian.transpose() * jacobian;
       observability_information.noalias() += jacobian.transpose() * jacobian;
       gradient.noalias() += weight * jacobian.transpose() * residual;
+      if (steps)
+        error_step.correspondences.push_back(
+            {source_index, static_cast<std::size_t>(indices[0]), weight, n});
       ++correspondences;
     }
     if (profile) {
@@ -376,6 +388,11 @@ Result MapMatcher::MatchPointToPlaneIcp(const Cloud::ConstPtr& base_cloud,
     if (!delta.allFinite()) {
       record_solver_time();
       return {Reason::MATCH_FAILED, "point-to-plane ICP update is nonfinite"};
+    }
+    if (steps) {
+      error_step.delta = delta;
+      error_step.information = information;
+      steps->push_back(std::move(error_step));
     }
     const Eigen::Vector3d rotation_vector = delta.tail<3>();
     const double rotation_angle = rotation_vector.norm();
@@ -660,7 +677,9 @@ Result ProjectMapInformation(const Matrix6d& information,
 
 Result MapMatcher::Match(const Cloud::ConstPtr& base_cloud,
                          const Eigen::Isometry3d& initial,
-                         MatchResult* result) const {
+                         MatchResult* result,
+                         RegistrationErrorMap* errors) const {
+  if (errors) *errors = RegistrationErrorMap();
   const auto started = std::chrono::steady_clock::now();
   const auto finish = [&started, result](Result status) {
     if (result != nullptr) {
@@ -708,7 +727,27 @@ Result MapMatcher::Match(const Cloud::ConstPtr& base_cloud,
   result->registration_source_points = static_cast<uint32_t>(filtered->size());
   result->registration_target_points = static_cast<uint32_t>(map_->size());
   if (config_.algorithm == RegistrationAlgorithm::kPointToPlaneIcp) {
-    return finish(MatchPointToPlaneIcp(filtered, initial, result));
+    std::vector<IcpErrorStep> steps;
+    const auto matched =
+        MatchPointToPlaneIcp(filtered, initial, result, errors ? &steps : nullptr);
+    if (errors) {
+      if (!matched.ok()) {
+        errors->assessment = matched;
+      } else if (!raw_error_map_) {
+        errors->assessment = {
+            Reason::CORRELATION_UNQUALIFIED,
+            "Registration target raw support was not retained or exceeded capacity"};
+      } else {
+        const double target_voxel = config_.target_voxel_size > 0
+            ? config_.target_voxel_size : config_.source_voxel_size;
+        errors->assessment = LinearizeRawIcp(
+            *base_cloud, *filtered, *raw_error_map_, *map_,
+            config_.source_voxel_size, target_voxel, config_.normal_neighbors,
+            config_.maximum_registration_points, config_.maximum_error_points,
+            steps, errors);
+      }
+    }
+    return finish(matched);
   }
   registration_.setInputSource(filtered);
   Cloud aligned;

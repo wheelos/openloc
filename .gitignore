@@ -60,6 +60,8 @@ compile_commands.json
 *.log
 *.bak
 *.swp
+/native_*.INFO
+/native_*.log.INFO.*
 
 # vcpkg
 vcpkg_installed/

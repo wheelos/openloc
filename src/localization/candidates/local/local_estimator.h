@@ -9,20 +9,36 @@
 #include <cstddef>
 #include <deque>
 #include <functional>
+#include <map>
+#include <memory>
 #include <utility>
 
 #include "candidates/local/continuous_output.h"
 #include "candidates/local/local_lio.h"
 #include "candidates/local/local_motion.h"
+#include "candidates/local/motion_initializer.h"
+#include "candidates/local/native_joint_error.h"
 #include "candidates/local/stationarity_detector.h"
 
 namespace openloc {
 namespace localization {
 namespace unified {
 
+struct RelativeBootstrapEvidence;
+
 // The local owner deliberately has no absolute-pose or global-reset input.
 class LocalEstimator {
  public:
+  struct InternalHistoryErrorMap {
+    Stamp first;
+    Stamp second;
+    // Interior lookups use corrected left / pre-correction right history.
+    // An exact lookup has first == second and only first_error is nonzero.
+    bool second_propagated = false;
+    Matrix15d first_error = Matrix15d::Zero();
+    Matrix15d second_error = Matrix15d::Zero();
+  };
+  class LidarTask;
   using TraceCallback = std::function<void(const LocalEstimatorTrace&)>;
 
   explicit LocalEstimator(const LocalConfig& config);
@@ -33,6 +49,19 @@ class LocalEstimator {
   Result AddImu(const ImuSample& sample);
   Result AddWheel(const WheelSample& sample);
   Result AddLidar(const LidarScan& scan);
+  // The host owns task execution/threading and retains every subsequent IMU.
+  // Only IMU/LiDAR instances are supported; wheel updates need a separate
+  // replay contract. A completed task must catch up to the exact live frontier.
+  Result PrepareLidarTask(const LidarScan& scan,
+                         std::unique_ptr<LidarTask>* task) const;
+  Result CommitLidarTask(LidarTask* task);
+  Result PrepareStartupSnapshot(std::unique_ptr<LocalEstimator>* snapshot) const;
+  Result CommitStartupSnapshot(const LocalEstimator& snapshot);
+  Result InitializeMotion(
+      const std::vector<RelativeLidarPose>& relative_poses,
+      MotionInitializationDiagnostics* diagnostics = nullptr,
+      const RelativeBootstrapEvidence* evidence = nullptr);
+  bool joint_error_enabled() const { return config_.enable_native_joint_error; }
   Result ResetStopped(double now);
   Result EvaluateIntegrity(double now) const;
   Result Evaluate(double now) const;
@@ -54,6 +83,23 @@ class LocalEstimator {
   Result Lookup(double time, LocalState* state) const;
   Result MotionBetween(double start_time, double end_time,
                        MotionIncrement* motion) const;
+  Result JointErrorLookup(double time, LocalState* state) const {
+    return joint_error_.Lookup(time, state);
+  }
+  Result JointErrorMotionBetween(double start, double end,
+                                MotionIncrement* motion) const {
+    return joint_error_.MotionBetween(start, end, motion);
+  }
+  const Result& joint_error_status() const { return joint_error_.status(); }
+  Result PrepareJointLidarScan(uint64_t sequence, JointLidarScan* scan);
+  Result OutputErrorTransition(ContinuousOutputErrorTransition* transition) const {
+    if (!lio_active_)
+      return {Reason::HISTORY_UNAVAILABLE, "Continuous LiDAR output is not active"};
+    return continuous_output_.LinearizeLastStep(transition);
+  }
+  Result DeskewErrorMap(const LidarScan& scan,
+                        LidarDeskewErrorMap* error_map) const;
+  Result StoredGeometryErrorMap(LidarStoredGeometryErrorMap* error_map) const;
   const Eigen::MatrixXd& lidar_observed_pose_basis() const {
     return lio_.observed_pose_basis();
   }
@@ -67,7 +113,8 @@ class LocalEstimator {
                 SourceCounters* counters);
   Result Initialize(const ImuSample& sample);
   Result Propagate(const ImuSample& start, const ImuSample& end,
-                   LocalState* state, Matrix15d* error_transition) const;
+                   LocalState* state, Matrix15d* error_transition,
+                   NativeJointError* observer = nullptr) const;
   Result UpdateWheel(const WheelSample& sample, const ImuSample& imu,
                      LocalState* state, Matrix15d* error_transition);
   Result UpdateZeroVelocity(const ImuSample& imu, LocalState* state,
@@ -76,8 +123,19 @@ class LocalEstimator {
   void RecordHistory(const Matrix15d& transition = Matrix15d::Identity(),
                      const std::vector<SourceSampleId>& sources = {},
                      bool motion_qualified = true);
-  void RecordInternalHistory();
-  Result LookupInternal(double time, LocalState* state) const;
+  void RecordInternalHistory(bool lidar_correction = false);
+  void SyncJointMemory();
+  Result PrepareJointLidar(const LidarScan& scan,
+                           LidarDeskewErrorMap* deskew,
+                           std::vector<StoredPlaneError>* planes);
+  void JointLidarIteration(const LioUpdate& update, const LocalState& prior,
+                          const LocalState& before, const LocalState& after,
+                          const LidarDeskewErrorMap& deskew,
+                          const std::vector<StoredPlaneError>& planes);
+  void StoreJointLidar(const LidarScan& scan,
+                       const LidarDeskewErrorMap& deskew);
+  Result LookupInternal(double time, LocalState* state,
+                        InternalHistoryErrorMap* error_map = nullptr) const;
 
   struct HistoryEntry {
     LocalState state;
@@ -86,7 +144,14 @@ class LocalEstimator {
     bool motion_qualified = true;
   };
 
+  struct InternalHistoryEntry {
+    LocalState propagated;
+    LocalState corrected;
+    bool has_lidar_correction = false;
+  };
+
   LocalConfig config_;
+  std::shared_ptr<const int> owner_identity_ = std::make_shared<const int>(0);
   LocalState state_;
   LocalState output_state_;
   SourceCounters imu_health_;
@@ -108,9 +173,16 @@ class LocalEstimator {
   StationarityDetector stationarity_;
   std::deque<WheelSample> pending_wheels_;
   std::deque<HistoryEntry> history_;
-  std::deque<LocalState> internal_history_;
+  std::deque<InternalHistoryEntry> internal_history_;
+  std::deque<ImuSample> initialization_imu_;
   LocalLio lio_;
   ContinuousOutput continuous_output_;
+  mutable NativeJointError joint_error_;
+  struct RetainedJointScan {
+    Stamp reference;
+    std::vector<Eigen::Vector3d> points;
+  };
+  std::map<uint64_t, RetainedJointScan> joint_scans_;
   bool lio_active_ = false;
   std::vector<SourceSampleId> pending_lidar_sources_;
   MotionIncrement last_motion_;
@@ -122,6 +194,25 @@ class LocalEstimator {
   bool wheel_forward_velocity_only_ = false;
   Result motion_status_{Reason::HISTORY_UNAVAILABLE,
                         "Two committed local states are required"};
+};
+
+class LocalEstimator::LidarTask {
+ public:
+  Result Compute();
+  Result ReplayImu(const ImuSample& sample);
+  const Result& decision() const { return decision_; }
+  const LocalState& internal_state() const { return snapshot_->internal_state(); }
+
+ private:
+  friend class LocalEstimator;
+  LidarTask(const LocalEstimator& owner, const LidarScan& scan);
+  std::unique_ptr<LocalEstimator> snapshot_;
+  std::shared_ptr<const int> stochastic_fork_;
+  LidarScan scan_;
+  SourceCounters lidar_before_;
+  Result decision_{Reason::HISTORY_UNAVAILABLE, "LiDAR task has not run"};
+  bool computed_ = false;
+  bool committed_ = false;
 };
 
 }  // namespace unified

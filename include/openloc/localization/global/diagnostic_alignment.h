@@ -30,6 +30,22 @@ struct DiagnosticAlignmentConfig {
   int64_t maximum_full_pose_age_ns = 2'000'000'000LL;
   std::size_t maximum_pending_observations = 128;
   std::size_t maximum_decisions = 1000;
+  // Opt-in multi-position XY/yaw acquisition with later holdout validation.
+  // Requires an explicit diagnostic assumption that ODOM and global XY are
+  // gravity-level. Neither this declaration nor acquisition qualifies axes.
+  bool enable_horizontal_bootstrap = false;
+  bool assume_gravity_aligned_odom = false;
+};
+
+struct DiagnosticHorizontalEstimate {
+  Eigen::Vector3d map_from_odom_xy_yaw = Eigen::Vector3d::Zero();
+  Eigen::Vector2d map_base_xy = Eigen::Vector2d::Zero();
+  // Parameter covariance at odom_reference_xy, not at the ODOM origin.
+  // Explicitly uncalibrated; no height, roll/pitch or full-pose covariance.
+  Eigen::Vector2d odom_reference_xy = Eigen::Vector2d::Zero();
+  Eigen::Matrix3d covariance = Eigen::Matrix3d::Zero();
+  Timestamp last_observation_time;
+  uint64_t correction_id = 0;
 };
 
 struct DiagnosticAlignmentEstimate {
@@ -59,6 +75,9 @@ struct DiagnosticAlignmentResult {
   // Absent until distinct full-pose observations verify an alignment basin.
   // A position observation can be retained without creating an alignment.
   std::optional<DiagnosticAlignmentEstimate> estimate;
+  // Separate partial result; never creates estimate or a full-pose lease.
+  std::optional<DiagnosticHorizontalEstimate> horizontal_estimate;
+  bool horizontal_evidence_fresh = false;
   std::vector<GlobalObservationDecision> decisions;
 };
 

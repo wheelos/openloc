@@ -164,6 +164,35 @@ TEST(GnssQualityGateTest, InvalidInputsCannotAdvanceStability) {
             gate.CheckHeading(Time(100), receiver, 0.01, 1.0, 1.0).outcome);
 }
 
+TEST(GnssQualityGateTest, MissingAccuracyRequiresPositionDiagnosticOptIn) {
+  GnssQualityGate gate;
+  auto policy = GatePolicy();
+  auto receiver = FixedReceiver();
+  receiver.horizontal_accuracy_m = std::numeric_limits<double>::quiet_NaN();
+  ASSERT_TRUE(gate.Configure(policy).ok());
+  EXPECT_EQ(GnssQualityOutcome::kInvalid,
+            gate.CheckPosition(Time(100), receiver).outcome);
+  policy.allow_missing_horizontal_accuracy_diagnostic = true;
+  ASSERT_TRUE(gate.Configure(policy).ok());
+  EXPECT_EQ(GnssQualityOutcome::kWaitingForStability,
+            gate.CheckPosition(Time(100), receiver).outcome);
+  EXPECT_TRUE(gate.CheckPosition(Time(200), receiver).status.ok());
+  EXPECT_EQ(GnssQualityOutcome::kInvalid,
+            gate.CheckHeading(Time(200), receiver, 0.01, 1.0, 1.0).outcome);
+  receiver.carrier_solution = GnssCarrierSolution::kFloat;
+  EXPECT_EQ("carrier_solution_not_fixed",
+            gate.CheckPosition(Time(300), receiver).status.message());
+  receiver = FixedReceiver();
+  receiver.horizontal_accuracy_m = policy.maximum_horizontal_accuracy_m + 1;
+  EXPECT_EQ("horizontal_accuracy_exceeds_limit",
+            gate.CheckPosition(Time(400), receiver).status.message());
+  for (double value : {0.0, -1.0, std::numeric_limits<double>::infinity()}) {
+    receiver.horizontal_accuracy_m = value;
+    EXPECT_EQ(GnssQualityOutcome::kInvalid,
+              gate.CheckPosition(Time(500), receiver).outcome);
+  }
+}
+
 TEST(GnssQualityGateTest, PreservesInclusiveAndExclusiveQualityBoundaries) {
   GnssQualityGate gate;
   auto policy = GatePolicy();

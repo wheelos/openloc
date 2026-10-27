@@ -1,0 +1,786 @@
+// Copyright 2026 WheelOS. All Rights Reserved.
+// Licensed under the Apache License, Version 2.0 (the "License");
+
+#include <atomic>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <iomanip>
+#include <iostream>
+#include <map>
+#include <memory>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <utility>
+
+#include "openloc/localization/local/native_motion_bootstrap.h"
+#include "openloc/localization/local/native_odometry.h"
+#include "test/integration/map/native_diagnostic_executor.h"
+#include "test/integration/map/native_health_diagnostic.h"
+#include "test/integration/map/native_lidar_scheduler.h"
+#include "test/integration/map/native_map_diagnostic.h"
+#include "test/integration/map/native_scan_reader.h"
+#include "test/integration/map/native_timer_output.h"
+#include "test/integration/map/replay_csv.h"
+
+namespace {
+namespace u = openloc::localization::unified;
+namespace csv = openloc::replay;
+using Clock = std::chrono::steady_clock;
+
+double Seconds(const std::string& text) {
+  return static_cast<double>(csv::Time(text)) / 1e9;
+}
+
+void WriteImuTrace(std::ostream& stream, const u::LocalEstimatorTrace& trace) {
+  if (trace.kind != u::LocalEstimatorTraceKind::IMU_PROPAGATION)
+    throw std::runtime_error("raw native replay received a non-IMU trace");
+  stream << std::setprecision(17) << trace.stamp.sequence << ','
+         << trace.stamp.time << ',' << trace.dt;
+  for (const auto* vector :
+       {&trace.specific_force_body, &trace.angular_rate_body,
+        &trace.linear_acceleration_local, &trace.position_before,
+        &trace.position_after, &trace.velocity_before, &trace.velocity_after,
+        &trace.gyro_bias_before, &trace.accel_bias_before}) {
+    stream << ','
+           << vector->transpose().format(
+                  Eigen::IOFormat(Eigen::FullPrecision, 0, ",", ","));
+  }
+  stream << ','
+         << trace.orientation_midpoint.coeffs().transpose().format(
+                Eigen::IOFormat(Eigen::FullPrecision, 0, ",", ","));
+  for (int offset : {0, 3, 6, 9, 12})
+    stream << ',' << trace.covariance_after.block<3, 3>(offset, offset).trace();
+  for (int offset : {3, 6, 9, 12})
+    stream << ',' << trace.covariance_after.block<3, 3>(offset, 0).norm();
+  stream << '\n';
+  if (!stream) throw std::runtime_error("incomplete IMU trace write");
+}
+
+void WriteLocalCorrection(std::ostream& stream, uint64_t sequence,
+                          int64_t stamp, const u::Result& decision,
+                          const u::LocalState& before,
+                          const u::LocalState& after,
+                          const u::LocalState& output) {
+  stream << sequence << ',' << stamp << ',' << u::ReasonName(decision.reason);
+  for (const Eigen::Vector3d& vector :
+       {Eigen::Vector3d(after.position - before.position),
+        Eigen::Vector3d(after.velocity - before.velocity)})
+    stream << ','
+           << vector.transpose().format(
+                  Eigen::IOFormat(Eigen::FullPrecision, 0, ",", ","));
+  stream << ','
+         << u::LogRotation(before.orientation.conjugate() * after.orientation)
+                .norm()
+         << ',' << after.gyro_bias.norm() << ',' << after.accel_bias.norm();
+  for (const auto* vector :
+       {&after.position, &output.position, &after.velocity, &output.velocity})
+    stream << ','
+           << vector->transpose().format(
+                  Eigen::IOFormat(Eigen::FullPrecision, 0, ",", ","));
+  stream << '\n';
+}
+
+u::LocalConfig Configuration(const std::string& path) {
+  u::LocalConfig c;
+  c.session = "native-raw-lio-diagnostic";
+  c.allow_imu_only_initialization = true;
+  c.enable_lidar = true;
+  c.lidar_frame = "livox_frame";
+  c.lidar_calibration_id = "mid360-manual-T_I_L";
+  std::map<std::string, double*> doubles{
+      {"gyro_noise", &c.gyro_noise},
+      {"accel_noise", &c.accel_noise},
+      {"gyro_bias_noise", &c.gyro_bias_noise},
+      {"accel_bias_noise", &c.accel_bias_noise},
+      {"point_noise_std", &c.lidar_point_noise_std},
+      {"plane_noise_std", &c.lidar_plane_noise_std},
+      {"voxel_size", &c.lidar_voxel_size},
+      {"max_correspondence_distance", &c.lidar_max_correspondence_distance},
+      {"observed_singular_value", &c.lidar_observed_singular_value},
+      {"innovation_gate", &c.lidar_innovation_gate},
+      {"max_scan_age", &c.lidar_max_scan_age},
+      {"translation_correction_rate", &c.lidar_max_translation_correction_rate},
+      {"rotation_correction_rate", &c.lidar_max_rotation_correction_rate},
+      {"velocity_correction_acceleration",
+       &c.lidar_max_velocity_correction_acceleration},
+      {"anchor_variance_scale", &c.lidar_anchor_variance_scale},
+      {"correction_variance_scale", &c.lidar_correction_variance_scale},
+      {"max_translation_correction", &c.lidar_max_translation_correction},
+      {"max_rotation_correction", &c.lidar_max_rotation_correction},
+      {"max_velocity_correction", &c.lidar_max_velocity_correction},
+      {"process_noise_psd_tolerance", &c.lidar_process_noise_psd_tolerance},
+      {"rotation_length", &c.lidar_rotation_length}};
+  std::map<std::string, uint32_t*> integers{
+      {"max_voxels", &c.lidar_max_voxels},
+      {"max_scans", &c.lidar_max_scans},
+      {"min_points_per_plane", &c.lidar_min_points_per_plane},
+      {"min_correspondences", &c.lidar_min_correspondences},
+      {"max_points", &c.lidar_max_points},
+      {"max_update_iterations", &c.lidar_max_update_iterations}};
+  for (const auto& row : csv::ReadRows(path, "name,value", 2)) {
+    const auto real = doubles.find(row[0]);
+    const auto integer = integers.find(row[0]);
+    if (real != doubles.end()) {
+      *real->second = csv::Number(row[1]);
+      doubles.erase(real);
+    } else if (integer != integers.end()) {
+      const auto value = csv::Time(row[1]);
+      if (value > UINT32_MAX)
+        throw std::runtime_error("config integer overflow");
+      *integer->second = static_cast<uint32_t>(value);
+      integers.erase(integer);
+    } else {
+      throw std::runtime_error("unknown or duplicate config key: " + row[0]);
+    }
+  }
+  if (!doubles.empty() || !integers.empty())
+    throw std::runtime_error("incomplete native LIO configuration");
+  return c;
+}
+
+void Run(const std::filesystem::path& input,
+         const std::filesystem::path& output, bool motion_bootstrap,
+         const std::filesystem::path& map_bundle,
+         const std::string& map_digests,
+         const std::filesystem::path& gnss_bundle,
+         const std::string& gnss_digests, int64_t global_holdback_ns,
+         bool motion_translation_deskew, bool lidar_stationary_initialization,
+         double motion_bootstrap_voxel_size, bool imu_trace, bool async_global,
+         bool arrival_paced, int64_t async_local_delay_ns, bool prefetch_lidar,
+         bool timer_output, bool level_odom_gnss_bootstrap,
+         double native_joint_sample_period,
+         const std::map<std::string, uint32_t>& native_joint_limits) {
+  if (!std::filesystem::create_directory(output))
+    throw std::runtime_error("output must be a new directory");
+  auto config = Configuration((input / "config.csv").string());
+  config.enable_motion_initialization = motion_bootstrap;
+  config.enable_lidar_stationary_initialization =
+      lidar_stationary_initialization;
+  config.enable_native_joint_error = native_joint_sample_period > 0;
+  config.native_imu_sample_period = native_joint_sample_period;
+  for (const auto& limit : native_joint_limits) {
+    if (limit.first == "--native-joint-max-dimension")
+      config.native_joint_max_dimension = limit.second;
+    else if (limit.first == "--native-joint-max-memory-rows")
+      config.native_joint_max_memory_rows = limit.second;
+    else
+      config.native_joint_max_snapshots = limit.second;
+  }
+  openloc::localization::NativeOdometry local(config);
+  openloc::replay::NativeHealthDiagnostic health(output);
+  std::unique_ptr<openloc::replay::NativeMapDiagnostic> map;
+  if (!map_bundle.empty() || !gnss_bundle.empty())
+    map = std::make_unique<openloc::replay::NativeMapDiagnostic>(
+        map_bundle, output, map_digests, gnss_bundle, gnss_digests,
+        global_holdback_ns, async_global, level_odom_gnss_bootstrap);
+  std::atomic<bool> global_initialized{false};
+  std::unique_ptr<openloc::replay::NativeDiagnosticExecutor> global_executor;
+  if (async_global)
+    global_executor =
+        std::make_unique<openloc::replay::NativeDiagnosticExecutor>(
+            (output / "global_scheduler.csv").string(), 256, 64 * 1024 * 1024);
+  auto submit_global = [&](const char* kind, std::size_t bytes,
+                           std::function<void()> run) {
+    if (global_executor) {
+      global_executor->Submit(kind, bytes, std::move(run));
+    } else {
+      run();
+    }
+  };
+  openloc::localization::NativeMotionBootstrap bootstrap(
+      motion_translation_deskew, motion_bootstrap_voxel_size);
+  std::unique_ptr<openloc::replay::NativeLidarScheduler> local_scheduler;
+  if (async_local_delay_ns)
+    local_scheduler = std::make_unique<openloc::replay::NativeLidarScheduler>(
+        output, async_local_delay_ns);
+  const auto configured = local.ValidateConfig();
+  if (!configured.ok()) throw std::runtime_error(configured.message);
+  const auto imu =
+      csv::ReadRows((input / "imu.csv").string(),
+                    "timestamp_ns,receive_ns,ax,ay,az,gx,gy,gz", 8);
+  const auto scans = csv::ReadRows((input / "scans.csv").string(),
+                                   "end_ns,receive_ns,points", 3);
+  const auto extrinsic =
+      csv::ReadRows((input / "extrinsic.csv").string(), "tx,ty,tz", 3);
+  if (imu.empty() || scans.empty() || extrinsic.size() != 1)
+    throw std::runtime_error("raw IMU, scans and one extrinsic are required");
+  std::unique_ptr<openloc::replay::NativeScanReader> scan_reader;
+  if (prefetch_lidar) {
+    std::vector<std::string> names;
+    for (const auto& scan : scans) names.push_back(scan[2]);
+    scan_reader = std::make_unique<openloc::replay::NativeScanReader>(
+        input, std::move(names), config.lidar_max_points, output);
+  }
+  Eigen::Isometry3d base_from_lidar = Eigen::Isometry3d::Identity();
+  for (int axis = 0; axis < 3; ++axis)
+    base_from_lidar.translation()[axis] = csv::Number(extrinsic[0][axis]);
+  std::ofstream states(output / "odometry.csv");
+  std::ofstream decisions(output / "lidar.csv");
+  std::ofstream initialization(output / "motion_initialization.csv");
+  std::ofstream capability(output / "capability.csv");
+  std::ofstream corrections(output / "local_corrections.csv");
+  std::ofstream joint_audit;
+  if (config.enable_native_joint_error) {
+    joint_audit.open(output / "native_joint.csv");
+    if (!joint_audit) throw std::runtime_error("cannot open native joint audit");
+    joint_audit
+        << "sequence,timestamp_ns,receive_ns,reason,detail,dimension,"
+           "imu_sample_period_s,maximum_dimension,maximum_memory_rows,"
+           "maximum_snapshots,history_duration_s,diagnostic_only,trusted\n";
+  }
+  std::ofstream host_timing;
+  if (arrival_paced) {
+    host_timing.open(output / "host_timing.csv");
+    if (!host_timing)
+      throw std::runtime_error("cannot open host timing journal");
+    host_timing << "timestamp_ns,receive_ns,valid,target_steady_ns,"
+                   "emitted_steady_ns,deadline_ns\n";
+  }
+  std::ofstream trace;
+  if (imu_trace) {
+    trace.open(output / "imu_trace.csv");
+    if (!trace) throw std::runtime_error("cannot open IMU trace");
+    trace
+        << "sequence,time_s,dt_s,force_x,force_y,force_z,rate_x,rate_y,rate_z,"
+           "acceleration_x,acceleration_y,acceleration_z,"
+           "position_before_x,position_before_y,position_before_z,"
+           "position_after_x,position_after_y,position_after_z,"
+           "velocity_before_x,velocity_before_y,velocity_before_z,"
+           "velocity_after_x,velocity_after_y,velocity_after_z,"
+           "gyro_bias_x,gyro_bias_y,gyro_bias_z,"
+           "accel_bias_x,accel_bias_y,accel_bias_z,"
+           "midpoint_qx,midpoint_qy,midpoint_qz,midpoint_qw,"
+           "position_covariance_trace,velocity_covariance_trace,"
+           "attitude_covariance_trace,gyro_bias_covariance_trace,"
+           "accel_bias_covariance_trace,velocity_position_cross_norm,"
+           "attitude_position_cross_norm,gyro_bias_position_cross_norm,"
+           "accel_bias_position_cross_norm\n";
+    local.SetTraceCallback([&trace](const u::LocalEstimatorTrace& item) {
+      WriteImuTrace(trace, item);
+    });
+  }
+  if (!states || !decisions || !initialization || !capability || !corrections)
+    throw std::runtime_error("cannot open outputs");
+  states << std::setprecision(17)
+         << "timestamp_ns,receive_ns,valid,px,py,pz,qx,qy,qz,qw,vx,vy,vz,"
+            "covariance_model_valid,motion_available,imu_ms,integrity_reason,"
+            "capability_reason\n";
+  decisions << std::setprecision(17)
+            << "sequence,raw_end_ns,source_receive_ns,reference_ns,"
+               "processing_frontier_receive_ns,reason,detail,"
+               "observed_rank,processing_ms,bootstrap_stage\n";
+  initialization << std::setprecision(17)
+                 << "sequence,reference_ns,reason,linear_system_evaluated,"
+                    "solution_available,minimum_scaled_singular_value,"
+                    "gravity_error_mps2,accel_bias_mps2,gyro_bias_radps,"
+                    "normalized_rms,angular_rms_radps,translation_deskew,"
+                    "deskew_velocity_x,deskew_velocity_y,deskew_velocity_z,"
+                    "lidar_stationary_initialization,maximum_lidar_speed,"
+                    "maximum_lidar_angular_speed,"
+                    "maximum_stationary_force_residual,bootstrap_voxel_m\n";
+  capability << "timestamp_ns,receive_ns,valid,integrity_reason,"
+                "capability_reason,detail\n";
+  corrections << std::setprecision(17)
+              << "sequence,reference_ns,reason,position_dx,position_dy,"
+                 "position_dz,velocity_dx,velocity_dy,velocity_dz,"
+                 "rotation_rad,gyro_bias_norm,accel_bias_norm,"
+                 "internal_px,internal_py,internal_pz,output_px,output_py,"
+                 "output_pz,internal_vx,internal_vy,internal_vz,"
+                 "output_vx,output_vy,output_vz\n";
+  std::size_t next_scan = 0;
+  uint64_t initialized_ns = 0;
+  uint64_t valid_states = 0;
+  uint64_t lidar_updates = 0;
+  uint64_t warmup_scans = 0;
+  int64_t last_imu = 0;
+  int64_t last_receive = 0;
+  const auto arrival_origin = Clock::now();
+  const int64_t first_receive = csv::Time(imu.front()[1]);
+  std::ofstream timer_journal;
+  std::unique_ptr<csv::NativeTimerOutput> timer;
+  if (timer_output) {
+    timer_journal.open(output / "timer_output.csv");
+    if (!timer_journal) throw std::runtime_error("cannot open timer output");
+    timer_journal
+        << std::setprecision(17)
+        << "publication_sequence,target_steady_ns,emitted_steady_ns,"
+           "skipped_periods,usable,new_measurement,epoch_changed,"
+           "measurement_ns,receive_ns,source_sequence,session,generation,"
+           "px,py,pz,qx,qy,qz,qw,vx,vy,vz,measurement_age_ns,"
+           "maximum_age_ns,diagnostic_only,trusted\n";
+    timer = std::make_unique<csv::NativeTimerOutput>(
+        [&, sequence = uint64_t{0}](
+            const csv::NativeTimerOutput::Publication& p) mutable {
+          timer_journal << ++sequence << ',' << p.target_steady_ns << ','
+                        << p.emitted_steady_ns << ',' << p.skipped_periods
+                        << ',' << p.usable << ',' << p.new_measurement << ','
+                        << p.epoch_changed;
+          if (p.snapshot) {
+            const auto& snapshot = *p.snapshot;
+            timer_journal << ',' << snapshot.measurement_ns << ','
+                          << snapshot.receive_ns << ','
+                          << snapshot.state.stamp.sequence << ',';
+            csv::Text(timer_journal, snapshot.state.epoch.session);
+            timer_journal << ',' << snapshot.state.epoch.generation;
+          } else {
+            timer_journal << ",,,,,";
+          }
+          for (int axis = 0; axis < 10; ++axis) {
+            timer_journal << ',';
+            if (p.usable) {
+              const auto& state = p.snapshot->state;
+              if (axis < 3)
+                timer_journal << state.position[axis];
+              else if (axis < 7)
+                timer_journal << state.orientation.coeffs()[axis - 3];
+              else
+                timer_journal << state.velocity[axis - 7];
+            }
+          }
+          timer_journal << ',' << p.measurement_age_ns << ','
+                        << static_cast<int64_t>(config.max_sample_age * 1e9)
+                        << ",1,0\n";
+          timer_journal.flush();
+          if (!timer_journal)
+            throw std::runtime_error("incomplete timer output");
+        },
+        static_cast<int64_t>(config.max_sample_age * 1e9));
+  }
+  for (std::size_t index = 0; index < imu.size(); ++index) {
+    const auto& row = imu[index];
+    const int64_t stamp = csv::Time(row[0]);
+    const int64_t receive = csv::Time(row[1]);
+    if (stamp <= last_imu || receive < last_receive)
+      throw std::runtime_error("IMU measurement/arrival order regressed");
+    last_imu = stamp;
+    last_receive = receive;
+    if (global_executor) global_executor->Check();
+    const auto target =
+        arrival_origin + std::chrono::nanoseconds(receive - first_receive);
+    if (arrival_paced) std::this_thread::sleep_until(target);
+    u::ImuSample sample;
+    sample.stamp = {Seconds(row[0]), Seconds(row[1]), index + 1, "unix"};
+    for (int axis = 0; axis < 3; ++axis) {
+      sample.acceleration[axis] = csv::Number(row[axis + 2]);
+      sample.angular_velocity[axis] = csv::Number(row[axis + 5]);
+    }
+    auto started = Clock::now();
+    const auto result = local.AddImu(sample);
+    const double imu_ms =
+        std::chrono::duration<double, std::milli>(Clock::now() - started)
+            .count();
+    const auto integrity = local.EvaluateIntegrity(sample.stamp.receive_time);
+    if (!result.ok()) {
+      capability << stamp << ',' << receive << ',' << local.state().valid << ','
+                 << u::ReasonName(integrity.reason) << ','
+                 << u::ReasonName(result.reason) << ',';
+      csv::Text(capability, result.message);
+      capability << '\n';
+      capability.flush();
+    }
+    if (!result.ok() &&
+        !((result.reason == u::Reason::WHEEL_STALE ||
+           result.reason == u::Reason::CORRELATION_UNQUALIFIED ||
+           result.reason == u::Reason::CORRECTION_BUDGET_EXCEEDED) &&
+          integrity.ok()))
+      throw std::runtime_error(result.message);
+    const auto& state = local.state();
+    if (timer) timer->Update(state, integrity.ok(), stamp, receive, target);
+    health.Update(state, integrity, stamp, receive, global_initialized.load());
+    if (motion_bootstrap && !state.valid) bootstrap.AddImu(sample);
+    if (state.valid) {
+      ++valid_states;
+      if (initialized_ns == 0) initialized_ns = stamp;
+      if (map) {
+        submit_global("odometry", sizeof(state),
+                      [&, snapshot = state, stamp, receive] {
+                        map->AddOdometry(snapshot, stamp, receive);
+                        global_initialized.store(map->initialized());
+                      });
+      }
+    }
+    if (map) {
+      submit_global("gnss", sizeof(receive), [&, receive] {
+        map->ProcessGnss(receive);
+        global_initialized.store(map->initialized());
+      });
+    }
+    states << stamp << ',' << receive << ',' << state.valid << ','
+           << state.position.transpose().format(
+                  Eigen::IOFormat(Eigen::FullPrecision, 0, ",", ","))
+           << ','
+           << state.orientation.coeffs().transpose().format(
+                  Eigen::IOFormat(Eigen::FullPrecision, 0, ",", ","))
+           << ','
+           << state.velocity.transpose().format(
+                  Eigen::IOFormat(Eigen::FullPrecision, 0, ",", ","))
+           << ',' << state.covariance_model_valid << ','
+           << local.motion_available() << ',' << imu_ms << ','
+           << u::ReasonName(integrity.reason) << ','
+           << u::ReasonName(result.reason) << '\n';
+    if (arrival_paced) {
+      states.flush();
+      if (!states) throw std::runtime_error("incomplete paced ODOM write");
+      const auto emitted = Clock::now();
+      const auto to_ns = [](Clock::time_point time) {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   time.time_since_epoch())
+            .count();
+      };
+      host_timing << stamp << ',' << receive << ',' << state.valid << ','
+                  << to_ns(target) << ',' << to_ns(emitted) << ",10000000\n";
+    }
+    if (local_scheduler) {
+      const auto completion = local_scheduler->Advance(&local, sample, stamp);
+      if (completion) {
+        WriteLocalCorrection(corrections, completion->sequence, stamp,
+                             completion->decision, completion->before,
+                             completion->after, local.state());
+        if (completion->applied && completion->decision.ok()) ++lidar_updates;
+        if (!completion->applied &&
+            completion->decision.reason != u::Reason::LIDAR_STALE &&
+            completion->decision.reason != u::Reason::GEOMETRY_UNAVAILABLE)
+          throw std::runtime_error(completion->decision.message);
+      }
+    }
+    // Re-reference a received scan to a real committed IMU frontier. No
+    // synthetic IMU sample or nearest-state substitution is introduced.
+    while (next_scan < scans.size() &&
+           csv::Time(scans[next_scan][1]) <= receive &&
+           csv::Time(scans[next_scan][0]) <= stamp) {
+      std::optional<openloc::replay::NativeScanReader::Decoded> decoded;
+      if (scan_reader && (state.valid || motion_bootstrap)) {
+        decoded = scan_reader->Take(next_scan, stamp);
+        if (!decoded) break;
+      }
+      const auto& source = scans[next_scan];
+      const auto sequence = ++next_scan;
+      u::Result decision;
+      u::MotionInitializationDiagnostics motion_diagnostics;
+      double elapsed = 0.0;
+      const bool bootstrapping = !state.valid;
+      if (bootstrapping && !motion_bootstrap) {
+        ++warmup_scans;
+        decision = {u::Reason::WAITING_FOR_STATIONARY,
+                    "Waiting for native IMU initialization"};
+      } else {
+        u::LidarScan scan;
+        scan.stamp = sample.stamp;
+        scan.stamp.sequence = sequence;
+        scan.epoch = state.epoch;
+        scan.frame_id = config.lidar_frame;
+        scan.calibration_id = config.lidar_calibration_id;
+        scan.base_from_lidar = base_from_lidar;
+        if (decoded) {
+          scan.points = std::move(decoded->points);
+        } else {
+          const auto points = csv::ReadRows((input / source[2]).string(),
+                                            "timestamp_ns,x,y,z", 4);
+          for (const auto& point : points) {
+            scan.points.push_back(
+                {{csv::Number(point[1]), csv::Number(point[2]),
+                  csv::Number(point[3])},
+                 Seconds(point[0])});
+          }
+        }
+        if (scan.points.empty()) throw std::runtime_error("empty raw scan");
+        if (bootstrapping) {
+          started = Clock::now();
+          decision = bootstrap.Observe(scan, &local, &motion_diagnostics);
+          elapsed =
+              std::chrono::duration<double, std::milli>(Clock::now() - started)
+                  .count();
+          ++warmup_scans;
+          if (decision.ok()) initialized_ns = stamp;
+        } else if (scan.points.front().time <
+                   static_cast<double>(initialized_ns) / 1e9) {
+          ++warmup_scans;
+          decision = {u::Reason::HISTORY_UNAVAILABLE,
+                      "Scan overlaps pre-initialization history"};
+        } else {
+          const u::LocalState before = local.internal_state();
+          started = Clock::now();
+          decision = local_scheduler
+                         ? local_scheduler->Submit(&local, scan, stamp)
+                         : local.AddLidar(scan);
+          elapsed =
+              std::chrono::duration<double, std::milli>(Clock::now() - started)
+                  .count();
+          const auto& after = local.internal_state();
+          if (!local_scheduler) {
+            WriteLocalCorrection(corrections, sequence, stamp, decision, before,
+                                 after, state);
+            if (decision.ok()) ++lidar_updates;
+          }
+          // Use the pre-LIO continuous-output frontier already submitted to
+          // the global owner, not a mixture with corrected internal history.
+          if (map) {
+            const std::size_t bytes =
+                sizeof(scan) + scan.points.size() * sizeof(u::TimedLidarPoint);
+            submit_global("scan", bytes, [&, snapshot = scan, stamp, receive] {
+              map->Observe(snapshot, stamp, receive);
+              global_initialized.store(map->initialized());
+            });
+          }
+        }
+      }
+      decisions << sequence << ',' << source[0] << ',' << source[1] << ','
+                << stamp << ',' << receive << ','
+                << u::ReasonName(decision.reason) << ',';
+      csv::Text(decisions, decision.message);
+      decisions << ','
+                << (local_scheduler ? 0
+                                    : local.lidar_observed_pose_basis().rows())
+                << ',' << elapsed << ',' << bootstrapping << '\n';
+      decisions.flush();
+      if (bootstrapping && motion_bootstrap) {
+        initialization
+            << sequence << ',' << stamp << ',' << u::ReasonName(decision.reason)
+            << ',' << motion_diagnostics.linear_system_evaluated << ','
+            << motion_diagnostics.solution_available << ','
+            << motion_diagnostics.minimum_scaled_singular_value << ','
+            << motion_diagnostics.gravity_error << ','
+            << motion_diagnostics.accel_bias_norm << ','
+            << motion_diagnostics.gyro_bias_norm << ','
+            << motion_diagnostics.normalized_residual_rms << ','
+            << motion_diagnostics.angular_residual_rms << ','
+            << motion_translation_deskew << ','
+            << bootstrap.deskew_velocity_in_end_base().transpose().format(
+                   Eigen::IOFormat(Eigen::FullPrecision, 0, ",", ","))
+            << ',' << motion_diagnostics.lidar_stationary_initialization << ','
+            << motion_diagnostics.maximum_lidar_speed << ','
+            << motion_diagnostics.maximum_lidar_angular_speed << ','
+            << motion_diagnostics.maximum_stationary_force_residual << ','
+            << motion_bootstrap_voxel_size << '\n';
+        initialization.flush();
+      }
+      if (!decision.ok() &&
+          !(local_scheduler &&
+            (decision.reason == u::Reason::HISTORY_UNAVAILABLE ||
+             decision.reason == u::Reason::LIDAR_STALE)) &&
+          decision.reason != u::Reason::WAITING_FOR_STATIONARY &&
+          decision.reason != u::Reason::GEOMETRY_UNAVAILABLE &&
+          decision.reason != u::Reason::DEGENERATE &&
+          !(bootstrapping && motion_bootstrap &&
+            (decision.reason == u::Reason::HISTORY_UNAVAILABLE ||
+             decision.reason == u::Reason::DEGENERATE ||
+             decision.reason == u::Reason::MATCH_FAILED ||
+             decision.reason == u::Reason::INNOVATION_REJECTED)) &&
+          !(decision.reason == u::Reason::HISTORY_UNAVAILABLE &&
+            decision.message == "Scan overlaps pre-initialization history"))
+        throw std::runtime_error(decision.message);
+    }
+    if (map) {
+      submit_global("drain", sizeof(receive), [&, receive] {
+        map->DrainGlobal(receive);
+        global_initialized.store(map->initialized());
+      });
+    }
+    if (config.enable_native_joint_error && local.state().valid) {
+      u::LocalState joint;
+      const auto assessment =
+          local.JointErrorLookup(local.state().stamp.time, &joint);
+      joint_audit << index + 1 << ',' << stamp << ',' << receive << ','
+                  << u::ReasonName(assessment.reason) << ',';
+      csv::Text(joint_audit, assessment.message);
+      joint_audit << ','
+                  << (assessment.ok() ? joint.joint_error->covariance.rows() : 0)
+                  << ',' << std::setprecision(17)
+                  << config.native_imu_sample_period << ','
+                  << config.native_joint_max_dimension << ','
+                  << config.native_joint_max_memory_rows << ','
+                  << config.native_joint_max_snapshots << ','
+                  << config.history_duration << ",1,0\n";
+      joint_audit.flush();
+      if (!joint_audit)
+        throw std::runtime_error("incomplete native joint audit");
+      if (!assessment.ok())
+        throw std::runtime_error("native joint audit: " + assessment.message);
+    }
+  }
+  if (scan_reader) scan_reader->Finish();
+  if (local_scheduler) local_scheduler->Finish(last_imu);
+  if (map) {
+    submit_global("finish", 0, [&] { map->Finish(); });
+    if (global_executor) global_executor->Finish();
+  }
+  if (timer) timer->Finish();
+  states.flush();
+  initialization.flush();
+  capability.flush();
+  corrections.flush();
+  if (arrival_paced) {
+    host_timing.flush();
+    if (!host_timing) throw std::runtime_error("incomplete host timing write");
+  }
+  if (imu_trace) {
+    trace.flush();
+    if (!trace) throw std::runtime_error("incomplete IMU trace write");
+  }
+  if (!states || !decisions || !initialization || !capability || !corrections)
+    throw std::runtime_error("incomplete output write");
+  std::ofstream summary(output / "summary.csv");
+  summary << "imu_samples,valid_states,scans_consumed,scans_unconsumed,"
+             "warmup_scans,lidar_updates,initialized_ns\n"
+          << imu.size() << ',' << valid_states << ',' << next_scan << ','
+          << scans.size() - next_scan << ',' << warmup_scans << ','
+          << lidar_updates << ',' << initialized_ns << '\n';
+  summary.close();
+  if (!summary) throw std::runtime_error("incomplete summary write");
+  if (!valid_states || !lidar_updates)
+    throw std::runtime_error(
+        "Native initialization/LIO update not established");
+}
+}  // namespace
+
+int main(int argc, char** argv) {
+  try {
+    if (argc < 3)
+      throw std::runtime_error(
+          "usage: native_lio_replay INPUT_DIR NEW_OUTPUT_DIR "
+          "[--motion-bootstrap] [--imu-trace] [--diagnostic-map BUNDLE "
+          "--map-input-sha256 PCD_IDENTITY_SEED_SHA256_CONCATENATED]");
+    bool motion_bootstrap = false;
+    bool motion_translation_deskew = false;
+    bool lidar_stationary_initialization = false;
+    double motion_bootstrap_voxel_size = 0.5;
+    bool has_bootstrap_voxel_size = false;
+    std::filesystem::path map_bundle;
+    std::string map_digests;
+    std::filesystem::path gnss_bundle;
+    std::string gnss_digests;
+    int64_t global_holdback_ns = 0;
+    bool has_holdback = false;
+    bool imu_trace = false;
+    bool async_global = false;
+    bool arrival_paced = false;
+    int64_t async_local_delay_ns = 0;
+    bool prefetch_lidar = false;
+    bool timer_output = false;
+    bool level_odom_gnss_bootstrap = false;
+    double native_joint_sample_period = 0;
+    std::map<std::string, uint32_t> native_joint_limits;
+    for (int i = 3; i < argc; ++i) {
+      const std::string option(argv[i]);
+      if (option == "--motion-bootstrap" && !motion_bootstrap) {
+        motion_bootstrap = true;
+      } else if (option == "--imu-trace" && !imu_trace) {
+        imu_trace = true;
+      } else if (option == "--native-joint-audit-period-s" &&
+                 native_joint_sample_period == 0 && i + 1 < argc) {
+        native_joint_sample_period = csv::Number(argv[++i]);
+        if (native_joint_sample_period <= 0)
+          throw std::runtime_error("native joint audit requires a positive IMU period");
+      } else if ((option == "--native-joint-max-dimension" ||
+                  option == "--native-joint-max-memory-rows" ||
+                  option == "--native-joint-max-snapshots") &&
+                 !native_joint_limits.count(option) && i + 1 < argc) {
+        const auto limit = csv::Time(argv[++i]);
+        if (limit == 0 || limit > UINT32_MAX)
+          throw std::runtime_error("native joint limit must be a positive uint32");
+        native_joint_limits.emplace(option, static_cast<uint32_t>(limit));
+      } else if (option == "--async-global" && !async_global) {
+        async_global = true;
+      } else if (option == "--arrival-paced" && !arrival_paced) {
+        arrival_paced = true;
+      } else if (option == "--prefetch-lidar" && !prefetch_lidar) {
+        prefetch_lidar = true;
+      } else if (option == "--timer-output" && !timer_output) {
+        timer_output = true;
+      } else if (option == "--diagnostic-level-odom-gnss-bootstrap" &&
+                 !level_odom_gnss_bootstrap) {
+        level_odom_gnss_bootstrap = true;
+      } else if (option == "--async-local-lio-ms" &&
+                 async_local_delay_ns == 0 && i + 1 < argc) {
+        const auto delay_ms = csv::Time(argv[++i]);
+        if (delay_ms < 5 || delay_ms > 100)
+          throw std::runtime_error("local LIO delay must be in [5,100] ms");
+        async_local_delay_ns = delay_ms * 1000000;
+      } else if (option == "--motion-translation-deskew" &&
+                 !motion_translation_deskew) {
+        motion_translation_deskew = true;
+      } else if (option == "--lidar-stationary-initialization" &&
+                 !lidar_stationary_initialization) {
+        lidar_stationary_initialization = true;
+      } else if (option == "--motion-bootstrap-voxel-m" &&
+                 !has_bootstrap_voxel_size && i + 1 < argc) {
+        motion_bootstrap_voxel_size = csv::Number(argv[++i]);
+        has_bootstrap_voxel_size = true;
+      } else if (option == "--diagnostic-map" && map_bundle.empty() &&
+                 i + 1 < argc) {
+        map_bundle = argv[++i];
+      } else if (option == "--map-input-sha256" && map_digests.empty() &&
+                 i + 1 < argc) {
+        map_digests = argv[++i];
+      } else if (option == "--diagnostic-gnss" && gnss_bundle.empty() &&
+                 i + 1 < argc) {
+        gnss_bundle = argv[++i];
+      } else if (option == "--gnss-input-sha256" && gnss_digests.empty() &&
+                 i + 1 < argc) {
+        gnss_digests = argv[++i];
+      } else if (option == "--global-holdback-ns" && !has_holdback &&
+                 i + 1 < argc) {
+        const std::string value(argv[++i]);
+        std::size_t used = 0;
+        global_holdback_ns = std::stoll(value, &used);
+        if (used != value.size() || global_holdback_ns < 0 ||
+            global_holdback_ns > 500000000)
+          throw std::runtime_error(
+              "global holdback must be in [0,500000000] ns");
+        has_holdback = true;
+      } else {
+        throw std::runtime_error("unknown or duplicate replay option");
+      }
+    }
+    if (map_bundle.empty() != map_digests.empty())
+      throw std::runtime_error(
+          "map bundle and explicit input hashes required together");
+    if (!native_joint_limits.empty() && native_joint_sample_period == 0)
+      throw std::runtime_error("native joint limits require native joint audit");
+    if (native_joint_sample_period > 0 &&
+        (!map_bundle.empty() || !gnss_bundle.empty() || arrival_paced ||
+         async_local_delay_ns || prefetch_lidar || timer_output))
+      throw std::runtime_error(
+          "native joint audit requires deterministic local-only replay");
+    if (gnss_bundle.empty() != gnss_digests.empty())
+      throw std::runtime_error(
+          "GNSS bundle and explicit input hashes required together");
+    if (level_odom_gnss_bootstrap && gnss_bundle.empty())
+      throw std::runtime_error("horizontal bootstrap requires GNSS input");
+    if (has_holdback && map_bundle.empty() && gnss_bundle.empty())
+      throw std::runtime_error("global holdback requires map or GNSS input");
+    if (async_global && (map_bundle.empty() && gnss_bundle.empty()))
+      throw std::runtime_error("async global requires map or GNSS input");
+    if (async_global && !arrival_paced)
+      throw std::runtime_error("async global requires arrival-paced replay");
+    if (async_local_delay_ns && !arrival_paced)
+      throw std::runtime_error("async local LIO requires arrival-paced replay");
+    if (prefetch_lidar && !arrival_paced)
+      throw std::runtime_error("LiDAR prefetch requires arrival-paced replay");
+    if (timer_output && !arrival_paced)
+      throw std::runtime_error("timer output requires arrival-paced replay");
+    if (motion_translation_deskew && !motion_bootstrap)
+      throw std::runtime_error("translation deskew requires motion bootstrap");
+    if (lidar_stationary_initialization && !motion_bootstrap)
+      throw std::runtime_error(
+          "LiDAR rest initialization requires motion bootstrap");
+    if (has_bootstrap_voxel_size && !motion_bootstrap)
+      throw std::runtime_error(
+          "bootstrap voxel size requires motion bootstrap");
+    Run(argv[1], argv[2], motion_bootstrap, map_bundle, map_digests,
+        gnss_bundle, gnss_digests, global_holdback_ns,
+        motion_translation_deskew, lidar_stationary_initialization,
+        motion_bootstrap_voxel_size, imu_trace, async_global, arrival_paced,
+        async_local_delay_ns, prefetch_lidar, timer_output,
+        level_odom_gnss_bootstrap, native_joint_sample_period,
+        native_joint_limits);
+    return 0;
+  } catch (const std::exception& error) {
+    std::cerr << "native_lio_replay: " << error.what() << '\n';
+    return 1;
+  }
+}

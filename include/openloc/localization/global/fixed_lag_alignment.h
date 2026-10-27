@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "openloc/localization/global/observation_types.h"
+#include "openloc/localization/local/native_types.h"
 
 namespace openloc {
 namespace localization {
@@ -30,12 +31,17 @@ struct FixedLagAlignmentConfig {
   double solve_budget_ms = 50.0;
   uint32_t maximum_states = 1000;
   uint32_t maximum_observations = 2000;
+  uint32_t maximum_error_dimension = 256;
   std::size_t maximum_decisions = 1000;
   uint32_t verification_frames = 3;
   // An external qualification claim, not inferred from positive covariances,
   // a single cross-covariance, or provenance dependency declarations.
   std::string motion_error_model_id;
   bool motion_error_model_qualified = false;
+  // Explicit functional use of declared sufficient stochastic models before
+  // empirical calibration. Does not waive model validity, source quality,
+  // conditional independence or reference identity. Never trusted output.
+  bool allow_uncalibrated_inputs = false;
 };
 
 struct GraphOdometrySample {
@@ -47,6 +53,9 @@ struct GraphOdometrySample {
       Eigen::Matrix<double, 15, 15>::Zero();
   bool covariance_model_valid = false;
   bool uncertainty_qualified = false;
+  // Optional sufficient joint state; its projected marginal must equal
+  // covariance. Absent means the existing 15D identity projection.
+  std::optional<unified::JointLocalError> joint_error;
 };
 
 struct GraphMotionSource {
@@ -64,17 +73,42 @@ struct GraphMotionConnection {
   Eigen::Matrix<double, 15, 15> cross_covariance =
       Eigen::Matrix<double, 15, 15>::Zero();
   std::vector<GraphMotionSource> sources;
+  // Cov(joint_previous, joint_current). Required if either endpoint has a
+  // joint state, including entry/exit and dimension changes. Its projected
+  // covariance must agree with cross_covariance, never replace it silently.
+  Eigen::MatrixXd joint_cross_covariance;
+};
+
+struct GraphLocalObservationCorrelation {
+  std::string motion_error_model_id;
+  std::string conditional_independence_evidence_id;
+  uint64_t odometry_sequence = 0;
+  // Absent means the observation time. Delayed shared scans may condition on
+  // a later retained error node without changing their measurement/pose time.
+  std::optional<Timestamp> conditioning_time;
+  // Cov(e, n), where n = measured - true in the observation residual chart.
+  // Rows follow the retained joint error (15D without augmentation);
+  // columns follow the measured subspace.
+  Eigen::MatrixXd cross_covariance;
+  // The retained error state must mediate ALL local/temporal/source reuse:
+  // n = C^T P^-1 e + eta, with eta independent of the entire error chain,
+  // previous observations and other source residuals, not just the same node.
+  bool conditional_model_qualified = false;
+  bool residual_independent_of_history_and_sources = false;
 };
 
 struct GraphSourceQualification {
   std::string uncertainty_model_id;
-  // Covers local-motion dependence, temporal reuse and reuse across absolute
-  // sources, including map construction, shared scans and GNSS preprocessing.
+  // Unconditional claims apply only without local_correlation. Covers local
+  // motion, temporal reuse and reuse across absolute sources.
   std::string independence_evidence_id;
   bool quality_valid = false;
   bool uncertainty_qualified = false;
   bool independent_of_local = false;
   bool independent_of_graph_sources = false;
+  // Exclusive with unconditional independence. Covariance on the observation
+  // remains marginal; the backend derives its conditional residual covariance.
+  std::optional<GraphLocalObservationCorrelation> local_correlation;
 };
 
 struct FixedLagAlignmentEstimate {
@@ -109,6 +143,7 @@ struct FixedLagAlignmentResult {
   FrameId odom_frame;
   FrameId base_frame;
   std::string motion_error_model_id;
+  bool diagnostic_only = false;
   // Assessment is separate from retrieving a result. An estimate may be
   // retained while stale, degraded, or undergoing candidate verification.
   Status assessment = Status(StatusCode::kStateUnavailable,
@@ -135,8 +170,9 @@ struct FixedLagAlignmentResult {
 /// match the retained original integer timestamp, not just its rounded key.
 /// Full poses alone can bootstrap/recover. XY/XYZ/projected factors neither
 /// synthesize missing measurements nor renew the full-pose lease.
-/// Source and motion qualifications must be established externally; this API
-/// does not prove independence, publish TF, smooth output, or certify trust.
+/// Source and motion qualifications must be established externally. Qualified
+/// conditional source models can couple observations to its retained joint error;
+/// this API does not prove sufficient-state claims, publish TF, or certify trust.
 class FixedLagGlobalAlignment {
  public:
   FixedLagGlobalAlignment();

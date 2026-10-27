@@ -42,7 +42,9 @@ class FixedLagGlobalAlignment::Impl {
     }
     const auto reference = ValidateGeodeticReference(config.reference.geodetic);
     if (!reference.ok()) return reference;
-    if (config.reference.geodetic.state != GeodeticReferenceState::kVerified ||
+    if ((config.reference.geodetic.state != GeodeticReferenceState::kVerified &&
+         !(config.allow_uncalibrated_inputs &&
+           config.reference.geodetic.state == GeodeticReferenceState::kDiagnosticOnly)) ||
         config.reference.id.empty() || config.reference.version.empty() ||
         config.reference.calibration_id.empty() ||
         config.map_content_id.empty() || config.motion_error_model_id.empty() ||
@@ -74,9 +76,11 @@ class FixedLagGlobalAlignment::Impl {
     policy.global_timeout = Seconds(config.maximum_full_pose_age_ns);
     policy.enable_fixed_lag_graph = true;
     policy.motion_error_model_qualified = config.motion_error_model_qualified;
+    policy.graph_allow_uncalibrated_inputs = config.allow_uncalibrated_inputs;
     policy.graph_solve_budget_ms = config.solve_budget_ms;
     policy.graph_max_states = config.maximum_states;
     policy.graph_max_observations = config.maximum_observations;
+    policy.graph_max_error_dimension = config.maximum_error_dimension;
     policy.verification_frames = config.verification_frames;
     auto owner = std::make_unique<u::GlobalAlignment>(policy);
     const auto status = Convert(owner->ValidateConfig());
@@ -108,7 +112,8 @@ class FixedLagGlobalAlignment::Impl {
       owner_->Invalidate(u::Reason::INVALID_INPUT);
       return status;
     }
-    if (!input.covariance_model_valid || !input.uncertainty_qualified) {
+    if (!input.covariance_model_valid ||
+        (!input.uncertainty_qualified && !config_.allow_uncalibrated_inputs)) {
       owner_->Invalidate(u::Reason::UNCERTAINTY_UNQUALIFIED);
       return Status(StatusCode::kRejectedMeasurement,
                     "local error model or uncertainty is unqualified");
@@ -123,7 +128,19 @@ class FixedLagGlobalAlignment::Impl {
     local.covariance = input.covariance;
     local.covariance_model_valid = input.covariance_model_valid;
     local.uncertainty_qualified = input.uncertainty_qualified;
+    local.joint_error = input.joint_error;
     local.valid = true;
+    if (local.joint_error &&
+        local.joint_error->covariance.rows() > config_.maximum_error_dimension) {
+      owner_->Invalidate(u::Reason::INVALID_INPUT);
+      return Status(StatusCode::kInvalidArgument,
+                    "joint error dimension exceeds configured graph capacity");
+    }
+    const auto joint = u::ValidateJointLocalError(local);
+    if (!joint.ok()) {
+      owner_->Invalidate(joint.reason);
+      return Convert(joint);
+    }
     const auto* previous = owner_->latest_local();
     if (previous != nullptr &&
         (local.stamp.time <= previous->stamp.time ||
@@ -159,6 +176,10 @@ class FixedLagGlobalAlignment::Impl {
       if (!computed.ok()) {
         return RejectMotion(odometry, local, computed);
       }
+      motion.joint_cross_covariance = connection->joint_cross_covariance;
+      const auto joint_motion = u::ValidateJointMotion(*previous, local, motion);
+      if (!joint_motion.ok())
+        return RejectMotion(odometry, local, joint_motion);
     }
     status = Convert(owner_->AddLocal(local, connection ? &motion : nullptr));
     RetainOdometry(odometry, local);
@@ -259,19 +280,62 @@ class FixedLagGlobalAlignment::Impl {
     if (!alignment_bridge::ValidProvenance(context.provenance) ||
         observation.covariance_source.empty() ||
         qualification.uncertainty_model_id.empty() ||
-        qualification.independence_evidence_id.empty() ||
-        !qualification.quality_valid || !qualification.uncertainty_qualified ||
-        !qualification.independent_of_local ||
-        !qualification.independent_of_graph_sources) {
+        (!qualification.local_correlation &&
+         qualification.independence_evidence_id.empty()) ||
+        !qualification.quality_valid ||
+        (!qualification.uncertainty_qualified &&
+         !config_.allow_uncalibrated_inputs) ||
+        (!qualification.local_correlation &&
+         (!qualification.independent_of_local ||
+          !qualification.independent_of_graph_sources))) {
       return Status(StatusCode::kRejectedMeasurement,
                     "graph source quality, uncertainty or independence "
                     "qualification is unavailable");
+    }
+    if (qualification.local_correlation) {
+      const auto& model = *qualification.local_correlation;
+      const auto dimension = observation.kind == u::GlobalObservation::Kind::POSE ? 6
+          : observation.kind == u::GlobalObservation::Kind::POSITION ? 3
+          : observation.kind == u::GlobalObservation::Kind::HORIZONTAL_POSITION ? 2
+          : observation.projection.rows();
+      if (qualification.independent_of_local ||
+          qualification.independent_of_graph_sources ||
+          model.motion_error_model_id != config_.motion_error_model_id ||
+          model.conditional_independence_evidence_id.empty() ||
+          !model.conditional_model_qualified ||
+          !model.residual_independent_of_history_and_sources ||
+          model.odometry_sequence == 0 ||
+          model.cross_covariance.rows() < 15 ||
+          model.cross_covariance.rows() > config_.maximum_error_dimension ||
+          model.cross_covariance.cols() != dimension ||
+          !model.cross_covariance.allFinite()) {
+        return Status(StatusCode::kRejectedMeasurement,
+                      "conditional source model or sufficient-state qualification is unavailable");
+      }
+      observation.local_error_cross_covariance = model.cross_covariance;
+      observation.local_error_sequence = model.odometry_sequence;
+      if (model.conditioning_time) {
+        const auto valid = ValidateTimestamp(*model.conditioning_time);
+        if (!valid.ok()) return valid;
+        if (model.conditioning_time->clock_domain != config_.clock_domain)
+          return Status(StatusCode::kClockDomainMismatch,
+                        "conditional error clock differs from configuration");
+        const double time = Seconds(model.conditioning_time->nanoseconds);
+        const auto exact = exact_times_.find(time);
+        if (exact == exact_times_.end() ||
+            exact->second != model.conditioning_time->nanoseconds)
+          return Status(StatusCode::kOutsideHistory,
+                        "conditional error has no matching integer-time ODOM node");
+        observation.local_error_time = time;
+      }
+      observation.conditional_local_error_qualified = true;
     }
     for (const auto dependency : {context.provenance.odometry_initialization,
                                   context.provenance.odometry_deskew,
                                   context.provenance.shared_local_scans,
                                   context.provenance.gnss_map_construction}) {
-      if (dependency == ObservationDependency::kPresent) {
+      if (dependency == ObservationDependency::kPresent &&
+          !qualification.local_correlation) {
         return Status(StatusCode::kRejectedMeasurement,
                       "known shared dependencies have no joint graph factor");
       }
@@ -284,6 +348,7 @@ class FixedLagGlobalAlignment::Impl {
     }
     observation.quality_valid = qualification.quality_valid;
     observation.uncertainty_qualified = qualification.uncertainty_qualified;
+    observation.diagnostic_only = config_.allow_uncalibrated_inputs;
     observation.independent_of_local = qualification.independent_of_local;
     return Convert(owner_->Observe(observation));
   }
@@ -317,6 +382,7 @@ class FixedLagGlobalAlignment::Impl {
     output.odom_frame = config_.odom_frame;
     output.base_frame = config_.base_frame;
     output.motion_error_model_id = config_.motion_error_model_id;
+    output.diagnostic_only = config_.allow_uncalibrated_inputs;
     output.assessment =
         Convert(owner_->Evaluate(Seconds(evaluation_time.nanoseconds)));
     const auto& state = owner_->state();

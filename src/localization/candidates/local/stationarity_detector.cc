@@ -23,6 +23,7 @@ StationarityDetector::StationarityDetector(const LocalConfig& config)
 
 void StationarityDetector::Reset() {
   sample_count_ = 0;
+  last_mean_sequence_ = 0;
   start_time_ = 0.0;
   acceleration_sum_.setZero();
   angular_velocity_sum_.setZero();
@@ -59,6 +60,7 @@ void StationarityDetector::Observe(const ImuSample& imu,
       start_time_ = imu.stamp.time;
     }
     ++sample_count_;
+    last_mean_sequence_ = imu.stamp.sequence;
     acceleration_sum_ += imu.acceleration;
     angular_velocity_sum_ += imu.angular_velocity;
     mean_acceleration_ = acceleration_sum_ / sample_count_;

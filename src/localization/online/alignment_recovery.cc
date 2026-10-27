@@ -38,7 +38,7 @@ void GnssAlignmentRecovery::StartTrainingWindow(
   has_candidate_ = false;
 }
 
-Status GnssAlignmentRecovery::AddRejectedObservation(
+Status GnssAlignmentRecovery::AddObservation(
     const GnssAlignmentRecoveryObservation& observation,
     GnssAlignmentRecoveryDiagnostics* diagnostics,
     GnssAlignmentRecoveryCandidate* candidate) {

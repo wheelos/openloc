@@ -50,14 +50,16 @@ class PublicReplayContracts(unittest.TestCase):
                 stamp = (index + 1) * 10**9
                 x = min(index, 22) * 2
                 odom.append([stamp, x, 0, 3, 0, 0, 0, 1])
-                fixes.append([stamp, stamp, x + (10 if index >= 5 else 0), 0, 1, 1])
+                fixes.append(
+                    [stamp, stamp, x + (10 if index >= 15 else 0), 0, 1, 1]
+                )
             result, output = self.invoke(root, odom, fixes)
             self.assertEqual(result.returncode, 0, result.stderr)
             rows = read_csv(output)
             moving = [
                 row for row in rows
-                if row["alignment_revision"] != "0"
-                and int(row["odom_ns"]) <= 23 * 10**9
+                if row["alignment_revision"] == "2"
+                and 27 * 10**9 <= int(row["odom_ns"]) <= 29 * 10**9
             ]
             self.assertTrue(moving)
             for row in moving:
@@ -65,6 +67,17 @@ class PublicReplayContracts(unittest.TestCase):
                 self.assertEqual(row["publication_state"], "held_for_reset")
                 self.assertEqual(row["pending"], "1")
                 self.assertEqual(row["vertical_initialized"], "0")
+            factors = read_csv(Path(str(output) + ".factors.csv"))
+            bootstrap = [
+                row for row in factors
+                if row["source"] == "gnss_single_antenna_bootstrap"
+                and row["accepted"] == "1"
+            ]
+            self.assertEqual(len(bootstrap), 1)
+            self.assertEqual(
+                bootstrap[0]["reason"],
+                "single_antenna_course_bootstrap_holdout_validated",
+            )
             self.assertEqual(rows[-1]["reset_counter"], "1")
             self.assertEqual(rows[-1]["mean_matches"], "1")
             self.assertEqual(rows[-1]["backend_tz"], "0")
@@ -123,6 +136,8 @@ class PublicReplayContracts(unittest.TestCase):
             self.assertEqual(factors[0]["reason"], "pending_odometry_bracket")
             self.assertEqual(factors[-1]["timestamp_ns"], "1500000000")
             self.assertEqual(factors[-1]["arrival_ns"], "2000000000")
+            self.assertEqual(factors[-1]["record_index"], factors[0]["record_index"])
+            self.assertNotEqual(factors[-1]["reason"], "pending_odometry_bracket")
             self.assertEqual(read_csv(Path(str(output) + ".summary.csv"))[0]
                              ["pending_at_end"], "0")
         for bad in ("nan", "0"):
@@ -142,7 +157,7 @@ class PublicReplayContracts(unittest.TestCase):
                 odom.append([stamp, 2 * index, 0, 3, 0, 0, 0, 1])
                 if 25 <= index < 35:
                     continue
-                offset = 10 if index >= 5 else 0
+                offset = 10 if index >= 15 else 0
                 if index == 45:
                     offset += 1000
                 fixes.append([stamp, stamp, 2 * index + offset, 0, 1, 1])
@@ -172,6 +187,47 @@ class PublicReplayContracts(unittest.TestCase):
                        if row["timestamp_ns"] == str(46 * 10**9)]
             self.assertTrue(outlier)
             self.assertTrue(all(row["accepted"] == "0" for row in outlier))
+
+    def test_pending_course_bootstrap_replaces_pending_fix_record(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            odom = [
+                [(index + 1) * 10**9, 2 * index, 0, 3, 0, 0, 0, 1]
+                for index in range(17)
+            ]
+            fixes = [
+                [
+                    index * 10**9 + 1500000000,
+                    index * 10**9 + 1500000000,
+                    2 * index + 11,
+                    0,
+                    1,
+                    1,
+                ]
+                for index in range(16)
+            ]
+            result, output = self.invoke(root, odom, fixes)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            factor_updates = read_csv(Path(str(output) + ".factors.csv"))
+            final_factors = {}
+            for row in factor_updates:
+                final_factors[row["record_index"]] = row
+            self.assertEqual(len(final_factors), len(fixes))
+            self.assertTrue(
+                all(row["reason"] != "pending_odometry_bracket"
+                    for row in final_factors.values())
+            )
+            bootstraps = [
+                row for row in final_factors.values()
+                if row["source"] == "gnss_single_antenna_bootstrap"
+            ]
+            self.assertTrue(bootstraps)
+            self.assertEqual(bootstraps[-1]["accepted"], "1")
+            self.assertEqual(
+                read_csv(Path(str(output) + ".summary.csv"))[0]
+                ["pending_at_end"],
+                "0",
+            )
 
 
 if __name__ == "__main__":

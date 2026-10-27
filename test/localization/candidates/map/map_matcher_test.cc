@@ -86,6 +86,71 @@ TEST(MapMatcherTest, MissingMapAndEmptyHypothesesAreExplicitErrors) {
   EXPECT_EQ(Reason::MAP_NOT_READY, matcher.SetMap(cloud).reason);
 }
 
+TEST(MapMatcherTest, ActualIcpRetainsSharedRawLoadingsWithoutChangingNominal) {
+  auto config = Config();
+  config.algorithm = RegistrationAlgorithm::kPointToPlaneIcp;
+  auto map = AsymmetricMap();
+  for (std::size_t i = 0; i < map->size(); ++i) {
+    const Eigen::Vector3d shifted =
+        Eigen::Vector3d((*map)[i].x, (*map)[i].y, (*map)[i].z) +
+        Eigen::Vector3d(0.03713, 0.04317, 0.05119) +
+        Eigen::Vector3d::Constant(0.000023 * (i % 7));
+    (*map)[i] = pcl::PointXYZ(shifted.x(), shifted.y(), shifted.z());
+  }
+  MapMatcher matcher(config);
+  ASSERT_TRUE(matcher.SetMap(map, true).ok());
+  MatchResult nominal, modeled;
+  ASSERT_TRUE(matcher.Match(map, Eigen::Isometry3d::Identity(), &nominal).ok());
+  RegistrationErrorMap errors;
+  const auto matched =
+      matcher.Match(map, Eigen::Isometry3d::Identity(), &modeled, &errors);
+  ASSERT_TRUE(matched.ok()) << matched.message;
+  ASSERT_TRUE(errors.assessment.ok()) << errors.assessment.message;
+  EXPECT_TRUE(nominal.pose.matrix().isApprox(modeled.pose.matrix(), 0));
+  EXPECT_TRUE(nominal.covariance.isApprox(modeled.covariance, 0));
+  EXPECT_EQ(nominal.iterations, modeled.iterations);
+  ASSERT_EQ(errors.source_point_jacobians.size(), map->size());
+  ASSERT_EQ(errors.target_point_jacobians.size(), map->size());
+  Eigen::Matrix<double, 6, 3> source_translation =
+      Eigen::Matrix<double, 6, 3>::Zero();
+  Eigen::Matrix<double, 6, 3> target_translation = source_translation;
+  double shared_noise = 0;
+  double independent_noise = 0;
+  for (std::size_t i = 0; i < map->size(); ++i) {
+    const auto& source = errors.source_point_jacobians[i];
+    const auto& target = errors.target_point_jacobians[i];
+    source_translation += source;
+    target_translation += target;
+    shared_noise += (source + target).squaredNorm();
+    independent_noise += source.squaredNorm() + target.squaredNorm();
+  }
+  Eigen::Matrix<double, 6, 3> translated =
+      Eigen::Matrix<double, 6, 3>::Zero();
+  translated.topRows<3>().setIdentity();
+  EXPECT_TRUE(source_translation.isApprox(-translated, 1e-5));
+  EXPECT_TRUE(target_translation.isApprox(translated, 1e-5));
+  EXPECT_GT(independent_noise, 0);
+  EXPECT_LT(shared_noise, independent_noise * 1e-8);
+}
+
+TEST(MapMatcherTest, RawErrorSupportRejectionDoesNotReplaceNominalRegistration) {
+  auto config = Config();
+  config.algorithm = RegistrationAlgorithm::kPointToPlaneIcp;
+  const auto map = AsymmetricMap();
+  MapMatcher matcher(config);
+  ASSERT_TRUE(matcher.SetMap(map).ok());
+  MatchResult result;
+  RegistrationErrorMap errors;
+  ASSERT_TRUE(matcher.Match(map, Eigen::Isometry3d::Identity(), &result, &errors).ok());
+  EXPECT_EQ(errors.assessment.reason, Reason::CORRELATION_UNQUALIFIED);
+  EXPECT_TRUE(errors.source_point_jacobians.empty());
+  ASSERT_TRUE(matcher.SetMap(map, true).ok());
+  ASSERT_TRUE(matcher.Match(map, Eigen::Isometry3d::Identity(), &result, &errors).ok());
+  EXPECT_EQ(errors.assessment.reason, Reason::CORRELATION_UNQUALIFIED);
+  EXPECT_NE(errors.assessment.message.find("voxel assignment"), std::string::npos);
+  EXPECT_TRUE(errors.source_point_jacobians.empty());
+}
+
 TEST(MapMatcherTest, RejectsInvalidVoxelAndSolverBudgets) {
   const Cloud::Ptr map = AsymmetricMap();
   MatchConfig config = Config();

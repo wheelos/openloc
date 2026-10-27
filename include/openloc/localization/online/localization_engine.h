@@ -88,6 +88,10 @@ struct LocalizationConfig {
   double heading_innovation_gate_threshold = 6.6348966010212145;
   /// Experimental global-only re-acquisition; disabled unless explicitly set.
   bool enable_gnss_reacquisition = false;
+  /// If no accepted dual-antenna heading is available, initialize global XY
+  /// and yaw only after a multi-fix ODOM baseline and GNSS holdout validate.
+  /// This course-derived yaw is not a direct receiver heading observation.
+  bool enable_single_antenna_bootstrap = true;
   uint32_t minimum_satellites = 12;
   double maximum_hdop = 1.5;
   double maximum_differential_age_seconds = 3.0;

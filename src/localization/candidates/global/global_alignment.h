@@ -17,6 +17,9 @@
 
 namespace openloc {
 namespace localization {
+namespace internal {
+class GnssAlignmentRecovery;
+}
 namespace unified {
 
 class FixedLagGraph;
@@ -54,6 +57,8 @@ class GlobalAlignment {
   void ClearEpoch(const Epoch& epoch);
   Result ObservePartial(const GlobalObservation& observation,
                         const LocalState& local, SourceCounters* source);
+  Result ObserveHorizontal(const GlobalObservation& observation,
+                           const LocalState& local, SourceCounters* source);
   Result InitializeGraph(const GlobalObservation& observation,
                          const LocalState& local);
   void AdoptGraphState();
@@ -72,6 +77,8 @@ class GlobalAlignment {
   Reason reason_ = Reason::GLOBAL_UNAVAILABLE;
   std::unique_ptr<FixedLagGraph> graph_;
   std::map<double, MotionIncrement> motion_history_;
+  std::unique_ptr<internal::GnssAlignmentRecovery> horizontal_bootstrap_;
+  std::string horizontal_source_;
 };
 
 }  // namespace unified

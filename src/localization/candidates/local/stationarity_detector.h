@@ -23,6 +23,7 @@ class StationarityDetector {
                bool allow_imu_only, bool reset_window = false);
   bool Qualified(double time) const;
   uint32_t sample_count() const { return sample_count_; }
+  uint64_t last_mean_sequence() const { return last_mean_sequence_; }
   const Eigen::Vector3d& mean_acceleration() const {
     return mean_acceleration_;
   }
@@ -43,6 +44,7 @@ class StationarityDetector {
   double stationary_duration_;
   uint32_t required_samples_;
   uint32_t sample_count_ = 0;
+  uint64_t last_mean_sequence_ = 0;
   double start_time_ = 0.0;
   Eigen::Vector3d acceleration_sum_ = Eigen::Vector3d::Zero();
   Eigen::Vector3d angular_velocity_sum_ = Eigen::Vector3d::Zero();

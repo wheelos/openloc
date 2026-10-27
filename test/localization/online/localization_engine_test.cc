@@ -97,6 +97,7 @@ LocalizationConfig TestConfig() {
   config.gnss_baseline_in_base = Eigen::Vector3d(1.0, 0.0, 0.0);
   config.fixed_solution_stability_ns = 0;
   config.minimum_heading_admission_interval_ns = 0;
+  config.enable_single_antenna_bootstrap = false;
   config.alignment_segment_distance_m = 0.5;
   config.alignment_segment_max_duration_ns = 500'000'000LL;
   config.odometry_buffer.maximum_interpolation_gap_ns = 200'000'000LL;
@@ -436,7 +437,9 @@ bool TestPendingFixUsesSensorTimestampAndBracket() {
   return true;
 }
 
-bool TestFirstQualifiedFixInitializesGlobalAlignment() {
+}  // namespace
+
+bool TestDisabledSingleAntennaBootstrapAllowsFirstFixInitialization() {
   LocalizationEngine engine;
   if (!Expect(engine.Configure(TestConfig()).ok(),
               "engine configuration failed") ||
@@ -464,6 +467,124 @@ bool TestFirstQualifiedFixInitializesGlobalAlignment() {
   }
   return true;
 }
+
+bool TestSingleAntennaBootstrapWaitsForMotionAndHoldout() {
+  LocalizationConfig config = TestConfig();
+  config.enable_single_antenna_bootstrap = true;
+  config.minimum_gnss_admission_interval_ns = 0;
+  LocalizationEngine engine;
+  if (!Expect(engine.Configure(config).ok(),
+              "single-antenna bootstrap should configure")) {
+    return false;
+  }
+
+  constexpr double kYaw = 0.6;
+  Eigen::Matrix2d rotation;
+  rotation << std::cos(kYaw), -std::sin(kYaw), std::sin(kYaw), std::cos(kYaw);
+  const Eigen::Vector2d translation(12.0, -4.0);
+  LocalizationResult result;
+  for (int index = 0; index <= 10; ++index) {
+    const int64_t timestamp =
+        kStartTimeNs + static_cast<int64_t>(index) * 1'000'000'000LL;
+    const Eigen::Vector2d odom_xy(index, 0.1 * index * index);
+    OdometrySample odometry = Odometry(timestamp, odom_xy.x());
+    odometry.pose.translation.y() = odom_xy.y();
+    if (!Expect(engine.AddOdometry(odometry).ok(),
+                "bootstrap ODOM should be accepted")) {
+      return false;
+    }
+    GnssHorizontalFix fix =
+        HorizontalFix(timestamp, rotation * odom_xy + translation);
+    const Status status = engine.SubmitGnssHorizontalFix(fix);
+    if (index < 10 &&
+        !Expect(status.code() == StatusCode::kRejectedMeasurement,
+                "bootstrap must wait for independent holdout observations")) {
+      return false;
+    }
+    if (index == 10 &&
+        !Expect(status.ok(),
+                "validated single-antenna bootstrap should initialize")) {
+      return false;
+    }
+    if (!Expect(engine.GetResult(&result).ok(),
+                "bootstrap result should remain queryable") ||
+        (index < 10 &&
+         !Expect(!result.global_alignment_valid && !result.heading_initialized,
+                 "partial position track must not claim global alignment"))) {
+      return false;
+    }
+  }
+
+  return Expect(
+      result.global_alignment_valid && !result.vertical_position_initialized &&
+          result.alignment_revision == 1 &&
+          std::abs(result.map_from_odom[3] - kYaw) < 1e-6 &&
+          (result.map_from_odom.head<2>() - translation).norm() < 1e-5 &&
+          result.factor_records.back().accepted &&
+          result.factor_records.back().source ==
+              "gnss_single_antenna_bootstrap" &&
+          result.factor_records.size() == 11 &&
+          result.factor_records.back().reason ==
+              "single_antenna_course_bootstrap_holdout_validated",
+      "bootstrap must publish only the validated XY/yaw candidate");
+}
+
+bool TestSingleAntennaBootstrapDoesNotInferYawWhileStationary() {
+  LocalizationConfig config = TestConfig();
+  config.enable_single_antenna_bootstrap = true;
+  config.minimum_gnss_admission_interval_ns = 0;
+  LocalizationEngine engine;
+  if (!Expect(engine.Configure(config).ok(),
+              "stationary bootstrap should configure")) {
+    return false;
+  }
+  LocalizationResult result;
+  for (int index = 0; index <= 10; ++index) {
+    const int64_t timestamp =
+        kStartTimeNs + static_cast<int64_t>(index) * 1'000'000'000LL;
+    if (!Expect(engine.AddOdometry(Odometry(timestamp, 0.0)).ok(),
+                "stationary ODOM should be accepted")) {
+      return false;
+    }
+    const Status status = engine.SubmitGnssHorizontalFix(
+        HorizontalFix(timestamp, Eigen::Vector2d(20.0, -10.0)));
+    if (!Expect(status.code() == StatusCode::kRejectedMeasurement,
+                "stationary single-antenna fixes must not initialize yaw") ||
+        !Expect(engine.GetResult(&result).ok() &&
+                    !result.global_alignment_valid &&
+                    !result.heading_initialized,
+                "unobservable yaw must not be reported as aligned")) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool TestDualAntennaHeadingInitializesWithoutCourseBootstrap() {
+  LocalizationConfig config = TestConfig();
+  config.enable_single_antenna_bootstrap = true;
+  LocalizationEngine engine;
+  if (!Expect(engine.Configure(config).ok() &&
+                  engine.AddOdometry(Odometry(kStartTimeNs, 0.0)).ok() &&
+                  engine.SubmitGnssHeading(Heading(kStartTimeNs, 0.7)).ok(),
+              "qualified dual-antenna heading should initialize yaw")) {
+    return false;
+  }
+  const Status fix_status = engine.SubmitGnssHorizontalFix(
+      HorizontalFix(kStartTimeNs, Eigen::Vector2d(30.0, 5.0)));
+  LocalizationResult result;
+  return Expect(
+      fix_status.ok() && engine.GetResult(&result).ok() &&
+          result.heading_initialized && result.global_alignment_valid &&
+          result.factor_records.size() == 2 &&
+          result.factor_records.front().source == "gnss_heading" &&
+          result.factor_records.back().type == "ABS_POS2" &&
+          result.factor_records.back().reason == "accepted_initialization" &&
+          std::abs(result.map_from_odom[3] - 0.7) < 0.02,
+      "dual-antenna heading must bypass single-antenna course bootstrap");
+}
+
+namespace {
 
 bool TestGnssUpdateLeavesOdometryInputUnchanged() {
   LocalizationEngine engine;
@@ -1581,8 +1702,11 @@ int main() {
       TestConsistentRejectedGnssReanchorsGlobalWithoutChangingOdometry;
   using openloc::localization::TestDelayedFixUsesPublicationEpochForRateLimit;
   using openloc::localization::TestDiagnosticOnlyGeodeticReferenceIsExplicit;
+  using openloc::localization::
+      TestDisabledSingleAntennaBootstrapAllowsFirstFixInitialization;
   using openloc::localization::TestDualAntennaHeadingInitializationAndGate;
-  using openloc::localization::TestFirstQualifiedFixInitializesGlobalAlignment;
+  using openloc::localization::
+      TestDualAntennaHeadingInitializesWithoutCourseBootstrap;
   using openloc::localization::TestGeodeticReferenceConfigurationIsFailClosed;
   using openloc::localization::TestGnssUpdateLeavesOdometryInputUnchanged;
   using openloc::localization::TestGravityFrameContractAndRollPitchOdometry;
@@ -1604,6 +1728,10 @@ int main() {
   using openloc::localization::
       TestRecoverySurvivesStabilityWaitingButNotBadQualityOrExpiry;
   using openloc::localization::TestSegmentBoundaryAndFixedLagRejection;
+  using openloc::localization::
+      TestSingleAntennaBootstrapDoesNotInferYawWhileStationary;
+  using openloc::localization::
+      TestSingleAntennaBootstrapWaitsForMotionAndHoldout;
   using openloc::localization::TestStableFixedSolutionAndDropoutUncertainty;
   using openloc::localization::TestSyntheticReplayIsDeterministic;
   using openloc::localization::TestTrackingIsBoundedAndStopsOnStaleEvidence;
@@ -1619,7 +1747,10 @@ int main() {
                  TestGravityFrameContractAndRollPitchOdometry() &&
                  TestDualAntennaHeadingInitializationAndGate() &&
                  TestPendingFixUsesSensorTimestampAndBracket() &&
-                 TestFirstQualifiedFixInitializesGlobalAlignment() &&
+                 TestDisabledSingleAntennaBootstrapAllowsFirstFixInitialization() &&
+                 TestSingleAntennaBootstrapWaitsForMotionAndHoldout() &&
+                 TestSingleAntennaBootstrapDoesNotInferYawWhileStationary() &&
+                 TestDualAntennaHeadingInitializesWithoutCourseBootstrap() &&
                  TestGnssUpdateLeavesOdometryInputUnchanged() &&
                  TestPositionOnlyConfigurationNeedsNoHeadingBaseline() &&
                  TestHorizontalFixSharesAdmissionWithoutInventingHeight() &&

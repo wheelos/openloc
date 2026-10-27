@@ -6,9 +6,11 @@
 
 #include "candidates/global/fixed_lag_graph.h"
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 
+#include "Eigen/Cholesky"
 #include "gtest/gtest.h"
 
 #include "candidates/global/global_alignment.h"
@@ -61,6 +63,105 @@ MotionIncrement Motion(const LocalState& start, const LocalState& end) {
       {{"imu", start.stamp.sequence}, {"imu", end.stamp.sequence}}, &motion);
   EXPECT_TRUE(result.ok()) << result.message;
   return motion;
+}
+
+LocalState JointLocal(uint64_t index) {
+  auto state = Local(index);
+  const Eigen::Index dimension = index >= 3 && index <= 5 ? 17 : 16;
+  JointLocalError model;
+  model.covariance = Eigen::MatrixXd::Identity(dimension, dimension) * 0.1;
+  model.covariance(15, 15) = 0.025;
+  model.output_jacobian = Eigen::MatrixXd::Zero(15, dimension);
+  model.output_jacobian.leftCols<15>().setIdentity();
+  model.output_jacobian(0, 15) = 0.2 * index;
+  state.covariance = model.output_jacobian * model.covariance *
+                     model.output_jacobian.transpose();
+  state.joint_error = std::move(model);
+  return state;
+}
+
+MotionIncrement JointMotion(const LocalState& start, const LocalState& end) {
+  const auto first = JointErrorCovariance(start);
+  const auto second = JointErrorCovariance(end);
+  Eigen::MatrixXd cross = Eigen::MatrixXd::Zero(first.rows(), second.rows());
+  const auto shared = std::min(first.rows(), second.rows());
+  cross.topLeftCorner(shared, shared) = first.topLeftCorner(shared, shared);
+  const Matrix15d projected =
+      JointOutputJacobian(start) * cross * JointOutputJacobian(end).transpose();
+  MotionIncrement motion;
+  const auto result = ComputeMotionIncrement(
+      start, end, projected,
+      {{"imu", start.stamp.sequence}, {"imu", end.stamp.sequence}}, &motion);
+  EXPECT_TRUE(result.ok()) << result.message;
+  motion.joint_cross_covariance = cross;
+  return motion;
+}
+
+TEST(FixedLagGraphTest, HiddenSharedMemorySurvivesDimensionChangesAndLag) {
+  FixedLagGraph graph(Policy());
+  auto previous = JointLocal(0);
+  ASSERT_TRUE(graph.Initialize(previous, Observation(previous, 1)).ok());
+  Eigen::Matrix2d information = Eigen::Matrix2d::Zero();
+  information.diagonal() << 100.0, 40.0;
+  Eigen::Vector2d right = Eigen::Vector2d::Zero();
+  for (uint64_t index = 1; index <= 8; ++index) {
+    const auto local = JointLocal(index);
+    const auto added = graph.AddLocal(local, JointMotion(previous, local));
+    ASSERT_TRUE(added.ok()) << added.message;
+    if (index == 1 || index == 4) {
+      const auto measured = JointLocal(index == 1 ? 1 : 2);
+      auto fix = Observation(measured, 1);
+      fix.source = index == 1 ? "shared-memory-a" : "shared-memory-b";
+      fix.kind = GlobalObservation::Kind::HORIZONTAL_POSITION;
+      fix.pose.translation().x() += 0.05;
+      fix.covariance.topLeftCorner<2, 2>() =
+          Eigen::Matrix2d::Identity() * 0.05;
+      fix.independent_of_local = false;
+      fix.conditional_local_error_qualified = true;
+      fix.local_error_sequence = measured.stamp.sequence;
+      fix.local_error_cross_covariance =
+          Eigen::MatrixXd::Zero(JointErrorCovariance(measured).rows(), 2);
+      fix.local_error_cross_covariance(15, 0) = 0.025;
+      const auto observed = graph.Observe(fix);
+      ASSERT_TRUE(observed.ok()) << observed.message;
+      // z = x_anchor + (output loading + source loading) * memory + eta.
+      const Eigen::Vector2d row(
+          1.0, JointOutputJacobian(measured)(0, 15) + 1.0);
+      information += row * row.transpose() / 0.025;
+      right += row * 0.05 / 0.025;
+    }
+    const Eigen::Vector2d posterior = information.ldlt().solve(right);
+    const double expected = 100 + posterior.x() + 0.2 * index * posterior.y();
+    EXPECT_NEAR(graph.state().map_to_odom.translation().x(), expected, 1e-7);
+    previous = local;
+  }
+}
+
+TEST(FixedLagGraphTest, RejectsInvalidHiddenCovarianceWithoutConsumingNode) {
+  auto policy = Policy();
+  policy.max_error_dimension = 16;
+  FixedLagGraph graph(policy);
+  auto previous = JointLocal(0);
+  auto malformed = previous;
+  malformed.joint_error->output_jacobian(0, 15) = 1;
+  EXPECT_EQ(graph.Initialize(malformed, Observation(malformed, 1)).reason,
+            Reason::INVALID_INPUT);
+  ASSERT_TRUE(graph.Initialize(previous, Observation(previous, 1)).ok());
+  const auto local = JointLocal(1);
+  auto motion = JointMotion(previous, local);
+  const auto revision = graph.state().correction_id;
+  motion.joint_cross_covariance(15, 15) *= 2;
+  // Published marginals/cross-covariance still match, but the hidden block
+  // implies negative conditional covariance and must not be discarded.
+  motion.cross_covariance =
+      JointOutputJacobian(previous) * motion.joint_cross_covariance *
+      JointOutputJacobian(local).transpose();
+  EXPECT_EQ(graph.AddLocal(local, motion).reason, Reason::INVALID_INPUT);
+  EXPECT_EQ(graph.state().correction_id, revision);
+  ASSERT_TRUE(graph.AddLocal(local, JointMotion(previous, local)).ok());
+  auto over_capacity = JointLocal(3);
+  EXPECT_EQ(graph.AddLocal(over_capacity, JointMotion(local, over_capacity)).reason,
+            Reason::INVALID_INPUT);
 }
 
 TEST(FixedLagGraphTest, PositionOrCorrelatedEvidenceCannotCreateAnAnchor) {
@@ -182,7 +283,7 @@ TEST(FixedLagGraphTest, UnmodeledLocalCovarianceCannotAnchorOrAdvanceGraph) {
   const auto motion = Motion(Local(0), Local(1));
   local = Local(1);
   local.covariance_model_valid = false;
-  EXPECT_EQ(Reason::INVALID_INPUT, graph.AddLocal(local, motion).reason);
+  EXPECT_EQ(Reason::CORRELATION_UNQUALIFIED, graph.AddLocal(local, motion).reason);
   EXPECT_DOUBLE_EQ(previous.covariance_time, graph.state().covariance_time);
   EXPECT_TRUE(previous.map_to_odom.matrix().isApprox(
       graph.state().map_to_odom.matrix()));
@@ -231,6 +332,170 @@ TEST(FixedLagGraphTest, MarginalizationRetainsAnchorAndRejectsOldTimes) {
   auto fresh = Observation(Local(8), 3);
   ASSERT_TRUE(graph.Observe(fresh).ok());
   EXPECT_DOUBLE_EQ(Local(8).stamp.time, graph.state().last_full_observation);
+}
+
+TEST(FixedLagGraphTest, DeterministicErrorChainSurvivesFixedLagMarginalization) {
+  FixedLagGraph graph(Policy());
+  const auto first = Local(0);
+  ASSERT_TRUE(graph.Initialize(first, Observation(first, 1)).ok());
+  const auto before = graph.state();
+  auto previous = first;
+  for (uint64_t index = 1; index <= 8; ++index) {
+    auto local = Local(index);
+    local.covariance = first.covariance;
+    const auto result = graph.AddLocal(local, Motion(previous, local));
+    ASSERT_TRUE(result.ok()) << result.message;
+    EXPECT_NEAR(graph.state().map_to_odom.translation().x(), 100.0, 1e-8);
+    EXPECT_TRUE(graph.state().covariance.isApprox(before.covariance, 1e-8));
+    previous = local;
+  }
+  auto fix = Observation(previous, 1);
+  fix.source = "independent-latest-xy";
+  fix.kind = GlobalObservation::Kind::HORIZONTAL_POSITION;
+  fix.pose.translation().y() = 0.02;
+  ASSERT_TRUE(graph.Observe(fix).ok());
+  EXPECT_GT(graph.state().map_to_odom.translation().y(), 0.0);
+  EXPECT_DOUBLE_EQ(graph.state().last_full_observation, first.stamp.time);
+  EXPECT_EQ(Reason::HISTORY_UNAVAILABLE,
+            graph.Observe(Observation(first, 2)).reason);
+}
+
+TEST(FixedLagGraphTest, RankDeficientConditionalRetainsRotatedNoiseSubspace) {
+  FixedLagGraph graph(Policy());
+  auto previous = Local(0);
+  previous.covariance = Matrix15d::Identity() * 0.125;
+  ASSERT_TRUE(graph.Initialize(previous, Observation(previous, 1)).ok());
+  for (uint64_t index = 1; index <= 8; ++index) {
+    auto local = Local(index);
+    Eigen::Matrix<double, 15, 1> direction =
+        Eigen::Matrix<double, 15, 1>::Zero();
+    direction[0] = 0.125;
+    direction[1] = 0.125;
+    local.covariance = previous.covariance + direction * direction.transpose();
+    const auto added = graph.AddLocal(local, Motion(previous, local));
+    ASSERT_TRUE(added.ok()) << added.message;
+    previous = local;
+  }
+  const auto before = graph.state();
+  auto fix = Observation(previous, 1);
+  fix.source = "independent-xy";
+  fix.kind = GlobalObservation::Kind::HORIZONTAL_POSITION;
+  fix.pose.translation().head<2>() += Eigen::Vector2d(0.02, 0.02);
+  ASSERT_TRUE(graph.Observe(fix).ok());
+  const auto shift = graph.state().map_to_odom.translation() -
+                     before.map_to_odom.translation();
+  EXPECT_GT(shift.x(), 0);
+  EXPECT_NEAR(shift.x(), shift.y(), 1e-8);
+  EXPECT_NEAR(shift.z(), 0, 1e-8);
+  EXPECT_TRUE(graph.state().map_to_odom.linear().isIdentity(1e-8));
+}
+
+TEST(FixedLagGraphTest, IndefiniteConditionalCannotCommitOrConsumeFrontier) {
+  FixedLagGraph graph(Policy());
+  const auto first = Local(0);
+  ASSERT_TRUE(graph.Initialize(first, Observation(first, 1)).ok());
+  const auto before = graph.state();
+  auto next = Local(1);
+  next.covariance = first.covariance;
+  auto motion = Motion(first, next);
+  // Within the endpoint joint-PSD audit tolerance, but not roundoff in the
+  // conditional model. Do not convert this negative mode into a constraint.
+  motion.cross_covariance(0, 0) += 1e-12;
+  const auto invalid = graph.AddLocal(next, motion);
+  EXPECT_EQ(invalid.reason, Reason::INVALID_INPUT);
+  EXPECT_EQ(graph.state().correction_id, before.correction_id);
+  EXPECT_TRUE(graph.state().covariance.isApprox(before.covariance, 0));
+  ASSERT_TRUE(graph.AddLocal(next, Motion(first, next)).ok());
+}
+
+TEST(FixedLagGraphTest, SharedLocalNoiseUsesJointPoseErrorInnovation) {
+  FixedLagGraph graph(Policy());
+  const auto local = Local(0);
+  ASSERT_TRUE(graph.Initialize(local, Observation(local, 1)).ok());
+  auto fix = Observation(local, 1);
+  fix.kind = GlobalObservation::Kind::HORIZONTAL_POSITION;
+  fix.source = "shared-scan-first";
+  fix.pose.translation().x() = 100.05;
+  fix.covariance.topLeftCorner<2, 2>() = 0.05 * Eigen::Matrix2d::Identity();
+  fix.independent_of_local = false;
+  fix.conditional_local_error_qualified = true;
+  fix.local_error_sequence = local.stamp.sequence;
+  fix.local_error_cross_covariance = Eigen::MatrixXd::Zero(15, 2);
+  fix.local_error_cross_covariance.topLeftCorner<2, 2>() =
+      0.05 * Eigen::Matrix2d::Identity();
+  ASSERT_TRUE(graph.Observe(fix).ok());
+  EXPECT_NEAR(graph.state().map_to_odom.translation().x(),
+              100 + 0.05 * 0.01 / (0.01 + 0.05), 1e-8);
+  fix.source = "shared-scan-second";
+  ASSERT_TRUE(graph.Observe(fix).ok());
+  // Both sources share 0.025 of noise through the same local error. Only
+  // their remaining 0.025 is independent and can be reduced by two samples.
+  EXPECT_NEAR(graph.state().map_to_odom.translation().x(),
+              100 + 0.05 * 0.01 / (0.01 + 0.025 + 0.025 / 2), 1e-8);
+  EXPECT_NEAR(graph.state().map_to_odom.translation().y(), 0, 1e-8);
+}
+
+TEST(FixedLagGraphTest, InvalidConditionalSourceCannotConsumeOriginalIdentity) {
+  FixedLagGraph graph(Policy());
+  auto previous = Local(0);
+  ASSERT_TRUE(graph.Initialize(previous, Observation(previous, 1)).ok());
+  for (uint64_t i = 1; i <= 5; ++i) {
+    auto next = Local(i);
+    next.covariance = previous.covariance;
+    ASSERT_TRUE(graph.AddLocal(next, Motion(previous, next)).ok());
+    previous = next;
+  }
+  auto historical = Local(3);
+  historical.covariance = Local(0).covariance;
+  auto fix = Observation(historical, 1);
+  fix.kind = GlobalObservation::Kind::HORIZONTAL_POSITION;
+  fix.source = "delayed-shared-scan";
+  fix.stamp.receive_time = previous.stamp.time;
+  fix.independent_of_local = false;
+  fix.conditional_local_error_qualified = true;
+  fix.local_error_sequence = historical.stamp.sequence + 1;
+  fix.local_error_cross_covariance = Eigen::MatrixXd::Zero(15, 2);
+  fix.local_error_cross_covariance(0, 0) = 1;
+  const auto before = graph.state();
+  EXPECT_EQ(graph.Observe(fix).reason, Reason::CORRELATION_UNQUALIFIED);
+  fix.local_error_sequence = historical.stamp.sequence;
+  EXPECT_EQ(graph.Observe(fix).reason, Reason::INVALID_INPUT);
+  EXPECT_EQ(graph.state().correction_id, before.correction_id);
+  fix.local_error_cross_covariance(0, 0) = 0.01;
+  ASSERT_TRUE(graph.Observe(fix).ok());
+  EXPECT_EQ(graph.state().correction_id, before.correction_id + 1);
+  EXPECT_EQ(graph.Observe(fix).reason, Reason::DUPLICATE);
+  auto next = Local(6);
+  next.covariance = previous.covariance;
+  ASSERT_TRUE(graph.AddLocal(next, Motion(previous, next)).ok());
+}
+
+TEST(FixedLagGraphTest, ConditionalFullAnchorAndProjectedUpdateShareErrorState) {
+  FixedLagGraph graph(Policy());
+  const auto local = Local(0);
+  auto anchor = Observation(local, 1);
+  anchor.independent_of_local = false;
+  anchor.conditional_local_error_qualified = true;
+  anchor.local_error_sequence = local.stamp.sequence;
+  anchor.local_error_cross_covariance = Eigen::MatrixXd::Zero(15, 6);
+  anchor.local_error_cross_covariance(0, 0) = 0.01;
+  ASSERT_TRUE(graph.Initialize(local, anchor).ok());
+  const auto before = graph.state();
+  auto projected = anchor;
+  projected.kind = GlobalObservation::Kind::PROJECTED_POSE;
+  projected.source = "shared-projected";
+  projected.projection = Eigen::MatrixXd::Zero(1, 6);
+  projected.projection(0, 0) = 1;
+  projected.projected_covariance = Eigen::MatrixXd::Constant(1, 1, 0.01);
+  projected.local_error_cross_covariance = Eigen::MatrixXd::Zero(15, 1);
+  projected.local_error_cross_covariance(0, 0) = 0.01;
+  projected.pose.translation().x() += 0.02;
+  ASSERT_TRUE(graph.Observe(projected).ok());
+  // Common error remains common; only the independent 0.009 noise is
+  // averaged. An independent-factor implementation gives a different gain.
+  EXPECT_NEAR(graph.state().map_to_odom.translation().x(), 100.01, 1e-8);
+  EXPECT_NEAR(graph.state().map_to_odom.translation().y(), 0, 1e-8);
+  EXPECT_DOUBLE_EQ(graph.state().last_full_observation, before.last_full_observation);
 }
 
 TEST(FixedLagGraphTest, RejectedUpdatesLeaveTheCommittedSnapshotUntouched) {

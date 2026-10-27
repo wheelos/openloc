@@ -15,6 +15,13 @@ bazel_dep(
 )
 
 single_version_override(
+    module_name = "gtsam",
+    version = "4.3.0-alpha.1",
+    patches = ["//:patches/gtsam_sl4_cassert.patch"],
+    patch_strip = 1,
+)
+
+single_version_override(
     module_name = "eigen",
     version = "4.0.0-20241125.bcr.2",
     patches = ["//:patches/eigen_required_unsupported_modules.patch"],

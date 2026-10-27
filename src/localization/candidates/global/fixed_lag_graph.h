@@ -22,6 +22,7 @@ struct FixedLagConfig {
   double robust_threshold = 2.5;
   uint32_t max_states = 1000;
   uint32_t max_observations = 2000;
+  uint32_t max_error_dimension = 256;
   uint32_t max_iterations = 5;
   double max_linearization_angle = 0.2;
 };
@@ -33,8 +34,13 @@ class FixedLagGraph {
   explicit FixedLagGraph(const FixedLagConfig& config);
   ~FixedLagGraph();
   Result ValidateConfig() const;
-  // The caller must first verify an independent, full-pose hypothesis.
-  Result Initialize(const LocalState& local, const GlobalObservation& anchor);
+  static Result ValidateConditionalObservation(
+      const LocalState& local, const GlobalObservation& observation);
+  // The caller must first verify a full-pose hypothesis with either independent
+  // noise or a qualified conditional joint model against the same local error.
+  Result Initialize(const LocalState& local, const GlobalObservation& anchor,
+                    const std::vector<LocalState>& following = {},
+                    const std::vector<MotionIncrement>& motions = {});
   Result AddLocal(const LocalState& local, const MotionIncrement& motion);
   // Only exact retained measurement times; never use a nearest keyframe.
   // Point factors constrain only the supplied XY/XYZ antenna coordinates.

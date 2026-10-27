@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "candidates/common/types.h"
+#include "candidates/map/map_registration_error.h"
 #include "pcl/kdtree/kdtree_flann.h"
 #include "pcl/point_cloud.h"
 #include "pcl/point_types.h"
@@ -54,6 +55,7 @@ struct MatchConfig {
   uint32_t maximum_seeds = 16;
   double rotation_length = 1.0;
   uint32_t maximum_registration_points = 12000;
+  uint32_t maximum_error_points = 100000;
   uint32_t normal_neighbors = 15;
   double normal_planarity_ratio = 0.1;
   double icp_max_rmse = 0.2;
@@ -111,9 +113,10 @@ class MapMatcher {
   MapMatcher(const MapMatcher&) = delete;
   MapMatcher& operator=(const MapMatcher&) = delete;
   Result Load(const std::string& pcd_path);
-  Result SetMap(const Cloud::ConstPtr& cloud);
+  Result SetMap(const Cloud::ConstPtr& cloud, bool retain_error_support = false);
   Result Match(const Cloud::ConstPtr& base_cloud,
-               const Eigen::Isometry3d& initial, MatchResult* result) const;
+               const Eigen::Isometry3d& initial, MatchResult* result,
+               RegistrationErrorMap* errors = nullptr) const;
   Result Recover(const Cloud::ConstPtr& base_cloud,
                  const std::vector<Eigen::Isometry3d>& seeds,
                  MatchResult* result) const;
@@ -124,11 +127,13 @@ class MapMatcher {
   Result Evidence(const Cloud& cloud, MatchResult* result) const;
   Result MatchPointToPlaneIcp(const Cloud::ConstPtr& base_cloud,
                               const Eigen::Isometry3d& initial,
-                              MatchResult* result) const;
+                              MatchResult* result,
+                              std::vector<IcpErrorStep>* steps = nullptr) const;
   Result DownsampleAndLimit(const Cloud::ConstPtr& input, Cloud* output,
                             double voxel_size) const;
   MatchConfig config_;
   Cloud::Ptr map_;
+  Cloud::ConstPtr raw_error_map_;
   pcl::PointCloud<pcl::Normal>::Ptr normals_;
   enum class NormalFailure { kOther, kRank, kNonplanar };
   std::vector<NormalFailure> normal_failures_;

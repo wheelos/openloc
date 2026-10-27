@@ -5,6 +5,10 @@
 // http://www.apache.org/licenses/LICENSE-2.0
 
 #include "openloc/localization/global/fixed_lag_alignment.h"
+#include "openloc/localization/local/native_odometry.h"
+#include "openloc/localization/map/scan_to_map.h"
+
+#include <cmath>
 
 #include "gtest/gtest.h"
 
@@ -142,6 +146,523 @@ TEST(FixedLagAlignmentTest, RejectsDiagnosticAndUnqualifiedDeclarations) {
             owner.SubmitMapObservation(Map(0), Qualification()).code());
 }
 
+TEST(FixedLagAlignmentTest, ExplicitUncalibratedModeUsesTheSameConditionalGraph) {
+  auto config = Config();
+  config.allow_uncalibrated_inputs = true;
+  config.reference.geodetic = {};
+  config.reference.geodetic.state = GeodeticReferenceState::kDiagnosticOnly;
+  FixedLagGlobalAlignment owner;
+  ASSERT_TRUE(owner.Configure(config).ok());
+  auto qualification = Qualification();
+  qualification.uncertainty_qualified = false;
+  qualification.independent_of_local = false;
+  qualification.independent_of_graph_sources = false;
+  qualification.local_correlation.emplace();
+  auto& correlation = *qualification.local_correlation;
+  correlation.motion_error_model_id = config.motion_error_model_id;
+  correlation.conditional_independence_evidence_id = "declared-sufficient-model";
+  correlation.conditional_model_qualified = true;
+  correlation.residual_independent_of_history_and_sources = true;
+  correlation.cross_covariance = Eigen::MatrixXd::Zero(15, 6);
+  correlation.cross_covariance(0, 0) = 0.0005;
+  for (int index = 0; index < 5; ++index) {
+    auto sample = Odom(index);
+    sample.uncertainty_qualified = false;
+    auto connection = Connection(index);
+    ASSERT_TRUE(owner.AddOdometry(sample, index ? &connection : nullptr).ok());
+    auto map = Map(index);
+    map.context.reference = config.reference;
+    map.context.provenance.shared_local_scans = ObservationDependency::kPresent;
+    correlation.odometry_sequence = sample.sequence;
+    const auto result = owner.SubmitMapObservation(map, qualification);
+    if (index >= 2) {
+      ASSERT_TRUE(result.ok()) << result.message();
+    }
+  }
+  FixedLagAlignmentResult result;
+  ASSERT_TRUE(owner.GetResult(Odom(4).receive_time, &result).ok());
+  ASSERT_TRUE(result.estimate);
+  EXPECT_TRUE(result.diagnostic_only);
+  EXPECT_FALSE(result.assessment.ok());
+  EXPECT_TRUE(result.odometry_fresh);
+  EXPECT_TRUE(result.full_pose_evidence_fresh);
+  EXPECT_GT(result.estimate->correction_id, 0);
+  EXPECT_NEAR(result.estimate->map_from_base.translation.x(), 100.4, 0.01);
+  std::vector<GraphObservationDecision> decisions;
+  ASSERT_TRUE(owner.GetDecisions(&decisions).ok());
+  ASSERT_EQ(decisions.size(), 5);
+  EXPECT_FALSE(decisions.back().qualification.uncertainty_qualified);
+  EXPECT_TRUE(decisions.back().qualification.local_correlation);
+  EXPECT_TRUE(decisions.back().observation.alignment_updated);
+}
+
+TEST(FixedLagAlignmentTest, UncalibratedModeNeverWaivesSufficiencyOrQuality) {
+  auto config = Config();
+  config.allow_uncalibrated_inputs = true;
+  FixedLagGlobalAlignment owner;
+  config.motion_error_model_qualified = false;
+  EXPECT_FALSE(owner.Configure(config).ok());
+  config.motion_error_model_qualified = true;
+  ASSERT_TRUE(owner.Configure(config).ok());
+  auto sample = Odom(0);
+  sample.uncertainty_qualified = false;
+  sample.covariance_model_valid = false;
+  EXPECT_FALSE(owner.AddOdometry(sample).ok());
+  sample.covariance_model_valid = true;
+  ASSERT_TRUE(owner.AddOdometry(sample).ok());
+  auto qualification = Qualification();
+  qualification.uncertainty_qualified = false;
+  qualification.quality_valid = false;
+  EXPECT_FALSE(owner.SubmitMapObservation(Map(0), qualification).ok());
+  qualification.quality_valid = true;
+  qualification.independent_of_local = false;
+  EXPECT_FALSE(owner.SubmitMapObservation(Map(0), qualification).ok());
+  qualification.local_correlation.emplace();
+  auto& correlation = *qualification.local_correlation;
+  correlation.motion_error_model_id = config.motion_error_model_id;
+  correlation.conditional_independence_evidence_id = "declared-model";
+  correlation.odometry_sequence = sample.sequence;
+  correlation.cross_covariance = Eigen::MatrixXd::Zero(15, 6);
+  qualification.independent_of_graph_sources = false;
+  EXPECT_FALSE(owner.SubmitMapObservation(Map(0), qualification).ok());
+}
+
+unified::LocalConfig RawNativeConfig() {
+  namespace u = unified;
+  u::LocalConfig local_config;
+  local_config.session = "actual-native-graph";
+  local_config.allow_imu_only_initialization = true;
+  local_config.stationary_samples = 3;
+  local_config.stationary_duration = 0.015;
+  local_config.enable_native_joint_error = true;
+  local_config.native_imu_sample_period = 0.01;
+  local_config.history_duration = 0.035;
+  local_config.enable_lidar = true;
+  local_config.lidar_frame = "lidar";
+  local_config.lidar_calibration_id = "test-lidar";
+  local_config.lidar_point_noise_std = 0.01;
+  local_config.lidar_plane_noise_std = 0.01;
+  local_config.lidar_voxel_size = 1;
+  local_config.lidar_max_voxels = 100;
+  local_config.lidar_max_scans = 2;
+  local_config.lidar_min_points_per_plane = 3;
+  local_config.lidar_min_correspondences = 2;
+  local_config.lidar_max_points = 1000;
+  local_config.lidar_max_correspondence_distance = 0.3;
+  local_config.lidar_observed_singular_value = 1;
+  local_config.lidar_innovation_gate = 100;
+  local_config.lidar_max_scan_age = 0.1;
+  local_config.lidar_future_tolerance = 0.001;
+  local_config.lidar_max_translation_correction_rate = 0.2;
+  local_config.lidar_max_rotation_correction_rate = 0.1;
+  local_config.lidar_max_velocity_correction_acceleration = 0.3;
+  local_config.lidar_anchor_variance_scale = 1;
+  local_config.lidar_correction_variance_scale = 2;
+  local_config.lidar_max_translation_correction = 2;
+  local_config.lidar_max_rotation_correction = 0.5;
+  local_config.lidar_max_velocity_correction = 2;
+  local_config.lidar_max_update_iterations = 2;
+  local_config.lidar_process_noise_psd_tolerance = 1e-12;
+  local_config.lidar_rotation_length = 1;
+  return local_config;
+}
+
+TEST(FixedLagAlignmentTest, ActualRawNativeLioFeedsTheSelectedGraphUncalibrated) {
+  namespace u = unified;
+  const auto local_config = RawNativeConfig();
+  NativeOdometry local(local_config);
+  ASSERT_TRUE(local.ValidateConfig().ok());
+  auto config = Config();
+  config.allow_uncalibrated_inputs = true;
+  config.motion_error_model_id = "native-frozen-linearization";
+  config.history_duration_ns = 60'000'000LL;
+  config.maximum_observation_age_ns = config.history_duration_ns;
+  FixedLagGlobalAlignment graph;
+  ASSERT_TRUE(graph.Configure(config).ok());
+  double previous_time = 0;
+  uint64_t previous_sequence = 0;
+  uint64_t map_commits = 0, gnss_commits = 0;
+  for (uint64_t index = 1; index <= 19; ++index) {
+    SCOPED_TRACE(index);
+    u::ImuSample imu;
+    imu.stamp = {1 + 0.01 * (index - 1), 1 + 0.01 * (index - 1), index, "unix"};
+    imu.acceleration.z() = local_config.gravity;
+    local.AddImu(imu);
+    if (index < 3) continue;
+    u::LocalState modeled;
+    const auto lookup = local.JointErrorLookup(imu.stamp.time, &modeled);
+    ASSERT_TRUE(lookup.ok()) << lookup.message;
+    GraphOdometrySample sample;
+    sample.sequence = modeled.stamp.sequence;
+    sample.odometry.timestamp = {
+        1'000'000'000LL + 10'000'000LL * static_cast<int64_t>(index - 1),
+        ClockDomain::kUnixEpoch};
+    sample.receive_time = sample.odometry.timestamp;
+    sample.odometry.epoch = {modeled.epoch.session, modeled.epoch.generation};
+    sample.odometry.parent_frame = config.odom_frame;
+    sample.odometry.child_frame = config.base_frame;
+    sample.odometry.pose = {modeled.position, modeled.orientation};
+    sample.covariance = modeled.covariance;
+    sample.joint_error = modeled.joint_error;
+    sample.covariance_model_valid = modeled.covariance_model_valid;
+    sample.uncertainty_qualified = modeled.uncertainty_qualified;
+    GraphMotionConnection connection;
+    if (previous_sequence) {
+      u::MotionIncrement motion;
+      const auto connected =
+          local.JointErrorMotionBetween(previous_time, imu.stamp.time, &motion);
+      ASSERT_TRUE(connected.ok()) << connected.message;
+      connection.epoch = sample.odometry.epoch;
+      connection.start_time = {
+          sample.odometry.timestamp.nanoseconds - 10'000'000LL, config.clock_domain};
+      connection.end_time = sample.odometry.timestamp;
+      connection.start_sequence = previous_sequence;
+      connection.end_sequence = index;
+      connection.cross_covariance = motion.cross_covariance;
+      connection.joint_cross_covariance = motion.joint_cross_covariance;
+      for (const auto& source : motion.sources)
+        connection.sources.push_back({source.source, source.sequence});
+    }
+    const auto added = graph.AddOdometry(sample, previous_sequence ? &connection : nullptr);
+    ASSERT_TRUE(added.ok()) << added.message();
+    previous_time = imu.stamp.time;
+    previous_sequence = index;
+    auto context = Context(0, "independent-survey");
+    context.epoch = sample.odometry.epoch;
+    context.measurement_time = context.receive_time = sample.odometry.timestamp;
+    context.sequence = index;
+    GlobalMapObservation map;
+    map.context = context;
+    map.map_from_base = {
+        Eigen::Vector3d(100, 20, 0) + modeled.position, modeled.orientation};
+    map.covariance.setIdentity();
+    map.covariance *= 0.01;
+    map.covariance_source = "declared-independent-survey-noise";
+    auto qualification = Qualification();
+    qualification.uncertainty_qualified = false;
+    const auto mapped = graph.SubmitMapObservation(map, qualification);
+    if (index >= 5) {
+      ASSERT_TRUE(mapped.ok()) << mapped.message();
+      ++map_commits;
+      GlobalHorizontalObservation gnss;
+      gnss.context = context;
+      gnss.context.source = "independent-gnss";
+      gnss.position = map.map_from_base.translation.head<2>();
+      gnss.covariance.setIdentity();
+      gnss.covariance *= 0.04;
+      gnss.covariance_source = "declared-independent-gnss-noise";
+      const auto corrected = graph.SubmitHorizontalObservation(gnss, qualification);
+      ASSERT_TRUE(corrected.ok()) << corrected.message();
+      ++gnss_commits;
+    }
+    const auto frozen_local = local.state();
+    if (index == 3 || index == 7 || index == 11 || index == 15) {
+      u::LidarScan scan;
+      scan.stamp = local.internal_state().stamp;
+      scan.stamp.sequence = (index + 1) / 4;
+      scan.epoch = local.internal_state().epoch;
+      scan.frame_id = "lidar";
+      scan.calibration_id = "test-lidar";
+      for (double x : {0.1, 0.3, 0.5})
+        for (double z : {0.1, 0.3, 0.5})
+          for (double side : {-1.0, 1.0})
+            scan.points.push_back({
+                Eigen::Vector3d(x, side + 0.25 + (index == 3 ? 0 : 0.02), z),
+                scan.stamp.time});
+      const auto updated = local.AddLidar(scan);
+      ASSERT_TRUE(updated.ok() || updated.reason == u::Reason::GEOMETRY_UNAVAILABLE)
+          << updated.message;
+      ASSERT_TRUE(local.joint_error_status().ok()) << local.joint_error_status().message;
+    }
+    EXPECT_TRUE(local.state().position.isApprox(frozen_local.position, 0));
+    EXPECT_TRUE(local.state().orientation.isApprox(frozen_local.orientation, 0));
+    EXPECT_FALSE(modeled.uncertainty_qualified);
+  }
+  EXPECT_EQ(local.lidar_health().accepted, 4);
+  EXPECT_GT(map_commits, 0);
+  EXPECT_GT(gnss_commits, 0);
+  FixedLagAlignmentResult result;
+  ASSERT_TRUE(graph.GetResult({1'180'000'000LL, config.clock_domain}, &result).ok());
+  ASSERT_TRUE(result.estimate);
+  EXPECT_TRUE(result.diagnostic_only);
+  EXPECT_FALSE(result.assessment.ok());
+  EXPECT_GT(result.estimate->correction_id, 0);
+}
+
+class SharedRawScanGraphTest : public ::testing::TestWithParam<bool> {};
+
+TEST_P(SharedRawScanGraphTest, ActualSharedRawScanRegistrationFeedsTheSameGraph) {
+  namespace u = unified;
+  const bool delayed_bootstrap = GetParam();
+  auto local_config = RawNativeConfig();
+  local_config.native_joint_max_dimension = 1024;
+  NativeOdometry local(local_config);
+  map::PointCloud::Ptr reference(new map::PointCloud);
+  for (int a = 0; a < 4; ++a)
+    for (int b = 0; b < 4; ++b) {
+      const double x = 0.2 * a + 0.03713, y = 0.2 * b + 0.04317;
+      reference->emplace_back(x, y, 0.45119);
+      reference->emplace_back(2.73713, x, y + 1.6);
+      reference->emplace_back(x, 2.34317, y + 1.6);
+    }
+  map::ScanToMapConfig matcher_config;
+  matcher_config.map_frame = "map";
+  matcher_config.base_frame = matcher_config.cloud_frame = "body";
+  matcher_config.calibration_id = "calibration";
+  matcher_config.algorithm = map::ScanMatchingAlgorithm::kPointToPlaneIcp;
+  matcher_config.retain_joint_error_support = true;
+  matcher_config.scan_voxel_size_m = 0.05;
+  matcher_config.normal_neighbors = 6;
+  matcher_config.minimum_points = matcher_config.icp_minimum_pairs = 20;
+  matcher_config.local_window_radius_m = 10;
+  map::ScanToMapLocalizer matcher(matcher_config);
+  map::MapMetadata metadata;
+  metadata.map_id = "site";
+  metadata.version = "v1";
+  metadata.content_id = "synthetic-map";
+  metadata.map_frame = "map";
+  metadata.source_cloud_frame = "map";
+  metadata.reference_state = map::MapReferenceState::kDiagnosticOnly;
+  metadata.integrity_verified = true;
+  std::string error;
+  ASSERT_TRUE(matcher.Configure(metadata, reference, &error)) << error;
+  auto config = Config();
+  config.allow_uncalibrated_inputs = true;
+  config.motion_error_model_id = "native-frozen-linearization";
+  config.maximum_error_dimension = 1024;
+  config.verification_frames = 2;
+  config.history_duration_ns = config.maximum_observation_age_ns = 60'000'000LL;
+  FixedLagGlobalAlignment graph;
+  ASSERT_TRUE(graph.Configure(config).ok());
+  double previous_time = 0;
+  uint64_t previous_sequence = 0, updates = 0;
+  std::unique_ptr<NativeOdometry::LidarTask> delayed;
+  for (uint64_t index = 1; index <= 19; ++index) {
+    SCOPED_TRACE(index);
+    u::ImuSample imu;
+    imu.stamp = {1 + 0.01 * (index - 1), 1 + 0.01 * (index - 1), index, "unix"};
+    imu.acceleration.z() = local_config.gravity;
+    local.AddImu(imu);
+    if (delayed) {
+      const auto replayed = delayed->ReplayImu(imu);
+      ASSERT_TRUE(replayed.ok() || replayed.reason == u::Reason::WHEEL_STALE ||
+                  replayed.reason == u::Reason::CORRELATION_UNQUALIFIED ||
+                  replayed.reason == u::Reason::CORRECTION_BUDGET_EXCEEDED)
+          << replayed.message;
+      ASSERT_TRUE(delayed->internal_state().valid);
+    }
+    if (index < 3) continue;
+    const auto nominal = local.state();
+    const bool has_scan = delayed_bootstrap ?
+        (index == 5 || index == 9 || index == 13 || index == 17) :
+        (index == 3 || index == 7 || index == 11 || index == 17);
+    u::JointLidarScan shared;
+    u::LocalState modeled;
+    if (index == 3 || index == 7 || index == 11 || index == 15) {
+      u::LidarScan scan;
+      scan.stamp = local.internal_state().stamp;
+      scan.stamp.sequence = (index + 1) / 4;
+      scan.epoch = local.internal_state().epoch;
+      scan.frame_id = "lidar";
+      scan.calibration_id = "test-lidar";
+      for (const auto& point : *reference)
+        scan.points.push_back({Eigen::Vector3d(point.x, point.y, point.z),
+                               scan.stamp.time - (index == 3 ? 0 : 0.005)});
+      if (delayed_bootstrap || index == 15) {
+        ASSERT_TRUE(local.PrepareLidarTask(scan, &delayed).ok());
+        const auto computed = delayed->Compute();
+        ASSERT_TRUE(computed.ok() || computed.reason == u::Reason::GEOMETRY_UNAVAILABLE)
+            << computed.message;
+      } else {
+        const auto updated = local.AddLidar(scan);
+        ASSERT_TRUE(updated.ok() || updated.reason == u::Reason::GEOMETRY_UNAVAILABLE)
+            << updated.message;
+      }
+    }
+    if (delayed && has_scan) {
+      const auto committed = local.CommitLidarTask(delayed.get());
+      ASSERT_TRUE(committed.ok() || committed.reason == u::Reason::GEOMETRY_UNAVAILABLE)
+          << committed.message;
+      delayed.reset();
+    }
+    if (has_scan) {
+      const auto exported = local.PrepareJointLidarScan(
+          delayed_bootstrap ? (index - 1) / 4 : (index == 17 ? 4 : (index + 1) / 4),
+                                                       &shared);
+      ASSERT_TRUE(exported.ok()) << exported.message;
+      modeled = shared.conditioning_state;
+    } else {
+      ASSERT_TRUE(local.JointErrorLookup(imu.stamp.time, &modeled).ok());
+    }
+    GraphOdometrySample sample;
+    sample.sequence = index;
+    sample.odometry.timestamp = {
+        1'000'000'000LL + 10'000'000LL * static_cast<int64_t>(index - 1),
+        config.clock_domain};
+    sample.receive_time = sample.odometry.timestamp;
+    sample.odometry.epoch = {modeled.epoch.session, modeled.epoch.generation};
+    sample.odometry.parent_frame = config.odom_frame;
+    sample.odometry.child_frame = config.base_frame;
+    sample.odometry.pose = {modeled.position, modeled.orientation};
+    sample.covariance = modeled.covariance;
+    sample.joint_error = modeled.joint_error;
+    sample.covariance_model_valid = true;
+    GraphMotionConnection connection;
+    if (previous_sequence) {
+      u::MotionIncrement motion;
+      const auto connected = local.JointErrorMotionBetween(
+          previous_time, imu.stamp.time, &motion);
+      ASSERT_TRUE(connected.ok()) << connected.message;
+      connection.epoch = sample.odometry.epoch;
+      connection.start_time = {sample.odometry.timestamp.nanoseconds - 10'000'000LL,
+                               config.clock_domain};
+      connection.end_time = sample.odometry.timestamp;
+      connection.start_sequence = previous_sequence;
+      connection.end_sequence = index;
+      connection.cross_covariance = motion.cross_covariance;
+      connection.joint_cross_covariance = motion.joint_cross_covariance;
+      for (const auto& source : motion.sources)
+        connection.sources.push_back({source.source, source.sequence});
+    }
+    const auto added = graph.AddOdometry(sample, previous_sequence ? &connection : nullptr);
+    ASSERT_TRUE(added.ok()) << added.message();
+    previous_time = imu.stamp.time;
+    previous_sequence = index;
+    if (has_scan) {
+      map::ScanToMapRequest request;
+      request.timestamp_ns = static_cast<int64_t>(std::llround(shared.reference.time * 1e9));
+      request.clock_domain = "unix";
+      request.cloud_frame = "body";
+      request.deskewed = true;
+      request.joint_scan = &shared;
+      request.initial_joint_jacobian =
+          Eigen::MatrixXd::Zero(6, shared.conditioning_state.joint_error->covariance.rows());
+      const auto matched = matcher.Match(request);
+      ASSERT_TRUE(matched.valid) << matched.reason << ": " << matched.detail;
+      ASSERT_TRUE(matched.joint_error);
+      const auto& model = *matched.joint_error;
+      ASSERT_TRUE(model.assessment.ok()) << model.assessment.message;
+      if (model.source_sequence == 1) {
+        request.initial_joint_jacobian.resize(0, 0);
+        const auto rejected = matcher.Match(request);
+        EXPECT_FALSE(rejected.valid);
+        EXPECT_EQ(rejected.reason, "invalid_shared_scan_or_seed_error_support");
+        request.joint_scan = nullptr;
+        request.cloud = reference;
+        const auto nominal_match = matcher.Match(request);
+        ASSERT_TRUE(nominal_match.valid);
+        EXPECT_TRUE(nominal_match.map_from_base.matrix().isApprox(
+            matched.map_from_base.matrix(), 0));
+        EXPECT_TRUE(nominal_match.covariance.isApprox(matched.covariance, 0));
+      }
+      EXPECT_TRUE((model.covariance - model.pose_jacobian *
+          model.local_cross_covariance).isZero(1e-12));
+      auto map = Map(0);
+      map.context.epoch = sample.odometry.epoch;
+      map.context.source = "actual-shared-scan";
+      map.context.sequence = model.source_sequence;
+      map.context.measurement_time = {
+          static_cast<int64_t>(std::llround(shared.reference.time * 1e9)), config.clock_domain};
+      map.context.receive_time = sample.odometry.timestamp;
+      map.context.provenance.shared_local_scans = ObservationDependency::kPresent;
+      map.context.provenance.odometry_deskew = ObservationDependency::kPresent;
+      map.map_from_base = {matched.map_from_base.translation(),
+                          Eigen::Quaterniond(matched.map_from_base.linear())};
+      map.covariance = model.covariance;
+      map.covariance_source = "uncalibrated-frozen-ICP-conditional-on-fixed-map";
+      GraphSourceQualification qualification;
+      qualification.quality_valid = true;
+      qualification.uncertainty_model_id = map.covariance_source;
+      qualification.local_correlation.emplace();
+      auto& correlation = *qualification.local_correlation;
+      correlation.motion_error_model_id = config.motion_error_model_id;
+      correlation.odometry_sequence = index;
+      correlation.conditioning_time = sample.odometry.timestamp;
+      correlation.cross_covariance = model.local_cross_covariance;
+      correlation.conditional_independence_evidence_id = "all-points-and-seed-in-native-basis";
+      correlation.conditional_model_qualified = true;
+      correlation.residual_independent_of_history_and_sources = true;
+      const auto submitted = graph.SubmitMapObservation(map, qualification);
+      if (model.source_sequence == 1) {
+        EXPECT_FALSE(submitted.ok());
+      } else {
+        ASSERT_TRUE(submitted.ok()) << submitted.message();
+        ++updates;
+      }
+    }
+    EXPECT_TRUE(local.state().position.isApprox(nominal.position, 0));
+    EXPECT_TRUE(local.state().orientation.isApprox(nominal.orientation, 0));
+    EXPECT_TRUE(local.state().covariance.isApprox(nominal.covariance, 0));
+  }
+  EXPECT_EQ(updates, 3);
+  FixedLagAlignmentResult result;
+  ASSERT_TRUE(graph.GetResult({1'180'000'000LL, config.clock_domain}, &result).ok());
+  ASSERT_TRUE(result.estimate);
+  EXPECT_TRUE(result.diagnostic_only);
+  EXPECT_FALSE(result.assessment.ok());
+}
+
+INSTANTIATE_TEST_SUITE_P(NativeSharedRegistration, SharedRawScanGraphTest,
+                        ::testing::Bool());
+
+TEST(FixedLagAlignmentTest, JointMemoryIsRetainedThroughFacadeBootstrap) {
+  FixedLagGlobalAlignment owner;
+  auto config = Config();
+  config.maximum_error_dimension = 16;
+  ASSERT_TRUE(owner.Configure(config).ok());
+  auto qualification = Qualification();
+  qualification.independent_of_local = false;
+  qualification.independent_of_graph_sources = false;
+  qualification.local_correlation.emplace();
+  auto& correlation = *qualification.local_correlation;
+  correlation.motion_error_model_id = config.motion_error_model_id;
+  correlation.conditional_independence_evidence_id = "synthetic-hidden-memory";
+  correlation.conditional_model_qualified = true;
+  correlation.residual_independent_of_history_and_sources = true;
+  correlation.cross_covariance = Eigen::MatrixXd::Zero(16, 6);
+  correlation.cross_covariance(15, 0) = 0.0025;
+  for (int index = 0; index < 4; ++index) {
+    auto sample = Odom(index);
+    unified::JointLocalError joint;
+    joint.covariance = Eigen::MatrixXd::Zero(16, 16);
+    joint.covariance.topLeftCorner<15, 15>() = sample.covariance;
+    joint.covariance(15, 15) = 0.025;
+    joint.output_jacobian = Eigen::MatrixXd::Zero(15, 16);
+    joint.output_jacobian.leftCols<15>().setIdentity();
+    sample.joint_error = joint;
+    auto connection = Connection(index);
+    if (index != 0) {
+      connection.joint_cross_covariance = Eigen::MatrixXd::Zero(16, 16);
+      connection.joint_cross_covariance.topLeftCorner<15, 15>() =
+          connection.cross_covariance;
+      connection.joint_cross_covariance(15, 15) = 0.025;
+    }
+    const auto added = owner.AddOdometry(sample, index ? &connection : nullptr);
+    ASSERT_TRUE(added.ok()) << added.message();
+    if (index < 3) {
+      correlation.odometry_sequence = sample.sequence;
+      // Map covariance is .001; conditional variance remains positive.
+      const auto status = owner.SubmitMapObservation(Map(index), qualification);
+      if (index < 2) {
+        EXPECT_EQ(status.code(), StatusCode::kRejectedMeasurement);
+      } else {
+        ASSERT_TRUE(status.ok()) << status.message();
+      }
+    }
+  }
+  FixedLagAlignmentResult result;
+  ASSERT_TRUE(owner.GetResult(Odom(3).odometry.timestamp, &result).ok());
+  ASSERT_TRUE(result.estimate);
+  EXPECT_NEAR(result.estimate->map_from_base.translation.x(), 100.3, 1e-8);
+  correlation.odometry_sequence = Odom(3).sequence;
+  correlation.cross_covariance = Eigen::MatrixXd::Zero(15, 6);
+  EXPECT_EQ(owner.SubmitMapObservation(Map(3), qualification).code(),
+            StatusCode::kRejectedMeasurement);
+  correlation.cross_covariance = Eigen::MatrixXd::Zero(16, 6);
+  correlation.cross_covariance(15, 0) = 0.0025;
+  EXPECT_TRUE(owner.SubmitMapObservation(Map(3), qualification).ok());
+}
+
 TEST(FixedLagAlignmentTest, DelayedAntennaXYAndProjectedMapShareOneOwner) {
   FixedLagGlobalAlignment owner;
   ASSERT_TRUE(owner.Configure(Config()).ok());
@@ -179,6 +700,103 @@ TEST(FixedLagAlignmentTest, DelayedAntennaXYAndProjectedMapShareOneOwner) {
                                 1e-9));
   EXPECT_EQ(StatusCode::kDuplicateTimestamp,
             owner.SubmitHorizontalObservation(fix, Qualification()).code());
+}
+
+TEST(FixedLagAlignmentTest, DeterministicConditionalDoesNotRevokeQualifiedOdom) {
+  FixedLagGlobalAlignment owner;
+  ASSERT_TRUE(owner.Configure(Config()).ok());
+  Bootstrap(&owner);
+  auto previous = Odom(2);
+  for (int index = 3; index <= 6; ++index) {
+    auto sample = Odom(index);
+    sample.covariance = previous.covariance;
+    auto connection = Connection(index);
+    connection.cross_covariance = previous.covariance;
+    const auto result = owner.AddOdometry(sample, &connection);
+    ASSERT_TRUE(result.ok()) << result.message();
+    previous = sample;
+  }
+  FixedLagAlignmentResult result;
+  ASSERT_TRUE(owner.GetResult(previous.odometry.timestamp, &result).ok());
+  ASSERT_TRUE(result.estimate.has_value());
+  EXPECT_TRUE(result.odometry_fresh);
+  EXPECT_NEAR(result.estimate->map_from_odom.translation.x(), 100, 1e-8);
+}
+
+TEST(FixedLagAlignmentTest, SharedSourceRequiresQualifiedSufficientErrorModel) {
+  FixedLagGlobalAlignment owner;
+  ASSERT_TRUE(owner.Configure(Config()).ok());
+  Bootstrap(&owner);
+  auto map = Map(2);
+  map.context.source = "conditionally-shared-map";
+  map.context.provenance.shared_local_scans = ObservationDependency::kPresent;
+  map.context.provenance.odometry_deskew = ObservationDependency::kPresent;
+  auto qualification = Qualification();
+  qualification.independent_of_local = false;
+  qualification.independent_of_graph_sources = false;
+  qualification.independence_evidence_id.clear();
+  GraphLocalObservationCorrelation model;
+  model.motion_error_model_id = Config().motion_error_model_id;
+  model.conditional_independence_evidence_id = "synthetic-sufficient-state";
+  model.odometry_sequence = Odom(2).sequence;
+  model.cross_covariance = Eigen::MatrixXd::Zero(15, 6);
+  model.cross_covariance(0, 0) = 0.001;
+  qualification.local_correlation = model;
+  EXPECT_EQ(owner.SubmitMapObservation(map, qualification).code(),
+            StatusCode::kRejectedMeasurement);
+  qualification.local_correlation->conditional_model_qualified = true;
+  qualification.local_correlation->residual_independent_of_history_and_sources = true;
+  qualification.local_correlation->motion_error_model_id = "wrong-model";
+  EXPECT_EQ(owner.SubmitMapObservation(map, qualification).code(),
+            StatusCode::kRejectedMeasurement);
+  qualification.local_correlation->motion_error_model_id = model.motion_error_model_id;
+  qualification.local_correlation->odometry_sequence++;
+  EXPECT_FALSE(owner.SubmitMapObservation(map, qualification).ok());
+  qualification.local_correlation->odometry_sequence = model.odometry_sequence;
+  ASSERT_TRUE(owner.SubmitMapObservation(map, qualification).ok());
+  std::vector<GraphObservationDecision> decisions;
+  ASSERT_TRUE(owner.GetDecisions(&decisions).ok());
+  ASSERT_TRUE(decisions.back().observation.alignment_updated);
+  ASSERT_TRUE(decisions.back().qualification.local_correlation.has_value());
+  EXPECT_TRUE(decisions.back().qualification.local_correlation->cross_covariance
+                  .isApprox(model.cross_covariance, 0));
+}
+
+TEST(FixedLagAlignmentTest, QualifiedConditionalFullPosesCanBootstrapSameOwner) {
+  FixedLagGlobalAlignment owner;
+  ASSERT_TRUE(owner.Configure(Config()).ok());
+  auto qualification = Qualification();
+  qualification.independent_of_local = false;
+  qualification.independent_of_graph_sources = false;
+  qualification.independence_evidence_id.clear();
+  GraphLocalObservationCorrelation model;
+  model.motion_error_model_id = Config().motion_error_model_id;
+  model.conditional_independence_evidence_id = "synthetic-full-state-proof";
+  model.conditional_model_qualified = true;
+  model.residual_independent_of_history_and_sources = true;
+  model.cross_covariance = Eigen::MatrixXd::Zero(15, 6);
+  model.cross_covariance(0, 0) = 0.001;
+  for (int index = 0; index < 3; ++index) {
+    const auto sample = Odom(index);
+    const auto connection = Connection(index);
+    ASSERT_TRUE(owner.AddOdometry(sample, index ? &connection : nullptr).ok());
+    model.odometry_sequence = sample.sequence;
+    qualification.local_correlation = model;
+    auto map = Map(index);
+    map.context.provenance.shared_local_scans = ObservationDependency::kPresent;
+    if (index == 0) {
+      qualification.local_correlation->cross_covariance(0, 0) = 1;
+      EXPECT_FALSE(owner.SubmitMapObservation(map, qualification).ok());
+      qualification.local_correlation->cross_covariance = model.cross_covariance;
+    }
+    const auto status = owner.SubmitMapObservation(map, qualification);
+    EXPECT_EQ(status.ok(), index == 2) << status.message();
+    EXPECT_DOUBLE_EQ(sample.odometry.pose.translation.x(), 0.1 * index);
+  }
+  FixedLagAlignmentResult result;
+  ASSERT_TRUE(owner.GetResult(Odom(2).odometry.timestamp, &result).ok());
+  ASSERT_TRUE(result.estimate.has_value());
+  EXPECT_NEAR(result.estimate->map_from_odom.translation.x(), 100, 1e-8);
 }
 
 TEST(FixedLagAlignmentTest, MissingMotionRevokesGlobalButRetainsNewOdom) {

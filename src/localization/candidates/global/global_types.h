@@ -41,11 +41,14 @@ struct GlobalConfig {
   // Explicit alternative for bounded replays with declared, uncalibrated
   // local covariance. Cannot enable the qualified graph or trusted output.
   bool diagnostic_only = false;
+  bool enable_diagnostic_horizontal_bootstrap = false;
   bool motion_error_model_qualified = false;
+  bool graph_allow_uncalibrated_inputs = false;
   double graph_solve_budget_ms = 50.0;
   double graph_robust_threshold = 2.5;
   uint32_t graph_max_states = 1000;
   uint32_t graph_max_observations = 2000;
+  uint32_t graph_max_error_dimension = 256;
   uint32_t graph_max_iterations = 5;
   double graph_max_linearization_angle = 0.2;
 };
@@ -89,6 +92,21 @@ struct GlobalObservation {
   bool recovery = false;
   bool ambiguous = false;
   bool independent_of_local = false;
+  // Qualified conditional source noise n=C^T P^-1 e+eta; empty by default.
+  Eigen::MatrixXd local_error_cross_covariance;
+  uint64_t local_error_sequence = 0;
+  std::optional<double> local_error_time;
+  bool conditional_local_error_qualified = false;
+};
+
+struct HorizontalGlobalState {
+  // [translation at reference XY, yaw], never a full SE(3) pose.
+  Eigen::Vector3d alignment = Eigen::Vector3d::Zero();
+  Eigen::Vector2d odom_reference_xy = Eigen::Vector2d::Zero();
+  Eigen::Matrix3d covariance = Eigen::Matrix3d::Zero();
+  double last_observation = 0.0;
+  double covariance_time = 0.0;
+  int64_t last_observation_ns = 0;
 };
 
 struct GlobalState {
@@ -104,6 +122,7 @@ struct GlobalState {
   bool georeferenced = false;
   bool verifying = false;
   bool diagnostic_only = false;
+  std::optional<HorizontalGlobalState> horizontal;
 };
 
 struct GlobalEvidence {

@@ -15,6 +15,7 @@
 
 #include "candidates/common/observed_subspace.h"
 #include "candidates/common/types.h"
+#include "candidates/local/local_motion.h"
 #include "candidates/map/map_matcher.h"
 
 namespace openloc {
@@ -53,6 +54,7 @@ unified::MatchConfig ToMatchConfig(const ScanToMapConfig& config) {
           ? config.icp_maximum_iterations
           : config.ndt_maximum_iterations;
   result.maximum_registration_points = config.maximum_registration_points;
+  result.maximum_error_points = config.maximum_error_points;
   result.normal_neighbors = config.normal_neighbors;
   result.normal_planarity_ratio = config.normal_planarity_ratio;
   result.icp_max_rmse = config.icp_max_rmse_m;
@@ -134,6 +136,10 @@ bool ScanToMapLocalizer::ValidateConfig(std::string* error) const {
       config_.algorithm != ScanMatchingAlgorithm::kPointToPlaneIcp) {
     return invalid("unknown scan matching algorithm");
   }
+  if (config_.maximum_error_points == 0 ||
+      (config_.retain_joint_error_support &&
+       config_.algorithm != ScanMatchingAlgorithm::kPointToPlaneIcp))
+    return invalid("joint registration support requires bounded point-to-plane ICP");
   if (config_.map_frame.empty() || config_.base_frame.empty() ||
       config_.cloud_frame.empty() ||
       !IsRigidTransform(config_.base_from_cloud)) {
@@ -351,7 +357,8 @@ ScanToMapLocalizer::Window* ScanToMapLocalizer::GetWindow(
     return nullptr;
   }
   auto window = std::make_unique<Window>(ToMatchConfig(config_));
-  const auto status = window->matcher.SetMap(local_map);
+  const auto status = window->matcher.SetMap(
+      local_map, config_.retain_joint_error_support);
   if (!status.ok()) {
     if (error != nullptr) {
       *error = status.message;
@@ -381,6 +388,7 @@ ScanToMapLocalizer::Window* ScanToMapLocalizer::GetWindow(
 ScanToMapResult ScanToMapLocalizer::Match(const ScanToMapRequest& request) {
   const auto started = std::chrono::steady_clock::now();
   ScanToMapResult output;
+  if (request.joint_scan) output.joint_error.emplace();
   const auto finish = [&started](ScanToMapResult result) {
     result.processing_time_ms = std::chrono::duration<double, std::milli>(
                                     std::chrono::steady_clock::now() - started)
@@ -413,10 +421,46 @@ ScanToMapResult ScanToMapLocalizer::Match(const ScanToMapRequest& request) {
     output.reason = "map_not_ready";
     return finish(std::move(output));
   }
+  PointCloud::ConstPtr cloud = request.cloud;
+  if (request.joint_scan) {
+    const auto& scan = *request.joint_scan;
+    const auto valid = unified::ValidateJointLocalError(scan.conditioning_state);
+    if (request.cloud || !config_.retain_joint_error_support ||
+       config_.cloud_frame != config_.base_frame ||
+       !config_.base_from_cloud.matrix().isApprox(Eigen::Matrix4d::Identity(), 0) ||
+       !valid.ok() || !scan.conditioning_state.joint_error ||
+       !std::isfinite(scan.reference.time) || scan.reference.time <= 0 ||
+       scan.reference.time > scan.conditioning_state.stamp.time ||
+       scan.reference.clock_id != request.clock_domain ||
+       scan.conditioning_state.stamp.clock_id != request.clock_domain ||
+       std::abs(scan.reference.time - request.timestamp_ns * 1e-9) > 1e-9 ||
+       scan.points_in_reference_base.size() > config_.maximum_error_points ||
+       scan.points_in_reference_base.size() != scan.point_jacobians.size() ||
+       request.initial_joint_jacobian.rows() != 6 ||
+       request.initial_joint_jacobian.cols() !=
+           scan.conditioning_state.joint_error->covariance.rows() ||
+       !request.initial_joint_jacobian.allFinite()) {
+      output.reason = "invalid_shared_scan_or_seed_error_support";
+      return finish(std::move(output));
+    }
+    PointCloud::Ptr points(new PointCloud);
+    for (std::size_t i = 0; i < scan.points_in_reference_base.size(); ++i) {
+      const auto& p = scan.points_in_reference_base[i];
+      const auto& loading = scan.point_jacobians[i];
+      if (!p.allFinite() || loading.rows() != 3 ||
+         loading.cols() != request.initial_joint_jacobian.cols() ||
+         !loading.allFinite()) {
+       output.reason = "invalid_shared_point_error_support";
+       return finish(std::move(output));
+      }
+      points->push_back(pcl::PointXYZ(p.x(), p.y(), p.z()));
+    }
+    cloud = std::move(points);
+  }
   if (request.timestamp_ns <= 0 || request.clock_domain.empty() ||
       request.cloud_frame != config_.cloud_frame || !request.deskewed ||
-      !request.cloud || request.cloud->empty() ||
-      request.cloud->size() >
+      !cloud || cloud->empty() ||
+      cloud->size() >
           static_cast<size_t>(std::numeric_limits<uint32_t>::max()) ||
       !IsRigidTransform(request.map_from_base_initial)) {
     output.reason = "invalid_scan_timestamp_frame_or_initial_pose";
@@ -424,12 +468,14 @@ ScanToMapResult ScanToMapLocalizer::Match(const ScanToMapRequest& request) {
   }
 
   PointCloud::Ptr filtered(new PointCloud);
-  filtered->reserve(request.cloud->size());
+  filtered->reserve(cloud->size());
+  std::vector<std::size_t> source_indices;
   const double minimum_squared =
       config_.minimum_scan_range_m * config_.minimum_scan_range_m;
   const double maximum_squared =
       config_.maximum_scan_range_m * config_.maximum_scan_range_m;
-  for (const auto& point : *request.cloud) {
+  for (std::size_t index = 0; index < cloud->size(); ++index) {
+    const auto& point = (*cloud)[index];
     if (!std::isfinite(point.x) || !std::isfinite(point.y) ||
         !std::isfinite(point.z)) {
       output.reason = "scan_contains_nonfinite_point";
@@ -445,6 +491,7 @@ ScanToMapResult ScanToMapLocalizer::Match(const ScanToMapRequest& request) {
       continue;
     }
     filtered->push_back(point);
+    if (request.joint_scan) source_indices.push_back(index);
   }
   output.source_points = static_cast<uint32_t>(filtered->size());
   const Eigen::Isometry3d map_from_cloud_initial =
@@ -461,8 +508,10 @@ ScanToMapResult ScanToMapLocalizer::Match(const ScanToMapRequest& request) {
   output.map_window_points = window->point_count;
   output.map_window_build_ms = window->build_time_ms;
   unified::MatchResult match;
+  unified::RegistrationErrorMap errors;
   const unified::Result status =
-      window->matcher.Match(filtered, map_from_cloud_initial, &match);
+      window->matcher.Match(filtered, map_from_cloud_initial, &match,
+                             request.joint_scan ? &errors : nullptr);
   output.converged = match.converged;
   output.ambiguous = match.ambiguous;
   output.score = match.score;
@@ -537,6 +586,36 @@ ScanToMapResult ScanToMapLocalizer::Match(const ScanToMapRequest& request) {
                       cloud_to_base_jacobian.transpose();
   output.observed_covariance = std::move(base_projected_covariance);
   output.observability_available = match.projection.rows() > 0;
+  if (request.joint_scan) {
+    auto& model = *output.joint_error;
+    model.assessment = errors.assessment;
+    if (!errors.assessment.ok()) return finish(std::move(output));
+    if (!match.full_pose ||
+        errors.source_point_jacobians.size() != source_indices.size()) {
+      model.assessment = {unified::Reason::CORRELATION_UNQUALIFIED,
+                          "Shared registration requires full observed pose support"};
+      return finish(std::move(output));
+    }
+    const auto& scan = *request.joint_scan;
+    Eigen::MatrixXd loading =
+        errors.initial_jacobian * request.initial_joint_jacobian;
+    for (std::size_t i = 0; i < source_indices.size(); ++i)
+      loading.noalias() += errors.source_point_jacobians[i] *
+                          scan.point_jacobians[source_indices[i]];
+    model.pose_jacobian = cloud_to_base_jacobian * loading;
+    model.conditioning = scan.conditioning_state.stamp;
+    model.source_sequence = scan.reference.sequence;
+    model.local_cross_covariance =
+        scan.conditioning_state.joint_error->covariance *
+        model.pose_jacobian.transpose();
+    model.covariance = model.pose_jacobian * model.local_cross_covariance;
+    model.covariance =
+        (0.5 * (model.covariance + model.covariance.transpose())).eval();
+    if (!model.covariance.allFinite() ||
+        Eigen::LLT<unified::Matrix6d>(model.covariance).info() != Eigen::Success)
+      model.assessment = {unified::Reason::CORRELATION_UNQUALIFIED,
+                          "Shared registration pose marginal is not full rank"};
+  }
   return finish(std::move(output));
 }
 

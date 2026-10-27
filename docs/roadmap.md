@@ -11,6 +11,1029 @@ Functional principles remain in
 
 ## Current implementation and evidence
 
+### Native target-graph Cyber functional boundary
+
+The host now has default-off, explicit sole `FixedLagGlobalAlignment` selection.
+The existing diagnostic owner is not constructed as a parallel/fallback owner.
+Local post-commit exports atomically transport the actual joint basis/output
+projection, rectangular cross-time motion, primitive identities and optional
+actual shared deskewed scan. Original nominal ODOM remains immutable.
+Packets, dimensions, tasks and queues are bounded; incomplete or unavailable
+models cannot be replaced by configured diagnostic covariance.
+
+Off-owner shared ICP includes the stochastic local seed loading and uses the
+declared deterministic versioned map. Its source covariance/cross-covariance
+feed that same selected graph. Raw GGA retains real quality/dwell admission
+and needs an explicit external source-model declaration. Both full-pose and
+GNSS decisions remain auditable; output identifies the selected owner/model
+and stays diagnostic-only/untrusted.
+
+The actual cross-process regression consumes 19 raw IMUs and four native scans,
+all committed two frontiers late, then performs shared ICP and three map
+updates plus admitted raw GGA in that one graph. It exercises delayed cold
+acquisition, lag retirement and original source references without modifying
+ODOM. A separate target-owner regression checks reset/consumer ACK fencing,
+reacquisition and rejection without diagnostic fallback. Source/worker failures
+also withdraw the separate joint channel immediately, with cross-process
+receipt checked before any graph snapshot exists. The preceding nine-target
+host regression passed, including the raw-host suite; its Cyber suite has ten cases.
+No lint, calibration sweep or accuracy tuning was run.
+
+The subsequent full raw sender/local host/target-graph host regression now
+passes with explicitly selected offline source-clock graph replay: 224 raw IMUs,
+four raw scans and two GGA packets produce three map and one GNSS correction,
+with the final subscribed source frontier at 224. The native owner computes
+the models inside the local executable, not before transport. Local/global
+profiles must both opt in; source times stay unchanged and actual processing
+delay is published separately. Ordinary ODOM and live graph freshness are
+unchanged. A locally withdrawn model no longer advances the motion endpoint.
+
+Earlier wall-freshness attempts remain failed coverage: even delayed LIO and
+recorded backpressure did not meet the unchanged window. The passing offline
+case observed model processing above two seconds and sender lateness above
+seven seconds. It is a maintained synthetic raw-input functional regression,
+not a real-capture baseline, live throughput fix or deadline qualification.
+After this change, all nine affected host targets pass together, including
+the full 13-case raw-host suite and ten-case global Cyber suite. No lint ran.
+
+This closes the host transport/selection functional gap, not all E3-E6:
+the new target path currently requires an explicit bounded map hypothesis
+rather than the separate diagnostic regional search. New target-graph
+two-capture replay, production consumers, live processing/overload budgets
+and independent-reference acceptance remain outside this evidence.
+
+### Actual native joint model into the selected graph
+
+An explicit default-off `allow_uncalibrated_inputs` mode separates functional
+graph composition from empirical uncertainty calibration without weakening
+model sufficiency, source dependence or quality admission. The public result
+remains diagnostic-only with an untrusted assessment.
+
+A maintained regression feeds 19 actual raw IMU samples and four local LiDAR
+scans through the native stochastic owner, then supplies its coherent joint
+snapshots and rectangular motion cross-covariances to the same fixed-lag graph.
+Independent synthetic map and GNSS measurements bootstrap and update that owner;
+absolute corrections do not change local ODOM. This exposed constrained
+Bayes-tree marginal re-elimination losing numerical rank. Covariances now use
+triangular propagation through the existing posterior, preserving exact
+zero-noise equations rather than introducing epsilon noise.
+
+This independent-source regression is functional composition evidence, not
+host target-graph selection, accuracy or E4 completion.
+The following section covers the separate actual relative-startup model.
+
+### Actual shared raw scan-to-map model
+
+Native geometry now retains each accepted scan's actual pre-correction
+deskewed points and same-driver loadings. `PrepareJointLidarScan` finalizes the
+augmented frontier once before graph consumption, preserving nominal ODOM and
+its published marginal. Synchronous and delayed commits retain the original
+measurement reference; their scan support retires with native geometry.
+
+The opt-in public scan-to-map path composes actual frozen ICP source/seed
+derivatives with this joint state. It preserves point identity across range
+filtering and voxelization and requires complete stochastic seed support.
+The model explicitly conditions on a deterministic versioned map; map survey/
+construction uncertainty and empirical calibration remain outside this claim.
+It does not substitute the existing residual-Hessian diagnostic covariance.
+
+All source errors can be mediated by the joint state, so zero conditional
+source noise is represented by exact equations, not an epsilon floor. Delayed
+observations bind their original pose node to a separately named retained
+error node. Cold bootstrap assembles that trajectory and source in one update.
+The same owner uses pose-first retained-factor re-elimination for conditional
+updates, avoiding constrained-separator rank loss without another solver.
+
+Maintained raw IMU/three-plane scan regressions cover synchronous and fully
+delayed acquisition, actual finite-iteration ICP, repeated same-graph updates,
+fixed-lag retirement, uncalibrated labels and unchanged nominal ODOM. Five
+package targets and the three existing worker/publication targets pass.
+The host transport/selection and actual cross-process regression are now
+implemented as described above; calibrated/operational E4 acceptance is separate.
+
+### Opt-in frozen-linearization stochastic observer (E4 still incomplete)
+
+The native owner now has executable shared covariance propagation, not just
+deterministic derivative exports: exact sampled IMU propagation, actual wheel gains,
+pre/post-correction history clones, deskew/raw points, retained geometry,
+iterated LIO and the 18D output smoother share one bounded error basis.
+Stored-point loadings survive retirement of their originating history; plane
+support reuses those loadings instead of independent anchor/point marginals.
+Every LIO iteration uses the original same-scan random errors, not another
+independent observation. Its gain, correspondence, whitening and observed
+subspace are frozen at the actual nominal iteration.
+
+`JointErrorLookup`/`JointErrorMotionBetween` expose separate coherent,
+uncalibrated first-order snapshots and rectangular cross-time covariance.
+The original nominal state, diagnostic covariance, source decisions and
+qualification flags are unchanged. Minimal-basis compression handles singular
+shared physical memory; no epsilon process noise is introduced. Independent
+limits cover physical rows, stochastic dimension and exported snapshots.
+Overflow rejects the observer, rather than truncating history dependencies.
+
+The raw sampled IMU model now reuses each original acceleration/gyro error
+across adjacent intervals and causal wheel interpolation, with explicit
+`native_imu_sample_period` specifying PSD-to-sample variance conversion.
+The actual midpoint state/sample Jacobians pass finite differences.
+Stationary initialization includes the frozen mean/current-sample correlation;
+the owner's declared residual initial uncertainty is not relabeled calibrated.
+
+Delayed tasks now pin the original sufficient basis and later primitive
+drivers. Their joint candidate/live covariance survives ordinary history
+retirement. Commit preserves the actual live output memory and previously
+published snapshots, while retaining candidate internal/history/geometry
+loadings; all pins and dependencies remain resource-bounded. Analytic shared
+driver/gauge, raw-sample, wheel-split, stationary-mean and retired-history
+bridge regressions exercise these paths without epsilon noise or looser graph
+admission.
+
+Actual relative bootstrap now retains raw scans and frozen ICP steps, with
+voxel membership and target-normal derivatives. Reverse propagation through
+relative composition, gyro interpolation and causal translation deskew
+preserves reuse across adjacent registrations. Numerical differentiation of
+the unchanged initializer combines pose and original IMU inputs; its initial
+state and frontier IMU share one joint covariance. The existing declared
+residual initial uncertainty is retained, not relabeled calibrated.
+
+Maintained regressions exercise real raw-scan synchronous/asynchronous
+LiDAR-rest startup and excited moving startup, then export joint motion across
+the next original IMU trapezoid. They compare nominal state exactly against the
+observer-disabled owner. Unretained/retired support, nonunique voxel/normal
+branches and capacity overflow reject only the observer. Bare pose-only
+initialization remains unmodeled. All four package regression targets pass.
+
+This does **not** establish qualified E4 acceptance. Host target-graph
+transport/selection is now implemented as described above.
+The shared map-source functional model is described above. These startup computations do
+not establish live processing deadlines or statistical calibration.
+
+### Augmented joint-error representation and native motion export
+
+The existing graph owner now accepts a bounded full-rank joint error basis,
+its projection into the published 15D state, and rectangular cross-time
+covariance. Its chain, exact pose coupling, conditional source loading and
+innovation retain all supplied memory instead of collapsing back to 15D.
+Endpoint/source dimensions and projected marginals/cross-covariances must
+agree. Negative hidden conditional noise and capacity violations fail
+explicitly; no truncation or artificial memory priors are introduced.
+An analytic regression keeps shared source/output memory through delayed
+historical observations, dimension growth/retirement and lag marginalization.
+The public facade exercises augmented bootstrap and malformed-model
+non-consumption.
+
+`NativeOdometry::MotionBetween()` now exposes the existing owner's actual
+cross-time motion and source identities without a private header or a
+duplicate value definition. IMU motion is available without relabeling
+uncalibrated uncertainty; unmodeled raw LIO intervals remain explicitly
+rejected. This resolves an API/export prerequisite and the graph's fixed-15D
+representation barrier, **not E4 completion**. Actual native stored geometry,
+deskew/startup and output-memory joint stochastic propagation remain incomplete.
+
+The native owner now exports on-demand analytic continuous-output dynamics,
+including its three correction-velocity memory dimensions and frozen endpoint
+inputs. It also exports the actual raw-scan deskew dependencies: interpolation
+uses corrected-left/pre-correction-right clones, repeated clones are shared,
+and raw-point/end-pose loadings retain lever arms and rotations. Nonunique
+rotation/limiter boundaries fail without overwriting a caller's model.
+These are deterministic derivatives of the unchanged nominal path, not a
+covariance assembled from independent endpoint marginals. Stored-geometry
+reuse and the full startup/history/output joint covariance/source model still
+need integration; native model/uncertainty flags remain unchanged.
+
+Stored local planes now also expose their actual raw-source sequence/point
+support and analytic center/normal derivatives, composed with the frozen
+anchor pose and deskew-point loading. Anchors are retained and retired with
+the existing bounded scan window. Voxel-assignment boundaries, repeated normal
+eigenvalues and ambiguous source identities cannot produce an error model.
+Plane relinearization, shared rigid gauge, scan retirement, actual public-owner
+exports and unchanged raw live/recorded/three-process composition are covered.
+This preserves geometry reuse explicitly but still does not supply its joint
+covariance or qualify E4.
+
+### Reversible output-envelope withdrawal
+
+The raw native worker now forwards the owner's existing
+`CORRECTION_BUDGET_EXCEEDED` assessment instead of publishing it as healthy
+integrity-only ODOM. Out-of-envelope publications retain original source
+identity/times but contain no pose/velocity/TF. The owner continues unchanged;
+later in-envelope samples can restore diagnostic publication without an epoch
+reset. A focused raw-scan regression proves withdrawal, recovery and exact
+position/velocity/orientation/covariance parity with the direct owner. Worker,
+publication, Cyber publisher, global worker and actual connected-host targets
+pass. No budget or uncertainty qualification was changed; a first-capture
+envelope breach remains a failure, not a reason to enlarge its limits.
+
+### Conditional source factors in the existing graph (2026-10-26)
+
+The selected graph now models qualified source/local-error cross-covariance
+instead of requiring every observation to be unconditionally independent.
+For `C = Cov(e,n)`, it derives the loading and conditional noise and factors
+`h(x)-z+B e` against that noise. Innovation uses the full current pose/error
+joint marginal, including cross blocks. Exact native node sequence/model
+identity, sufficient-state qualification and conditional independence from
+all history/other residuals are mandatory. Invalid conditional covariance
+cannot consume startup evidence or commit a graph revision.
+Independent sources retain their existing path; diagnostic sources do not
+gain qualification. No local feedback or additional global owner is added.
+
+The graph also accepts singular PSD conditional motion noise using exact
+constraints in deterministic directions, rather than adding epsilon process
+noise. Regressions exercise all-deterministic and rotated low-rank chains
+through fixed-lag marginalization, analytic shared-noise posterior gains,
+delayed shared evidence, projected factors, conditional full-pose bootstrap,
+invalid model identity/covariance and original-observation non-consumption.
+One existing test expectation was stale: unmodeled local covariance returns
+`CORRELATION_UNQUALIFIED`, not `INVALID_INPUT`; production behavior was not
+changed to satisfy that assertion.
+
+Evidence: `.agents/notes/native_graph_conditional_sources_20261026_v1/audit.json`.
+This implements graph-side E4 primitives, **not native E4 completion**.
+Native stored-plane/point/deskew reuse and continuous-output correction-memory
+still require a sufficient joint state and actual model export. The present
+15D native output does not establish that claim. No native qualification flag
+or recorded-data covariance was relabeled. The instrumented five-run bounded
+shutdown investigation did not reproduce the earlier timeout; it remains
+unresolved and is not counted as fixed.
+
+### Terminal online health withdrawal (2026-10-26)
+
+Fatal raw source/worker failures now latch a terminal unavailable state in
+the existing native publisher before process teardown. Original native
+identity/timestamps are retained, with no pose/velocity/TF or renewed source
+time, and later owner updates cannot restore output. Actual Cyber receipt,
+not just attempted write, is required by the four ingress-fault process cases.
+The existing global worker withdraws local availability on these messages;
+held ODOM/GNSS cannot revive it. Transport failure remains an explicit failure,
+not a delivery guarantee. This closes a functional health gap, not E4, live
+deadline/overload qualification or production-consumer acceptance.
+
+Opaque startup tasks also retain their originating bootstrap identity:
+matching revision/frontier from another bootstrap no longer authorizes
+commit or consumes the original task. The original bootstrap can still
+catch up and commit normally; no local initialization policy is changed.
+
+A subsequent archive run exposed first-map-packet loss after reader discovery
+(39/40 unique inputs) and one live-test shutdown timeout. The recorded map
+boundary now optionally reuses bounded enqueue ACKs and byte-identical
+last-packet retries, keeping every original cloud and the strict owner gate.
+Conflicting retries/gaps and live opt-in are rejected; the connected regression
+enables the protocol explicitly. The earlier failed run remains preserved.
+The shutdown timeout did not reproduce in the next corrected run; its cause
+is unresolved, not declared fixed. Bounded child waits now retain thread wait
+channels on failure rather than only discarding the process. This remains
+separate from qualified shutdown/deadline/overload acceptance.
+
+All 50 focused cases across seven local-owner/publication/global-worker/Cyber
+targets pass after the recorded-map boundary fix; all four terminal statuses
+are archived from actual subscribers. Evidence, including the prior failed
+run and the unresolved shutdown boundary:
+`.agents/notes/native_terminal_health_20261026_v1/audit.json`.
+This does not close the native joint-error/source-correlation implementation.
+
+### Actual connected raw-native/global functional milestone (2026-10-26)
+
+The raw sensor sender can now observe the separately running global host
+while the local host owns startup/LIO and publishes actual ODOM. It never
+substitutes a prepared ODOM trajectory. An actual global heartbeat precedes
+sensors; both subscribers must reach the final native source frontier.
+Optional original raw-GGA packets interleave by receive time. Recorded map
+transport is separate from local ACK retries, preserving identical clouds
+while leaving the global duplicate-observation guard unchanged.
+
+The third-capture no-GNSS, no-pose-seed conditional-region run admits all
+5,999 IMU and 300 clouds, initializes via relative async startup, commits 161
+local LIO tasks and 139 map corrections, and receives 1,405 actual full-pose
+publications. Evidence:
+`.agents/notes/native_connected_hosts_20261026_v2/audit.json`.
+Declared region/identity tilt and same-capture map remain unqualified priors.
+
+Second-capture connected GNSS-only and map+GNSS runs each admit all 6,000 IMU,
+300 clouds and 29 original GGA packets, and commit 135 local LIO tasks.
+GNSS-only commits one horizontal correction and no full pose; map+GNSS
+commits 70 map plus 11 GGA corrections through one owner and receives 1,324
+full-pose publications. Evidence:
+`.agents/notes/native_connected_three_sources_20261026_v3/audit.json`.
+This map arm preserves its historical epoch/time-limited, future-informed,
+same-capture **global-only** hypothesis, not seed-free recovery.
+Original reconstructed GGA payloads/identities are preserved; double-header
+receive-time rounding and unavailable raw-driver chunking are disclosed.
+Scheduling is recorded admission-paced, not open-loop live qualification.
+
+These runs close an actual online-composition gap, not E4 or all E3-E6.
+Native ODOM still has no absolute-feedback interface; asynchronous repetitions
+are not claimed as deterministic ODOM-isolation ablations. No threshold,
+queue/deadline budget or uncertainty qualification was relaxed to obtain
+corrections. Target conditional-error graph, unknown whole-map/tilt recovery,
+production consumers, output-envelope failures and full overload/scenario
+acceptance remain implementation/acceptance work, not hidden precision tuning.
+
+The connected composition is also a maintained three-process regression in
+the existing host suite, not only a temporary evidence driver. Its synthetic
+800 IMU/40 clouds/one raw-GGA fixture must yield actual local admissions,
+all 40 unique map events, correction commits and global full-pose publication
+through the final native frontier. Profiles, inputs and journals are archived
+as Bazel test outputs. All 24 affected host/config/worker/ingress cases pass;
+evidence: `.agents/notes/native_connected_regression_20261026_v1/audit.json`.
+
+### Explicit live ingress functional milestone (2026-10-26)
+
+The raw Cyber host now optionally requires genuine single-producer
+`Header.sequence_num` continuity independently for IMU and LiDAR.
+Missing identities, visible gaps, duplicates and regressions fail before
+enqueue; uint32 rollover is valid. A flushed `.source.csv` records the
+original source identity, actual admission and fatal adapter/worker/publisher
+outcomes. Failed enqueue is not admission. Exception-path reader shutdown
+precedes destruction of captured worker/journal state.
+Default headerless behavior and recorded idempotent retries remain unchanged.
+
+All 23 focused host/config/worker/ingress cases pass, including four actual
+cross-process admission/fault ledgers and missing point-coordinate rejection.
+Frozen source/runtime hashes, test logs/XML and fault journals:
+`.agents/notes/native_live_ingress_20261026_v1/audit.json`.
+This is synthetic contract evidence, not another raw-native algorithm run.
+The first observed sequence is only a baseline; earlier loss, trailing loss,
+producer loss before numbering, restart identity and transport-versus-reader
+attribution remain unqualified. Detection is not reliable delivery or 100 Hz
+overload qualification. The next online composition must consume actual
+native publications, not substitute replayed ODOM for a connected local host.
+
+### Isolated relative startup host functional milestone (2026-10-26)
+
+Opt-in `startup_task_timeout_ms` now moves provisional relative registration
+and motion initialization off the IMU owner thread. Public opaque startup
+tasks copy native/bootstrap state, replay every subsequently accepted IMU,
+and commit only at the exact live frontier of the original uninitialized
+owner. Local/global absolute sources remain unrelated to startup. Default
+synchronous behavior and the existing startup geometry/observability checks
+are unchanged; no stopped, calibrated or trusted claim is added.
+
+One startup task, a 128-IMU catch-up bound, steady/source-age deadlines and
+explicit shutdown retirement prevent hidden unbounded work or late adoption.
+A live owner that independently initialized cannot be overwritten.
+Async failures surface even when no new sensor event arrives.
+Focused public-owner and host cases cover exact catch-up, wrong owner,
+duplicate consumption, continuing IMUs during deliberately blocked geometry,
+deadline/shutdown rejection and async failure propagation.
+
+Three real raw-input, arrival-paced Cyber publisher runs preserve all 17,999
+IMU source identities/times, initialize via startup tasks and subsequently
+commit delayed LIO tasks. Current startup snapshot-to-frontier maxima are
+56.3/64.9/131.9 ms; these are source receive-time catch-up intervals, not
+measured compute times or a live 100 Hz result. End-of-input LIO work without
+a new IMU remains uncommitted. Evidence:
+`.agents/notes/native_async_startup_host_20261026_v2/audit.json`.
+Native uncertainty remains unqualified. The target conditional-error graph,
+unknown whole-map/tilt recovery, complete ingress-drop accounting, production
+consumers and full scenario acceptance are still not delivered by this step.
+
+### Raw-map Cyber acquisition/recovery functional milestone (2026-10-26)
+
+The independent host now accepts raw calibrated LiDAR plus continuous native
+ODOM history. One bounded asynchronous scan-to-map task waits for the actual
+ODOM frontier, deskews copied poses, and supplies full/projected observations
+to the existing single diagnostic global owner. ODOM/GNSS/reset processing
+does not wait for geometry; busy, missing history, deadline, stale source and
+epoch/reset retirement have explicit outcomes. No absolute feedback reaches
+native ODOM. This is not complete live ingress-drop or deadline qualification.
+
+Acquisition supports either an epoch/time-limited explicit hypothesis or a
+hash-pinned conditional region/tilt/coverage policy. Public
+`DiagnosticRegionalSearch` extracts the existing replay particle search,
+geometric candidate verification and stable unique tracker; it introduces
+neither a second estimator nor new geometry thresholds. Truncated/competing
+evidence cannot supply a pose. Full-pose lease loss or local/global identity
+changes restart candidate verification before the same owner's acquisition.
+
+Real seed-free third-capture evidence:
+`.agents/notes/native_regional_host_20261026_v1/audit.json`.
+The current raw-native replay commits 146 map corrections and exactly
+preserves the 5,999 ODOM rows and local scan decisions except measured timing.
+Rehosting its ODOM with 120 original point clouds commits 106 map corrections,
+with no GNSS, external ODOM or pose seed. Region, identity tilt and declared
+coverage remain explicit diagnostic priors; the same-capture draft map does
+not establish independent accuracy.
+
+`.agents/notes/native_regional_host_faults_20261026_v1/audit.json` separately
+proves full-pose withdrawal and regional reacquisition after 26 dropped scans
+(72 commits), and reset/consumer retirement followed by next-generation
+acquisition (69 commits). Both retain byte-identical ODOM inputs.
+Earlier seeded raw-map/raw-map+GNSS/raw-map+raw-GGA controls remain historical
+evidence in `.agents/notes/native_online_map_host_20261026_v4/`.
+This completes conditional raw-map runtime acquisition/recovery, not unknown
+whole-map/tilt search, the native conditional-error graph, production consumers,
+or qualified live deadlines/overload. Independent startup scheduling is
+implemented in the newer milestone above.
+
+### No-map horizontal acquisition functional milestone (2026-10-26)
+
+Explicit `--diagnostic-level-odom-gnss-bootstrap` now enables GNSS-only
+XY/yaw acquisition and tracking within the existing diagnostic owner.
+It reuses the eight-position fit and three later holdouts with unchanged
+baseline/residual gates; no map seed, second global owner or absolute input
+to local ODOM is introduced. Gravity-level ODOM/global XY is an explicit
+diagnostic assumption, not qualified physical-up evidence. Height/full pose
+remain absent, and the target graph and trust remain unavailable.
+Accepted-position gaps beyond the existing global timeout require a new
+training/holdout window; stationary and failed-holdout windows do not acquire.
+
+Same-binary first-30-second `odom`/default `gnss`/opt-in `gnss` arms pass for
+`20261012105149` and `20261013170722`: horizontal acquisition plus tracking
+commits 3 and 10 corrections respectively, while default GNSS-only commits
+zero. All six runs preserve their respective 6,000/6,001 ODOM rows and 300
+scan decisions exactly except measured processing time. All 29 GNSS arrivals
+per arm remain accounted, and no full pose or trusted health is emitted.
+Commands, source/input/runtime pins, reports and exact isolation checks:
+`.agents/notes/native_horizontal_acquisition_20261026_v1/audit.json`.
+Focused owner/recovery/online/graph tests and native map/GNSS regressions pass.
+This completes a no-map **diagnostic horizontal** function, not E3-E6.
+The prepared-input global host step below now advances online publication;
+live source adapters and the reset-request boundary remain functional work.
+Accuracy calibration is a separate acceptance track, not a reason to postpone
+that implementation.
+
+### Prepared-input Cyber global host functional milestone (2026-10-26)
+
+The independent consumer `modules/openloc_localization` now includes an
+opt-in `native_global_diagnostic` executable. One bounded diagnostic owner
+consumes existing local ODOM publications, explicitly prepared,
+receiver-admitted GNSS antenna XY and opt-in prepared map observations.
+A separate 10 ms timer publishes diagnostic XY/alignment or verified fresh
+map full pose, without absolute feedback, production topics, trusted output
+or target-graph qualification. Held/stale sources, missing
+local output, epoch retirement/reacquisition, rejects and worker overflow have
+explicit outcomes. Source frame/epoch/reference checks and journals remain
+host responsibilities; no private candidate headers are exposed.
+
+Two frozen raw-native 30-second ODOM/GNSS gate ledgers rehost through typed
+Cyber with all 6,029/6,030 events accounted and 3/10 actual correction commits
+plus partial publications. GNSS integer identities are preserved; the current
+ODOM wire uses double seconds and can round converted ns. This rehosting uses
+explicit uncalibrated host covariance, not retained native covariance.
+Evidence: `.agents/notes/native_global_host_20261026_v3/audit.json`.
+The cross-process regression separately covers actual Cyber delivery and
+stale/epoch output, including bilateral discovery and explicit reader shutdown.
+This is not a new raw-sensor algorithm run, independent accuracy or live
+100 Hz/overload acceptance. Prepared full/projected map observations now share
+that same owner. Map-only initialization, horizontal-to-full handover, both
+source revisions, epoch retirement and full-pose freshness are implemented;
+GNSS/projected evidence cannot renew the full-pose lease. Journals distinguish
+sources and retain dependency declarations. A final-event watermark makes the
+maintained replay wait for the corresponding publication rather than an older
+correction at the same ODOM epoch.
+
+Current host-wiring evidence:
+`.agents/notes/native_map_host_20261026_v1/audit.json`. The two unchanged
+no-map native ledgers still commit 3/10 corrections; a separate synthetic
+prepared-map/GNSS stream commits two map plus one GNSS correction and publishes
+full diagnostic pose. Mixed-source cross-process coverage is also synthetic,
+not raw-map matching evidence. Raw GGA adapter/projection is now implemented
+as described below. Live scan-to-map
+scheduling, reset-request/consumer acknowledgement and E4 remain unfinished;
+E5 is advanced, not complete. Continue these software functions rather than
+turning the next milestone into accuracy tuning.
+
+### Raw GGA Cyber adapter functional milestone (2026-10-26)
+
+The same independent global host now optionally subscribes
+`apollo.drivers.gnss.RawData` instead of prepared GNSS XY. Bounded streamed
+GPGGA/GNGGA framing/checksum, exact UTC time-of-day with nearest receive-day
+association, shared receiver fixed-quality/dwell admission and explicitly
+configured WGS84/UTM origin/lever adaptation run on the existing global worker.
+Public `GnssPositionGate` wraps the existing private admission implementation;
+no second global estimator or host dependency enters the OpenLoc library.
+The projection uses an explicit pipeline, not a host `proj.db` dependency.
+Prepared GNSS mode remains unchanged.
+
+Both original 30-second GGA recordings now feed actual typed Cyber with frozen
+native ODOM: all 6,029/6,030 events and 29 GGA sentences per capture are
+accounted, with 1/8 actual diagnostic corrections. New ODOM epoch establishment
+restarts two-second receiver stability, explaining two fewer commits than the
+unchanged prepared controls (3/10). Measurement ns remain exact; RawData's
+double receive-time header can round associated original bag receive ns.
+This reconstructs packets from original checksum-valid sentences and associated
+GPSGGA bag receive times, not observed raw-driver arrival/chunking. Separate-
+process synthetic cases exercise recorded and headerless live input; focused
+cases cover fragmented/multiple sentences, quality/checksum rejection, midnight,
+duplicates, gaps, epoch retirement and bounded incomplete shutdown.
+Evidence: `.agents/notes/native_raw_gga_host_20261026_v2/audit.json`.
+
+ODOM messages are unchanged and cannot receive absolute feedback. Raw GNSS
+still establishes no height, full pose, target graph or trust. This removes a
+runtime adapter gap without accuracy tuning; it is not a raw-LIO rerun or live
+100 Hz/overload acceptance. The diagnostic reset/consumer boundary is now
+implemented below; live map-matcher scheduling remains a functional gap. E3-E6
+and the qualified native conditional-error model are not declared complete.
+
+### Explicit global reset/consumer ACK functional milestone (2026-10-26)
+
+The independent diagnostic host now optionally accepts an explicit alignment
+reset request for the current host session/generation. It retires only the
+single global owner's history/alignment/pending observations, increments a
+separate alignment generation, withdraws global poses and waits for every
+configured named consumer to acknowledge retirement. No consumer timeout
+implicitly re-enables output. ODOM continues unchanged and the reference,
+origin, calibration and content remain immutable. Local `ResetStopped` is
+not called or weakened: its independent stopped-wheel prerequisite is absent
+from the current raw IMU/LiDAR host.
+
+Prepared GNSS/map require the new session/generation token; delayed old or
+untagged observations are rejected. Raw GGA clears partial framing/dwell and
+cannot use measurement epochs at/before the final ACK's ODOM frontier.
+Idempotent last-request/ACK retries, conflicting or stale requests, unknown
+consumers, missing ACK and fresh reacquisition have explicit outcomes.
+Alignment identity and sticky reset request/reason are published even when
+global pose is unavailable; correction IDs are scoped to alignment generation.
+Consumer ACK is a retirement declaration, not authentication or a fabricated
+trusted/qualified result.
+
+Worker and separate-process synthetic regressions exercise withdrawal,
+two-consumer barrier, stale source rejection, continued ODOM and actual
+horizontal reacquisition. A maintained 24-event synthetic map reset replay
+commits once before and once after reset, with unchanged ODOM generation.
+Two unchanged frozen native ODOM/prepared-GNSS controls still account all
+6,029/6,030 events and commit 3/10 corrections. Evidence:
+`.agents/notes/native_global_reset_host_20261026_v1/audit.json`.
+This removes the bounded diagnostic reset/ACK runtime gap without precision
+tuning. Production consumers, CRS/origin migration, live map scheduling,
+target conditional-error graph and full E3-E6 acceptance remain unfinished.
+
+### Native raw-input end-to-end milestones (2026-10-23)
+
+The current implementation sequence and input-status classification are owned
+by the [canonical integration plan](../../../ad_agents/context/modules/localization/knowledge/openloc-global-integration-plan.md).
+The stages below must not be confused with the older external-ODOM baselines.
+
+| Milestone | Current status |
+| --- | --- |
+| E1 raw IMU/LiDAR to native ODOM, supplied map, one diagnostic owner and health | Latest history-boundary repair: second capture 83/135 map accepts, 78 map corrections; third capture without GNSS 155/162 accepts, 153 corrections; explicit offline hypotheses, not causal relocalization |
+| E2 raw GNSS in the same native map/global chain | Second capture 12 GNSS commits in the map+GNSS arm; default GNSS-only remains unanchored. Explicit no-map horizontal acquisition is now available as described above. Historical first-capture 100 ms holdback comparison commits four GNSS rather than two |
+| E3 causal global acquisition and reliable multi-capture startup | Three native starts, seed-free conditional regional acquisition and lease-expiry/reacquisition are demonstrated; whole-map unknown-pose search, qualified startup and production handover remain incomplete |
+| E4 qualified native motion into the selected fixed-lag graph | Diagnostic functional model, actual shared-map source, bounded Cyber transport and sole target-owner selection implemented; calibration, live budgets and new target-graph dataset acceptance remain unqualified |
+| E5 bounded high-rate scheduling and Apollo publication | Independent raw IMU/LiDAR ODOM/TF host with isolated startup/LIO tasks, single-global-owner prepared/raw map + GGA publisher, conditional regional recovery and diagnostic reset/consumer ACK implemented; production consumers, complete ingress-drop accounting and qualified live deadlines/overload remain incomplete |
+| E6 indoor/outdoor/transition and S5/S6 acceptance | Not complete; independent reference and approved product budgets remain separate from functional software evidence |
+
+Completion means the integrated design goals, not a replay exit code or an
+individual milestone. Calibration, hardware clock evidence and independent
+truth remain recorded qualification limits, not excuses to stop runtime or
+algorithm implementation. E3-E5 are software work items, not missing-input
+blockers. Prior short-window results below are pinned historical evidence,
+not automatic acceptance of later algorithm changes.
+
+### Active implementation gaps
+
+1. Fixed-prior iteration and internal-history correction-boundary fixes are
+   implemented. Preserve attitude-error chart transport and unqualified
+   uncertainty; re-run all three captures and map/GNSS isolation after any
+   further trajectory change.
+2. Resolve sustained local correction demand versus the continuous-output
+   tracking budget; do not increase the envelope merely to clear violations.
+3. Complete host-owned high-rate publication, reset and explicit overload
+   contracts beyond the implemented bounded diagnostic workers. Separate
+   recorded receive gaps from host emission delays. Optimized native-only
+   baseline scan medians are 6.667-8.634 ms, with maxima up to 13.186 ms;
+   unoptimized 0.4 s timings are not deployment estimates.
+4. Extend the implemented conditional regional acquisition to unknown-pose
+   search and qualified recovery/handover beyond diagnostic lease expiry and
+   reacquisition. The native conditional model and selected single-owner Cyber
+   diagnostic publication boundary are implemented above; extend their actual
+   dataset/live acceptance rather than substituting offline future-informed
+   seeds or CI for those targets.
+
+Conditional diagnostic recovery now restarts the bounded particle/tracker
+generation when the existing two-second full-pose lease expires. A proposal
+must pass current-scan full geometry before adoption, then distinct-frame
+verification by the same global owner. Pending holdback cannot replace this
+hypothesis with a retained old alignment. The initialized diagnostic follows
+the current owner during verification; health remains untrusted.
+The third-capture normal arm retains 148 map accepts / 146 commits. A declared
+2.5-second scan-arrival outage (25 dropped scans, unchanged IMU) triggers loss
+and reacquisition, with 119 accepts / 113 commits and 1.800061 s from expiry to
+commit on the measurement clock. Each arm matches its corresponding local-only
+5,999 ODOM rows except timing. These are conditional regional, injected-fault
+functional results, not unknown-pose, independent accuracy or wall-time
+qualification. Commands, source/binary/input pins and reports:
+`.agents/notes/native_tracking_recovery_validation_20261023_v1/`.
+An earlier broader regression aborted with `double free or corruption (out)`
+in the unchanged NDT `MapMatcherTest.PlanarGeometryCannotProduceTrustedSixDofPose`
+case. At that failure, the native binary built and worker tests passed, but
+chained Python checks had not executed. PCL's aligned-allocation warning is
+a diagnostic lead, not a proven root cause. Do not infer full regression
+acceptance from the successful ICP/raw recovery runs.
+Follow-up GDB investigation and repeated normal tests did not reproduce the
+abort: thirty in-process repetitions and ten separate Bazel test processes
+passed. Final native Python regressions pass. The original failure remains an
+unresolved release concern, not a claimed allocator fix.
+The replay wrapper now verifies the executable plus loader-resolved library
+hashes before/after execution and rejects libraries from other Bazel
+configurations/workspaces. Both direct-container and container-invoking
+third-capture wrapper arms preserve the existing 5,999-row local-only output.
+Evidence: `.agents/notes/native_runtime_identity_validation_20261023_v1/`.
+Historical reports without such execution pins are not retroactively promoted.
+
+Independent diagnostic publication now uses a default-off `--timer-output`
+with arrival pacing. Its 10 ms thread samples immutable latest ODOM, preserves
+source timestamps and distinguishes new/held/stale/epoch changes and skipped
+ticks; callbacks never hold the estimator handoff lock. Freshness starts at
+original sensor arrival, not delayed handoff. It is not a Cyber publisher/TF.
+The stabilized binary passes ten worker/timer C++ cases and 14/5/3 native
+Python contracts. Three raw 30-second timer-only arms record respectively
+1,913/1,240/1,529 new measurements and 138/111/99 held publications, with
+3/5/2 whole-period deadline misses. Every usable publication matches its own
+source snapshot exactly. Cross-run ODOM is exact for the first two captures;
+third-capture timer-only differs by at most `1.00533e-11 m` per position
+component, while a no-timer repeat is exact. The strict comparison remains
+failed; its unique cause is not proven and no tolerance was relaxed.
+Third-capture async causal-map/timer produces 3,000 ticks and exact local ODOM,
+but zero map commits: ten stale worker results, ten history-budget search
+rejections and exhausted attempts prevent acquisition. A clean timer cadence
+therefore does not establish the map E2E goal. Frozen reports and explicit
+failed acceptance flags:
+`.agents/notes/native_timer_output_validation_20261023_v1/final_audit.json`.
+The seven executions are complete; strict isolation, real-time acceptance and
+overall design acceptance are not.
+
+Follow-up online acquisition repair moves the existing truncated-mode
+rejection ahead of geometry refinement. The rejected sets previously spent
+eight matcher calls without any possibility of admission; no acceptance,
+search-domain or age budget was relaxed. Same-input third-capture paced
+map/timer now accepts 143/162 matches, commits 141 corrections and preserves
+5,999 local ODOM rows exactly except timing. Four truncated snapshots cause
+no geometry calls; the recorded arm has 3,001 ticks and zero whole-period
+misses. Evidence:
+`.agents/notes/native_timer_output_validation_20261023_v1/search_fast_rejection/audit.json`.
+The original zero-commit and strict-numerical-mismatch evidence remains.
+The declared 2.5-second scan-arrival outage now also passes a paced async
+regional recovery check: 110 map accepts / 106 global commits, one lease expiry,
+two tracking commits and 2.200062275 s measurement-clock expiry-to-recovery.
+Its 5,999 ODOM rows match its fault-input local-only arm except timing;
+3,003 ticks have no whole-period miss. The fault input remains labeled as
+modified, and this is not a wall-clock recovery guarantee. Evidence is in the
+same investigation's `search_fast_rejection_gap/audit.json`.
+Paced seeded three-source checks also complete for both GGA recordings:
+122 map + 4 GNSS and 78 map + 12 GNSS commits, with exact respective
+local-only ODOM isolation. They preserve historical explicit 0.5/0.2 m
+bootstrap configurations rather than pretending a common algorithm baseline.
+First-capture timer still misses two whole-period deadlines.
+See the same investigation's `three_source/audit.json`.
+These complete selected diagnostic acquisition/wiring checks, not E3/E5/E6.
+
+The missing public local-ODOM boundary is now implemented as `NativeOdometry`
+(`//:native_odometry`). A PIMPL delegates to the same private local owner;
+public local value types retain the original fields/defaults, with no competing
+model or private/PCL/GTSAM header in the facade. Opaque delayed LiDAR tasks
+retain owner identity, exact IMU replay frontier and commit guards.
+Public-only consumer tests plus local owner and motion-initializer tests pass.
+Native replay and its delayed worker now consume the facade; 14/5/3 Python
+contracts and bootstrap tests pass. Fresh three-capture local runs exactly
+preserve the old 6,000/6,000/5,999 ODOM rows except timing.
+Third-capture paced causal-map/timer still accepts 143/162 matches and commits
+141 corrections, with exact local-only isolation and 3,003 timer ticks.
+Evidence: the timer investigation's `public_facade/audit.json` and C++ XMLs.
+Subsequently the same relative startup algorithm was extracted from the test
+host into public `NativeMotionBootstrap` (`//:native_motion_bootstrap`).
+Its PIMPL consumes the same IMU/previous raw scans and submits to the same
+`NativeOdometry`; geometry, solver and acceptance budgets are unchanged.
+Public-only consumer/owner guards and existing bootstrap regressions pass;
+three corrected windows retain exact ODOM and scan/startup decisions except
+processing time. The paced third-capture arm establishes alignment with
+141/162 map accepts, 139 corrections and 3,002 timer ticks without whole-period
+misses, preserving exact local-only isolation and publication identity.
+This is a fresh asynchronous execution, not an exact global-count comparison.
+Evidence: the timer investigation's `public_startup/audit.json` and two XMLs.
+The public startup algorithm prerequisite is resolved, but a raw sensor
+application, source-frontier stability under decoder backlog, Apollo
+dependency/host and sufficient LIO graph errors are not declared complete.
+
+The next host-output submilestone is implemented in the independent
+`modules/openloc_localization/` consumer: public native ODOM to actual Cyber
+subscribers, diagnostic-only TF, preserved source timestamps, new/held/stale
+identity and epoch-specific frames. An explicit-epoch-offset IMU-only
+executable now runs the native owner; three boundary cases, one owner/Cyber
+case and two cross-process raw-input cases cover publication, TF, stale/epoch,
+clean shutdown and malformed-input failure.
+Raw LiDAR integration now uses strict source/calibration profiles, bounded
+decode/FIFO queues, public relative startup and LIO with explicit overload
+failure. A third cross-process case consumes synthetic raw clouds through the
+standalone executable and reaches geometry/LIO acceptance. Four worker and
+two strict-profile cases bring the consumer total to 13.
+Optimized recorded worker replays retain all 6,000/6,000/5,999 ODOM rows and
+900 total scan decisions exactly against the frozen native baseline. These
+replays use a real publication timer but bypass Cyber sensor readers and do
+not count subscriber delivery. The initial unoptimized overflow arm remains
+preserved rather than being hidden with a larger queue.
+Post-initialization geometry can now run on a public isolated LIO snapshot
+with bounded exact IMU catch-up, declared source receive-time deadlines and
+explicit shutdown discard. Three real prepared recordings also passed actual
+separate-process Cyber IMU/cloud readers and diagnostic subscriptions:
+17,999 admitted IMUs and 900 scans, unchanged source/reference scan frontiers,
+178/122/158 LIO correction commits, and 25/12/2 explicit late-task discards.
+Replay preserves original header clocks, labels output `recorded_input` and
+uses admission acknowledgement/idempotent retry; sender lateness is recorded,
+not hidden as live performance. Eighteen consumer cases cover the expanded
+boundary. Evidence and trajectory overlays are in the consumer notes
+`native_cyber_reader_20261023_v3/`.
+Startup geometry still runs on the owner worker; complete live ingress-drop accounting,
+independent startup tasks, the global application, reset acknowledgement,
+fresh 100 Hz ODOM and production publication remain open.
+See the consumer README and its ignored validation artifacts for exact scope.
+
+The optimized baseline and per-scan correction demand are preserved in
+`.agents/notes/native_optimized_validation_20261023_v1/`. A reproducible
+GTSAM `<cassert>` patch fixes the optimized dependency build; existing
+PCL alignment and ignored OpenMP warnings remain visible and are not
+runtime correctness or deadline evidence.
+
+Fixed-prior iterated LIO repair has now been revalidated on the same corrected
+raw windows without gate changes. Output-budget rows change from 1412/0/63
+to 1372/0/0; scan-frontier tracking gaps are 4.680/1.643/1.782 m.
+The first capture remains outside its envelope, and the second gap increases:
+this is not a blanket accuracy improvement claim. Native update counts and
+initialization coverage remain 203/134/161 and unchanged, respectively.
+Fresh second-capture both accepts 79/135 map matches and commits 74 map plus
+11 GNSS corrections; third-capture map accepts 159/162 and commits 157.
+Both absolute arms preserve their new local-only ODOM exactly except timing.
+Nine focused C++ and fifteen Python contract cases pass. Paired hashes,
+correction summaries and commands are in
+`.agents/notes/native_fixed_prior_validation_20261023_v1/comparison.json`.
+This repair does not complete the remaining E3-E6 implementation.
+
+The next source-verified defect was interpolation through same-time LiDAR
+corrections in internal deskew history. The corrected history retains the
+propagated endpoint for the preceding interval and the corrected state for
+the exact epoch/following interval. Published ODOM history is unchanged.
+Synthetic coverage includes translation, attitude, velocity and the following
+interval. The three raw windows retain startup/LIO coverage; tracking gaps
+are now 4.661/1.440/1.930 m and violations remain 1372/0/0.
+Second-capture both commits 78 map and 12 GNSS corrections; third-capture map
+commits 153. Same-binary absolute arms still preserve local ODOM exactly
+except timing. These changes are not a uniform accuracy improvement.
+
+Default-off `--imu-trace` exposes the existing propagation callback as a
+CSV and signed XYZ acceleration/velocity/bias HTML plots. The reports verify
+IMU propagation equations and account for all IMU/LiDAR position/velocity
+contributions; they do not declare measured acceleration to be sensor bias.
+First-capture post-startup IMU velocity impulse is
+[1.951, 0.669, -0.487] m/s and LIO contributes
+[-1.540, 0.255, 0.263] m/s, while net LIO position correction is
+[-7.612, 1.476, 1.003] m. Accounting residuals are below 1e-8,
+not independent trajectory error. Trace adds explicit diagnostic overhead.
+Evidence:
+`.agents/notes/native_imu_trace_validation_20261023_v2/comparison.json`.
+Next implement sufficient local estimation/output error dynamics and bounded
+host scheduling; do not clear the first-capture failure with a larger budget
+or qualification flags.
+
+The diagnostic host now implements `--arrival-paced` and optional
+`--async-global`: one bounded FIFO global worker owns map/GNSS processing,
+accepts copied states/scans and never mutates the native estimator.
+Capacity is 256 outstanding tasks/64 MiB declared payload; overflow and worker
+failure are explicit, not drops or producer waits. Worker failures retain
+cancelled queued-task evidence. EOF drains before closing output.
+`host_timing.csv` records actual flushed ODOM emissions against recorded
+receive-time targets; `global_scheduler.csv` accounts for every submitted
+event and queue latency. Slow-task, outstanding-task/byte-limit and failure
+handoff regressions pass.
+
+One historical receive-paced comparison on the second raw capture retains identical
+ODOM, global poses, decisions and source-time admission. Valid-row deadline
+misses are 2025 synchronous versus 215 async-global; the async run still has
+164 output gaps above 10 ms, and queued-task peak is 224/256.
+Third-capture map-only worker peak is 47/256; first-capture local-only and both
+asynchronous global runs fail the wall-clock 10 ms check. These shared-host
+observations are not deterministic production deadlines or accuracy.
+At that revision, local LIO/bootstrap and point-file I/O were synchronous.
+Evidence: `.agents/notes/native_async_global_validation_20261023_v1/`.
+
+The current default-off `--async-local-lio-ms 50 --arrival-paced` computes
+one estimator snapshot off-thread, catches it up with at most 128 received
+IMU samples, and commits on the owning thread at the declared source frontier.
+Owner, epoch, source counts, exact IMU frontier, age and integrity guards
+reject inconsistent results. Published history and the output smoother are
+not replaced. Busy, missed-deadline, rejected and EOF-uncommitted tasks remain
+explicit in `local_lidar_tasks.csv`; EOF never invents a future IMU.
+Wheel-aided instances are not supported by this task path.
+
+Default-off `--prefetch-lidar` additionally decodes at most one future point
+file without advancing estimator admission before recorded arrival. Its
+`lidar_decode.csv` accounts for consumption, readiness deferral and unused
+decoding; bounded size, malformed input and worker failures fail explicitly.
+All five paced raw arms consumed 300 scans without readiness deferral.
+Snapshot copying, catch-up and bootstrap still run on the producer.
+
+The frozen prefetch revision preserves synchronous-default ODOM against the
+previous baseline. Three paced local arms commit 203/134/160 corrections;
+the third has one explicit tail task without a future commit frontier.
+Tracking gaps are 4.738/1.497/1.939 m: the first still fails.
+Second-capture both commits 84 map plus 12 GNSS updates and third-capture map
+commits 156. Both preserve paired local ODOM exactly except timing and have
+identical local commit schedules. All health remains untrusted.
+
+| Paced arm | Deadline misses | Wall gaps >10 ms | Those gaps with receive gap >10 ms |
+| --- | ---: | ---: | ---: |
+| First local | 4 | 59 | 51 |
+| Second local | 7 | 36 | 32 |
+| Second both | 7 | 33 | 33 |
+| Third local | 5 | 168 | 163 |
+| Third map | 12 | 168 | 161 |
+
+The same captures contain 52/33/165 valid receive intervals above 10 ms.
+These counts separate observed source-arrival gaps from host timing; they
+do not establish hardware clock discipline or uniquely attribute causality.
+An event-driven CSV emission path cannot establish timer-driven 100 Hz Apollo
+publication. No deadline, physical gate or trust criterion was relaxed.
+Fifty-two local C++ cases, five worker/decoder C++ cases and 18 Python cases
+pass. Frozen commands, binary/source/input/output pins, HTML and native XML:
+`.agents/notes/native_async_local_validation_20261023_v2/`.
+Its original reports remain immutable; `audit.json` adds receive-gap analysis
+with a separately pinned reporter revision.
+Next: causal global acquisition, sufficient native error dynamics, and the
+single-publisher/TF/reset boundary; these are still implementation work.
+
+### Conditional causal map acquisition (2026-10-23)
+
+`recovery.csv` replaces, and cannot coexist with, `seed.csv`/`seed_time.csv`.
+The host reuses the existing likelihood field, particle search and persistent
+fixed-anchor hypothesis tracker. Each bounded mode is refined with the existing
+point-to-plane matcher and unchanged geometry gates. Only one nontruncated,
+full-rank, unambiguous refined basin, confirmed over distinct frames and a
+minimum span, proposes a diagnostic alignment. No proposal modifies ODOM.
+Search region, score-coverage region, yaw interval and fixed tilt are explicit
+conditional priors, not inferred free space, calibrated gravity or heading.
+No trusted capability follows from a proposal or search weight.
+
+The third capture has a seed-free regional raw run with 148 map accepts and
+146 diagnostic global commits. All ODOM rows match local-only except timing.
+This uses manual regional bounds, full yaw search and an unqualified identity
+tilt prior; it is not arbitrary-location or attitude recovery. The wider
+map-cloud-bounds experiment finds no verified proposal and remains unanchored,
+with zero global commits. That is retained failure evidence, not successful
+localization or proof the correct basin is absent.
+
+A first paced attempt overflowed the unchanged 256-task global FIFO:
+candidate-refinement tasks took 145-462 ms. The repaired `--async-global`
+path isolates recovery in one immutable snapshot worker, serializing matcher
+access until the result is joined. Global ODOM/GNSS processing continues while
+search is busy. Result application retains the source ODOM pose and checks
+epoch, monotonic reference and 500 ms age before transporting its hypothesis
+to the current scan's independent matcher validation. Busy, stale, no-proposal
+and EOF-unconsumed outcomes are explicit; no queue bound was enlarged.
+
+The repaired paced raw arm finishes with 13 search queries, 33 busy skips,
+one stale result reject, one consumed proposal and 85 map commits. Global
+FIFO peak is 52/256; 12 valid-row deadlines and 141 wall gaps exceed 10 ms
+(137 also span receive gaps). Decoder readiness deferred 48 times, changing
+bootstrap/local commit timing against the historical local-only arm:
+**that paced ODOM isolation comparison is not established**. Synchronous
+source isolation and synthetic asynchronous isolation remain separate
+controlled evidence. No 100 Hz, production graph or Apollo acceptance follows.
+
+Native map/local/worker suites contain 30/52/5 passing C++ cases; Python
+contracts contain 11 local, five map and three GNSS cases. Commands, immutable
+reports/HTML, source/binary/CSV pins and test logs/XML:
+`.agents/notes/native_causal_map_validation_20261023_v2/`.
+The failed pre-isolation paced attempt remains under the corresponding `v1/`.
+The diagnostic host still lacks automatic lost-tracking recovery, map handover,
+source-frontier-stable feeding under decoder backlog and Apollo publication.
+
+With no-return sentinels removed before sampling, the first corrected
+`20261012103814` replay produced 188 native LIO updates and retained all
+29 GNSS arrivals (23 float rejects, two fixed-dwell waits, four accepted but
+unanchored positions). It did not establish a global correction: 189 map
+attempts were rejected (169 iteration-limit, 18 overlap, two planar-support).
+The old offline map hypothesis was reused at a newly earlier scan frontier,
+with approximately 7.8 seconds of epoch mismatch. This is a replay seed
+integration issue, not evidence that GNSS or the supplied map is invalid.
+Explicit map-side hypothesis re-association and a fresh output directory are
+required; no matcher gate relaxation is authorized.
+The subsequent epoch-matched `both_v2` run passed the bounded three-source
+integration: 188 LIO updates, 117/189 map matches, 115 map and two GNSS
+correction commits. All 29 GNSS arrivals remain in the journal; two of the four
+gate-accepted positions were ultimately rejected by the owner's committed-time
+frontier. This is a delayed-admission limitation, not a receiver-quality failure.
+Matched-seed map-only produced 121/189 matches and 119 corrections. All 6,000
+native ODOM rows match local-only, map-only and both arms except measured
+latency. A 1 ms seed-reference guard rejects the old stale hypothesis; no
+geometry gate changed. Fourteen focused regressions passed. Source/hash/
+comparison evidence:
+`.agents/notes/native_gnss_e2e_20261023_v1/20261012103814/comparison_report.json`.
+This remains offline-seeded diagnostic CI, not qualified fixed-lag fusion.
+
+An explicit default-off `--global-holdback-ns` now provides bounded causal
+global-observation reordering in the replay host (0-500 ms, 256 observations).
+With 100 ms, the first capture retains 117/189 map matches and 115 map commits,
+and all four gate-accepted GNSS positions commit. Original source timestamps
+and local ODOM are unchanged. `global_admission.csv` audits enqueue/submit
+times and statuses; the measured maximum queue residence is 104.617 ms,
+including discrete IMU wakeups, not a proven wall-clock bound. Beyond-window
+arrivals remain rejectable and future-on-arrival observations keep immediate
+owner validation. Explicit end-of-input processing-clock advancement drains
+only already received observations. This is not historical graph refusion.
+Evidence: the same first-capture directory's `both_holdback_v1/report/`.
+
+Input adapters already convert IMU acceleration from g, ignore invalid raw
+orientation and retain per-point Livox timestamps. Missing trusted single-antenna
+heading, unverified calibration/noise and unqualified map vertical reference
+must not be labeled as proven sensor failures. Graph motion not exported and
+no OpenLoc Apollo host are implementation gaps, not proof that
+the supplied bags/maps are unusable.
+
+The independent health supervisor is now invoked by native replay. It retains
+relative-state validity separately and grants no trusted capabilities to
+uncalibrated diagnostic output. The global/health type collision was fixed
+with the distinct protobuf `HealthPose`, not by hiding conflicting definitions
+behind a translation-unit boundary. Native local LIO directly revokes covariance
+model qualification after correlated corrections.
+
+E1 evidence and trajectory HTML:
+`.agents/notes/native_map_e2e_20261023_v1/20261012103814_v2/report/`.
+Existing mapper gates are unchanged; the explicit local-map support window is
+15 m with 2 m cells. Deterministic native ODOM is unchanged when map fusion is
+enabled. This does not grant qualified graph or production publication status.
+Subsequent source audit identified an adapter defect: exact-zero XYZ no-return
+sentinels were retained and consumed as geometry. The recorded counts above
+remain historical execution evidence, not corrected-input acceptance. The raw
+preparer must filter declared sentinels before sampling, retain rejection counts
+and original timestamps, and regenerate inputs for validation. This does not
+prove the cause of the third capture's startup failure.
+Corrected-input replay of `20261015185840` still failed to initialize:
+865,221 raw no-return points removed, 5,999 IMU samples / 300 scans retained,
+zero valid states or LIO updates. All 89 physical-budget rejection windows
+exceeded the unchanged gravity-error threshold. Raw point/IMU timestamps and
+hashes were independently checked. Evidence:
+`.agents/notes/native_corrected_startup_20261023/20261015185840/`.
+This narrows the remaining startup problem but does not identify a faulty
+sensor, and different historical/current binaries preclude paired attribution.
+
+Motion initialization now exposes finite-solution and linear-system-evaluation
+flags plus minimum scaled singular value and physical/fit residuals for rejected
+windows. Replay retains `motion_initialization.csv` and a gravity/bias HTML plot.
+Analytic variable-translation/attitude regression passes; coherent accelerative
+pose drift preserves rank and fit residual but correctly fails the unchanged
+gravity gate. This isolates a concrete failure mechanism, not the recorded
+capture's unique cause. A diagnostic-only rerun preserves all 5,999 ODOM rows
+and 300 scan decisions except measured timing: 91 evaluated linear systems,
+89 finite rejected solutions, gravity errors 0.431419-8.549471 m/s^2.
+Evidence: the same capture directory's `numeric_report_v1/index.html`.
+
+### Corrected multi-capture resolution baseline and replay capability fix
+
+The previous third-capture failure is specific to the default 0.5 m relative
+registration resolution. A bounded `--motion-bootstrap-voxel-m` alternative
+keeps all geometry, rank, residual, gravity and bias gates unchanged.
+With a common 0.2 m resolution and the same binary, corrected first-30-second
+captures produce:
+
+| Capture | Initialization delay | Valid ODOM | LIO updates | Output-envelope exceedances |
+| --- | ---: | ---: | ---: | ---: |
+| `20261012103814` | 9.441 s | 4,112 | 203 | 1,412 |
+| `20261012105149` | 16.335 s | 2,733 | 134 | 0 |
+| `20261015185840` | 13.681 s | 3,263 | 161 | 63 |
+
+The replay previously aborted on `CORRECTION_BUDGET_EXCEEDED`, conflating
+capability degradation with an integrity failure. It now preserves those
+untrusted rows and their reason; IMU gaps and invalid states still fail.
+No correction budget was increased. A completed diagnostic is not acceptance
+of the output envelope, calibrated accuracy or high-rate runtime.
+Evidence: `.agents/notes/native_corrected_startup_20261023/common_voxel_02_comparison_v1.json`.
+Paired capability journals isolate all 1,412/63 first/third-capture violations
+to the internal-to-published translation gap (max 4.976/2.128 m versus 2 m).
+No rotation or velocity discrepancy limit was exceeded. Applied correction
+acceleration remains capped; it is not an uncapped requested acceleration.
+`capability.csv` and JSON/HTML retain detailed first/last decisions and limits.
+This instrumentation preserves ODOM and establishes neither truth error nor
+the cause of the underlying LIO corrections; smoothing limits are unchanged.
+Evidence: `.agents/notes/native_corrected_startup_20261023/correction_envelope_diagnostics_v2.json`.
+The third no-GNSS map arm accepts 155/162 matches and commits 153 corrections;
+all 5,999 ODOM rows match local-only except timing. The seed is explicitly
+offline same-capture, epoch-matched and future-informed.
+Its report is under the third capture's `map_voxel_02_v1/report/`.
+
+Current-code design-goal validation now re-executes six bounded arms with one
+pinned binary: three local-only, second-capture both/GNSS-only, third-capture
+map-only. The local/absolute ODOM comparisons remain exact except timing;
+GNSS-only does not fabricate a full-pose anchor. Six bounded functional and
+honest-degradation checks pass, while output envelope and synchronous 100 Hz
+feasibility fail. Causal global acquisition, native target graph, actual Apollo
+publisher deadlines and independent accuracy/transition acceptance remain
+uncovered, not passed. Commands and hashes are preserved under
+`.agents/notes/native_design_goal_validation_20261023_v1/design_goal_report.json`
+and `index.html`; E3-E6 remain incomplete.
+
+Default-off translation deskew and LiDAR-confirmed-rest hypotheses have
+focused regressions but do not independently solve the third capture at
+0.5 m. The former uses only the last accepted relative-scan velocity; the
+latter requires existing rest/IMU checks and explicitly assumes zero velocity
+and accelerometer bias without qualifying uncertainty. Neither is promoted
+to production or used to claim the 0.2 m result. Source/model uncertainty and
+the specific recorded registration error remain unqualified.
+The second-capture native three-source arm also completes: 74/135 map matches,
+71 map + 12 GNSS commits, and all 6,000 ODOM rows unchanged except timing.
+All 29 GNSS arrivals are retained: two dwell waits, 14 gate-accepted
+native-not-ready exclusions, one unanchored position and 12 updates.
+Pre-initialization events are no longer mislabeled invalid observations
+through an invented generation-zero epoch. Evidence: the second capture's
+`both_voxel_02_v2/report/`.
+
 ### Remaining-plan implementation pass
 
 The graph owner now commits bootstrap mean/covariance and revision only after

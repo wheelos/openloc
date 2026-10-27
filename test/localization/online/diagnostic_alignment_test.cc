@@ -112,6 +112,189 @@ TEST(DiagnosticAlignmentTest, PositionEvidenceDoesNotInventAnAlignment) {
   EXPECT_EQ(0u, result.decisions.back().correction_id);
 }
 
+GlobalHorizontalObservation HorizontalFix(int index, const OdometrySample& odom) {
+  GlobalHorizontalObservation fix;
+  fix.context = Context(index, "gnss");
+  fix.context.epoch = odom.epoch;
+  fix.point_in_base = Eigen::Vector3d(1.0, -0.5, 0.3);
+  const Eigen::Vector2d antenna =
+      (odom.pose.translation + odom.pose.rotation * fix.point_in_base).head<2>();
+  fix.position =
+      Eigen::Rotation2Dd(0.35) * antenna + Eigen::Vector2d(100.0, 20.0);
+  fix.covariance = Eigen::Matrix2d::Identity() * 0.01;
+  fix.covariance_source = "uncalibrated-synthetic-xy";
+  return fix;
+}
+
+TEST(DiagnosticAlignmentTest, HorizontalAcquisitionRequiresExplicitLevelAssumption) {
+  auto config = Config();
+  config.enable_horizontal_bootstrap = true;
+  DiagnosticGlobalAlignment owner;
+  EXPECT_EQ(StatusCode::kInvalidArgument, owner.Configure(config).code());
+  config.assume_gravity_aligned_odom = true;
+  ASSERT_TRUE(owner.Configure(config).ok());
+}
+
+TEST(DiagnosticAlignmentTest, HorizontalAcquisitionTracksWithoutInventingFullPose) {
+  auto config = Config();
+  config.enable_horizontal_bootstrap = true;
+  config.assume_gravity_aligned_odom = true;
+  DiagnosticGlobalAlignment owner;
+  ASSERT_TRUE(owner.Configure(config).ok());
+  DiagnosticAlignmentResult result;
+  for (int i = 0; i <= 11; ++i) {
+    auto odom = Odom(i);
+    odom.pose.translation.y() = 0.03 * i * i;
+    odom.pose.translation.z() = 17.0 + i * 0.2;
+    odom.pose.rotation = Eigen::Quaterniond(
+        Eigen::AngleAxisd(0.02 * i, Eigen::Vector3d::UnitY()));
+    const auto original = odom.pose;
+    ASSERT_TRUE(owner.AddOdometry(odom, Matrix6d::Identity() * 0.01).ok());
+    const auto fix = HorizontalFix(i, odom);
+    const auto status = owner.SubmitHorizontalObservation(fix);
+    ASSERT_TRUE(status.ok()) << status.message();
+    ASSERT_TRUE(owner.GetResult(&result).ok());
+    EXPECT_FALSE(result.estimate.has_value());
+    EXPECT_FALSE(result.last_full_pose_time.has_value());
+    EXPECT_FALSE(result.full_pose_evidence_fresh);
+    EXPECT_TRUE(odom.pose.translation.isApprox(original.translation, 0.0));
+    EXPECT_EQ(i >= 10, result.horizontal_estimate.has_value());
+    EXPECT_EQ(i >= 10, result.decisions.back().alignment_updated);
+    if (i < 10) continue;
+    const auto& horizontal = *result.horizontal_estimate;
+    EXPECT_NEAR(100.0, horizontal.map_from_odom_xy_yaw.x(), 1e-8);
+    EXPECT_NEAR(20.0, horizontal.map_from_odom_xy_yaw.y(), 1e-8);
+    EXPECT_NEAR(0.35, horizontal.map_from_odom_xy_yaw.z(), 1e-8);
+    EXPECT_TRUE(horizontal.map_base_xy.isApprox(
+        Eigen::Rotation2Dd(0.35) * odom.pose.translation.head<2>() +
+            Eigen::Vector2d(100.0, 20.0),
+        1e-8));
+    EXPECT_TRUE(result.horizontal_evidence_fresh);
+    EXPECT_EQ(static_cast<uint64_t>(i - 9), horizontal.correction_id);
+    EXPECT_EQ(odom.timestamp.nanoseconds,
+              horizontal.last_observation_time.nanoseconds);
+  }
+  EXPECT_EQ("diagnostic_horizontal_updated",
+            result.decisions.back().status.message());
+  auto now = Odom(11).timestamp;
+  now.nanoseconds += config.maximum_full_pose_age_ns + 1;
+  ASSERT_TRUE(owner.GetResult(now, &result).ok());
+  EXPECT_TRUE(result.horizontal_estimate.has_value());
+  EXPECT_FALSE(result.horizontal_evidence_fresh);
+  EXPECT_FALSE(result.odometry_fresh);
+  EXPECT_FALSE(result.estimate.has_value());
+
+  ASSERT_TRUE(owner.AddOdometry(Odom(12), Matrix6d::Identity() * 0.01).ok());
+  auto outlier = HorizontalFix(12, Odom(12));
+  outlier.position.array() += 1000.0;
+  EXPECT_EQ(StatusCode::kRejectedMeasurement,
+            owner.SubmitHorizontalObservation(outlier).code());
+  ASSERT_TRUE(owner.GetResult(&result).ok());
+  EXPECT_EQ(2u, result.horizontal_estimate->correction_id);
+  EXPECT_FALSE(result.decisions.back().alignment_updated);
+
+  for (int i = 13; i <= 15; ++i) {
+    ASSERT_TRUE(owner.AddOdometry(Odom(i), Matrix6d::Identity() * 0.01).ok());
+    const auto status = owner.SubmitMapObservation(Map(i));
+    EXPECT_EQ(i == 15, status.ok());
+  }
+  ASSERT_TRUE(owner.GetResult(&result).ok());
+  ASSERT_TRUE(result.estimate.has_value());
+  EXPECT_FALSE(result.horizontal_estimate.has_value());
+  EXPECT_TRUE(result.full_pose_evidence_fresh);
+  EXPECT_EQ(3u, result.estimate->correction_id);
+}
+
+TEST(DiagnosticAlignmentTest, HorizontalStationarityAndFailedHoldoutCannotAcquire) {
+  auto config = Config();
+  config.enable_horizontal_bootstrap = true;
+  config.assume_gravity_aligned_odom = true;
+  DiagnosticGlobalAlignment stationary;
+  ASSERT_TRUE(stationary.Configure(config).ok());
+  DiagnosticAlignmentResult result;
+  for (int i = 0; i < 12; ++i) {
+    auto odom = Odom(i);
+    odom.pose.translation.setZero();
+    ASSERT_TRUE(stationary.AddOdometry(odom, Matrix6d::Identity()).ok());
+    ASSERT_TRUE(stationary.SubmitHorizontalObservation(HorizontalFix(i, odom)).ok());
+  }
+  ASSERT_TRUE(stationary.GetResult(&result).ok());
+  EXPECT_FALSE(result.horizontal_estimate.has_value());
+  EXPECT_EQ("recovery_yaw_unobservable", result.decisions.back().status.message());
+
+  DiagnosticGlobalAlignment owner;
+  ASSERT_TRUE(owner.Configure(config).ok());
+  for (int i = 0; i <= 10; ++i) {
+    ASSERT_TRUE(owner.AddOdometry(Odom(i), Matrix6d::Identity()).ok());
+    auto fix = HorizontalFix(i, Odom(i));
+    if (i == 8) fix.position.x() += 100.0;
+    ASSERT_TRUE(owner.SubmitHorizontalObservation(fix).ok());
+    if (i == 8) {
+      ASSERT_TRUE(owner.GetResult(&result).ok());
+      EXPECT_EQ("recovery_holdout_inconsistent",
+                result.decisions.back().status.message());
+      EXPECT_EQ(StatusCode::kDuplicateTimestamp,
+                owner.SubmitHorizontalObservation(fix).code());
+    }
+  }
+  ASSERT_TRUE(owner.GetResult(&result).ok());
+  EXPECT_FALSE(result.horizontal_estimate.has_value());
+  EXPECT_FALSE(result.estimate.has_value());
+}
+
+TEST(DiagnosticAlignmentTest, HorizontalEpochChangeRetiresAcquisitionAndEstimate) {
+  auto config = Config();
+  config.enable_horizontal_bootstrap = true;
+  config.assume_gravity_aligned_odom = true;
+  DiagnosticGlobalAlignment owner;
+  ASSERT_TRUE(owner.Configure(config).ok());
+  for (int i = 0; i <= 22; ++i) {
+    const auto odom = Odom(i, i < 10 ? 1 : 2);
+    ASSERT_TRUE(owner.AddOdometry(odom, Matrix6d::Identity()).ok());
+    ASSERT_TRUE(owner.SubmitHorizontalObservation(HorizontalFix(i, odom)).ok());
+    DiagnosticAlignmentResult result;
+    ASSERT_TRUE(owner.GetResult(&result).ok());
+    EXPECT_EQ(i >= 20, result.horizontal_estimate.has_value());
+    EXPECT_FALSE(result.estimate.has_value());
+  }
+  ASSERT_TRUE(owner.AddOdometry(Odom(23, 3), Matrix6d::Identity()).ok());
+  DiagnosticAlignmentResult result;
+  ASSERT_TRUE(owner.GetResult(&result).ok());
+  EXPECT_FALSE(result.horizontal_estimate.has_value());
+  EXPECT_FALSE(result.horizontal_evidence_fresh);
+  auto retired = HorizontalFix(23, Odom(23, 2));
+  EXPECT_EQ(StatusCode::kEpochMismatch,
+            owner.SubmitHorizontalObservation(retired).code());
+}
+
+TEST(DiagnosticAlignmentTest, HorizontalLossRequiresNewTrainingAndLaterHoldouts) {
+  auto config = Config();
+  config.enable_horizontal_bootstrap = true;
+  config.assume_gravity_aligned_odom = true;
+  DiagnosticGlobalAlignment owner;
+  ASSERT_TRUE(owner.Configure(config).ok());
+  for (int i = 0; i <= 10; ++i) {
+    ASSERT_TRUE(owner.AddOdometry(Odom(i), Matrix6d::Identity()).ok());
+    ASSERT_TRUE(owner.SubmitHorizontalObservation(HorizontalFix(i, Odom(i))).ok());
+  }
+  for (int i = 311; i <= 321; ++i) {
+    ASSERT_TRUE(owner.AddOdometry(Odom(i), Matrix6d::Identity()).ok());
+    auto fix = HorizontalFix(i, Odom(i));
+    fix.position += Eigen::Vector2d(40.0, -30.0);
+    ASSERT_TRUE(owner.SubmitHorizontalObservation(fix).ok());
+    DiagnosticAlignmentResult result;
+    ASSERT_TRUE(owner.GetResult(&result).ok());
+    EXPECT_EQ(i == 321, result.horizontal_estimate.has_value());
+    EXPECT_FALSE(result.estimate.has_value());
+    if (i == 321) {
+      EXPECT_NEAR(140.0, result.horizontal_estimate->map_from_odom_xy_yaw.x(), 1e-8);
+      EXPECT_NEAR(-10.0, result.horizontal_estimate->map_from_odom_xy_yaw.y(), 1e-8);
+      EXPECT_EQ(2u, result.horizontal_estimate->correction_id);
+      EXPECT_TRUE(result.horizontal_evidence_fresh);
+    }
+  }
+}
+
 TEST(DiagnosticAlignmentTest, QueuedProjectedMapAndGnssShareOneOwner) {
   DiagnosticGlobalAlignment owner;
   ASSERT_TRUE(owner.Configure(Config()).ok());

@@ -61,7 +61,7 @@ Status GnssQualityGate::Configure(const GnssQualityGatePolicy& policy) {
 
 GnssQualityDecision GnssQualityGate::CheckInput(
     const Timestamp& timestamp, const GnssReceiverQuality& receiver,
-    const FixedSolutionTrack& track) const {
+    const FixedSolutionTrack& track, bool allow_missing_accuracy) const {
   if (!configured_) {
     return Invalid("GNSS quality gate is not configured",
                    StatusCode::kStateUnavailable);
@@ -72,8 +72,10 @@ GnssQualityDecision GnssQualityGate::CheckInput(
       !std::isfinite(receiver.hdop) || receiver.hdop <= 0.0 ||
       !std::isfinite(receiver.differential_age_seconds) ||
       receiver.differential_age_seconds < 0.0 ||
-      !std::isfinite(receiver.horizontal_accuracy_m) ||
-      receiver.horizontal_accuracy_m <= 0.0) {
+      (!(allow_missing_accuracy &&
+         std::isnan(receiver.horizontal_accuracy_m)) &&
+       (!std::isfinite(receiver.horizontal_accuracy_m) ||
+        receiver.horizontal_accuracy_m <= 0.0))) {
     return Invalid("GNSS timestamp or receiver quality is invalid");
   }
   if (track.active) {
@@ -93,7 +95,9 @@ GnssQualityDecision GnssQualityGate::CheckInput(
 
 GnssQualityDecision GnssQualityGate::CheckPosition(
     const Timestamp& timestamp, const GnssReceiverQuality& receiver) {
-  auto decision = CheckInput(timestamp, receiver, position_track_);
+  auto decision =
+      CheckInput(timestamp, receiver, position_track_,
+                 policy_.allow_missing_horizontal_accuracy_diagnostic);
   if (!decision.status.ok()) {
     return decision;
   }

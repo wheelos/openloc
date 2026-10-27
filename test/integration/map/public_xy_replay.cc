@@ -150,6 +150,7 @@ int Replay(char** argv) {
   config.map_reference = {"prepared-xy", "v1", "declared-diagnostic-lever"};
   config.map_reference.geodetic.state =
       loc::GeodeticReferenceState::kDiagnosticOnly;
+  config.enable_single_antenna_bootstrap = true;
   config.enable_gnss_reacquisition = mode != "baseline";
   if (mode == "tracking") {
     config.large_correction_policy =

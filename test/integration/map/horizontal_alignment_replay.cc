@@ -179,8 +179,8 @@ int Replay(const char* input, const char* output, const std::string& mode,
           observation.global_antenna_xy = Eigen::Vector2d(values[6], values[7]);
           observation.covariance_xy =
               Eigen::Matrix2d::Identity() * values[8] * values[8];
-          status = recovery.AddRejectedObservation(
-              observation, &recovery_diagnostics, &recovery_candidate);
+          status = recovery.AddObservation(observation, &recovery_diagnostics,
+                                           &recovery_candidate);
           if (!status.ok()) {
             std::cerr << status.message() << '\n';
             return 2;

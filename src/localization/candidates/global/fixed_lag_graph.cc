@@ -10,11 +10,13 @@
 #include <chrono>
 #include <cmath>
 #include <functional>
+#include <limits>
 #include <map>
 #include <set>
 #include <utility>
 
 #include "Eigen/Cholesky"
+#include "Eigen/Eigenvalues"
 #include "Eigen/LU"
 #include "gtsam/base/numericalDerivative.h"
 #include "gtsam/geometry/Pose3.h"
@@ -44,6 +46,102 @@ gtsam::ISAM2Params Parameters() {
   return params;
 }
 
+class AlignmentSmoother final : public gtsam::IncrementalFixedLagSmoother {
+ public:
+  explicit AlignmentSmoother(double lag)
+      : gtsam::IncrementalFixedLagSmoother(lag, Parameters()) {}
+
+  void UpdateConditionalFactors(
+      const gtsam::NonlinearFactorGraph& factors,
+      const gtsam::Values& values = {},
+      const gtsam::FixedLagSmoother::KeyTimestampMap& timestamps = {}) {
+    updateKeyTimestampMap(timestamps);
+    gtsam::FastMap<gtsam::Key, int> groups;
+    gtsam::FastList<gtsam::Key> keys;
+    for (const auto& value : getLinearizationPoint()) {
+      keys.push_back(value.key);
+      groups[value.key] = gtsam::Symbol(value.key).chr() == 'x' ? 0 : 1;
+    }
+    for (const auto& value : values)
+      groups[value.key] = gtsam::Symbol(value.key).chr() == 'x' ? 0 : 1;
+    // A cross-time exact source joins old pose and new error cliques. Eliminate
+    // all retained poses before the unit-error priors, from the SAME factors;
+    // do not re-eliminate a separator assembled from constrained conditionals.
+    isamResult_ = isam_.update(factors, values, {}, groups, {}, keys, true);
+  }
+};
+
+Result PosteriorCovariance(
+    const gtsam::IncrementalFixedLagSmoother& smoother,
+    const std::vector<std::pair<gtsam::Key, Eigen::Index>>& query,
+    Eigen::MatrixXd* covariance) {
+  Eigen::Index dimension = 0;
+  for (const auto& entry : query) dimension += entry.second;
+  std::map<gtsam::Key, Eigen::MatrixXd> adjoints;
+  Eigen::Index offset = 0;
+  for (const auto& entry : query) {
+    if (!smoother.getLinearizationPoint().exists(entry.first) ||
+        entry.second <= 0 || adjoints.count(entry.first))
+      return {Reason::INVALID_INPUT, "Invalid posterior covariance query"};
+    auto& loading = adjoints[entry.first];
+    loading = Eigen::MatrixXd::Zero(entry.second, dimension);
+    loading.middleCols(offset, entry.second).setIdentity();
+    offset += entry.second;
+  }
+  Eigen::MatrixXd result = Eigen::MatrixXd::Zero(dimension, dimension);
+  // R x = D epsilon also holds for exact constraints (zero entries of D).
+  // Solve R^T y = selection^T leaf-to-root, then accumulate y^T D^2 y.
+  // Re-eliminating constrained cliques can lose rank in GTSAM's scalar QR.
+  const auto visit = [&](auto&& self, const auto& clique) -> Result {
+    for (const auto& child : clique->children) {
+      const auto valid = self(self, child);
+      if (!valid.ok()) return valid;
+    }
+    const auto& conditional = *clique->conditional();
+    const Eigen::MatrixXd r = conditional.R();
+    Eigen::MatrixXd rhs = Eigen::MatrixXd::Zero(r.rows(), dimension);
+    Eigen::Index row = 0;
+    for (auto it = conditional.beginFrontals();
+         it != conditional.endFrontals(); ++it) {
+      const auto found = adjoints.find(*it);
+      const Eigen::Index size = conditional.getDim(it);
+      if (found != adjoints.end()) {
+        if (found->second.rows() != size)
+          return {Reason::INVALID_INPUT, "Posterior query dimension mismatch"};
+        rhs.middleRows(row, size) = found->second;
+        adjoints.erase(found);
+      }
+      row += size;
+    }
+    if (!r.allFinite() || (r.diagonal().array() == 0).any())
+      return {Reason::DEGENERATE, "Singular posterior triangular factor"};
+    const Eigen::MatrixXd solved =
+        r.transpose().triangularView<Eigen::Lower>().solve(rhs);
+    if (!solved.allFinite())
+      return {Reason::DEGENERATE, "Posterior covariance triangular solve failed"};
+    const auto& noise = conditional.get_model();
+    const Eigen::MatrixXd weighted =
+        noise ? (noise->sigmas().asDiagonal() * solved).eval() : solved;
+    result.noalias() += weighted.transpose() * weighted;
+    for (auto it = conditional.beginParents();
+         it != conditional.endParents(); ++it) {
+      auto& parent = adjoints[*it];
+      if (parent.size() == 0)
+        parent = Eigen::MatrixXd::Zero(conditional.getDim(it), dimension);
+      parent.noalias() -= conditional.S(it).transpose() * solved;
+    }
+    return {};
+  };
+  for (const auto& root : smoother.getISAM2().roots()) {
+    const auto valid = visit(visit, root);
+    if (!valid.ok()) return valid;
+  }
+  if (!adjoints.empty() || !result.allFinite())
+    return {Reason::DEGENERATE, "Incomplete or nonfinite posterior covariance"};
+  *covariance = (0.5 * (result + result.transpose())).eval();
+  return {};
+}
+
 gtsam::Pose3 ToPose(const Eigen::Isometry3d& pose) {
   return gtsam::Pose3(pose.matrix());
 }
@@ -58,10 +156,14 @@ class ErrorChainFactor final
     : public gtsam::NoiseModelFactor2<gtsam::Vector, gtsam::Vector> {
  public:
   ErrorChainFactor(gtsam::Key first, gtsam::Key second,
-                   const Matrix15d& transition, const Matrix15d& noise)
+                   const Eigen::MatrixXd& transition,
+                   const Eigen::MatrixXd& projection,
+                   const gtsam::SharedNoiseModel& noise,
+                   const Eigen::VectorXd& sigmas)
       : gtsam::NoiseModelFactor2<gtsam::Vector, gtsam::Vector>(
-            gtsam::noiseModel::Gaussian::Covariance(noise), first, second),
-        transition_(transition) {}
+            noise, first, second),
+        transition_(projection * transition), projection_(projection),
+        sigmas_(sigmas) {}
 
   gtsam::Vector evaluateError(
       const gtsam::Vector& first, const gtsam::Vector& second,
@@ -71,26 +173,43 @@ class ErrorChainFactor final
       *h1 = -transition_;
     }
     if (h2) {
-      *h2 = Matrix15d::Identity();
+      *h2 = projection_;
     }
-    return second - transition_ * first;
+    return projection_ * second - transition_ * first;
+  }
+
+  bool ConstraintsConsistent(const gtsam::Vector& first,
+                            const gtsam::Vector& second) const {
+    const auto residual = evaluateError(first, second);
+    if (!residual.allFinite()) return false;
+    for (Eigen::Index i = 0; i < sigmas_.size(); ++i) {
+      if (sigmas_[i] == 0 && std::abs(residual[i]) > 1e-6) return false;
+    }
+    return true;
   }
 
  private:
-  Matrix15d transition_;
+  Eigen::MatrixXd transition_;
+  Eigen::MatrixXd projection_;
+  Eigen::VectorXd sigmas_;
 };
 
 class MotionFactor final
     : public gtsam::NoiseModelFactor4<gtsam::Pose3, gtsam::Vector, gtsam::Pose3,
                                       gtsam::Vector> {
  public:
-  MotionFactor(uint64_t first, uint64_t second, const MotionIncrement& motion)
+  MotionFactor(uint64_t first, uint64_t second, const MotionIncrement& motion,
+               const LocalState& start, const LocalState& end)
       : gtsam::NoiseModelFactor4<gtsam::Pose3, gtsam::Vector, gtsam::Pose3,
                                  gtsam::Vector>(
             gtsam::noiseModel::Constrained::All(6), PoseKey(first),
             ErrorKey(first), PoseKey(second), ErrorKey(second)),
         delta_(motion.delta) {
-    RelativeMotionJacobians(motion.start_pose, motion.delta, &first_, &second_);
+    Matrix6x15d start_jacobian, end_jacobian;
+    RelativeMotionJacobians(motion.start_pose, motion.delta,
+                            &start_jacobian, &end_jacobian);
+    first_ = start_jacobian * JointOutputJacobian(start);
+    second_ = end_jacobian * JointOutputJacobian(end);
   }
 
   gtsam::Vector RelativeError(const gtsam::Pose3& first,
@@ -137,8 +256,8 @@ class MotionFactor final
 
  private:
   Eigen::Isometry3d delta_;
-  Matrix6x15d first_;
-  Matrix6x15d second_;
+  Eigen::MatrixXd first_;
+  Eigen::MatrixXd second_;
 };
 
 Eigen::MatrixXd ObservationNoise(const GlobalObservation& observation) {
@@ -211,6 +330,158 @@ class ObservationFactor final : public gtsam::NoiseModelFactor1<gtsam::Pose3> {
   GlobalObservation observation_;
 };
 
+struct ConditionalNoise {
+  Eigen::MatrixXd projection;
+  Eigen::VectorXd sigmas;
+  gtsam::SharedNoiseModel model;
+};
+
+Result MakeConditionalNoise(const Eigen::MatrixXd& covariance,
+                            const Eigen::MatrixXd& marginal,
+                            double robust_threshold, ConditionalNoise* output) {
+  const auto scale = marginal.diagonal().cwiseSqrt().cwiseInverse().eval();
+  const Eigen::MatrixXd normalized =
+      scale.asDiagonal() * covariance * scale.asDiagonal();
+  if (!normalized.allFinite())
+    return {Reason::INVALID_INPUT, "Conditional covariance scaling overflow"};
+  Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> spectrum(normalized);
+  if (spectrum.info() != Eigen::Success || !spectrum.eigenvalues().allFinite())
+    return {Reason::INVALID_INPUT, "Conditional covariance decomposition failed"};
+  const double tolerance = 64 * std::numeric_limits<double>::epsilon() *
+      std::max(1.0, spectrum.eigenvalues().cwiseAbs().maxCoeff());
+  if (spectrum.eigenvalues().minCoeff() < -tolerance)
+    return {Reason::INVALID_INPUT, "Conditional covariance is not PSD"};
+  output->projection = spectrum.eigenvectors().transpose() * scale.asDiagonal();
+  if (!output->projection.allFinite())
+    return {Reason::INVALID_INPUT, "Conditional covariance projection overflow"};
+  output->sigmas.resize(covariance.rows());
+  for (Eigen::Index i = 0; i < covariance.rows(); ++i)
+    output->sigmas[i] = spectrum.eigenvalues()[i] <= tolerance
+        ? 0 : std::sqrt(spectrum.eigenvalues()[i]);
+  if (output->sigmas.minCoeff() > 0) {
+    output->projection.setIdentity();
+    output->model = gtsam::noiseModel::Gaussian::Covariance(covariance);
+    if (robust_threshold > 0)
+      output->model = gtsam::noiseModel::Robust::Create(
+          gtsam::noiseModel::mEstimator::Huber::Create(robust_threshold),
+          output->model);
+  } else {
+    // Exact equations must not be softened by a robust residual weight.
+    output->model = gtsam::noiseModel::Constrained::MixedSigmas(output->sigmas);
+  }
+  return {};
+}
+
+class ConditionalObservationFactor final
+    : public gtsam::NoiseModelFactor2<gtsam::Pose3, gtsam::Vector> {
+ public:
+  ConditionalObservationFactor(uint64_t key, uint64_t error_key,
+                              const GlobalObservation& observation,
+                              const Eigen::MatrixXd& loading,
+                              const ConditionalNoise& noise,
+                              double robust_threshold)
+      : gtsam::NoiseModelFactor2<gtsam::Pose3, gtsam::Vector>(
+            noise.model, PoseKey(key), ErrorKey(error_key)),
+        residual_(PoseKey(key), observation, robust_threshold),
+        loading_(noise.projection * loading),
+        projection_(noise.projection), sigmas_(noise.sigmas) {}
+
+  gtsam::Vector evaluateError(
+      const gtsam::Pose3& pose, const gtsam::Vector& error,
+      OptionalJacobian h1 = OptionalNone,
+      OptionalJacobian h2 = OptionalNone) const override {
+    if (h2) *h2 = loading_;
+    const auto residual = residual_.evaluateError(pose, h1);
+    if (h1) *h1 = (projection_ * *h1).eval();
+    return projection_ * residual + loading_ * error;
+  }
+
+  bool ConstraintsConsistent(const gtsam::Pose3& pose,
+                            const gtsam::Vector& error) const {
+    const auto residual = evaluateError(pose, error);
+    if (!residual.allFinite()) return false;
+    for (Eigen::Index i = 0; i < sigmas_.size(); ++i)
+      if (sigmas_[i] == 0 && std::abs(residual[i]) > 1e-6) return false;
+    return true;
+  }
+
+ private:
+  ObservationFactor residual_;
+  Eigen::MatrixXd loading_;
+  Eigen::MatrixXd projection_;
+  Eigen::VectorXd sigmas_;
+};
+
+Result ConditionalObservationModel(const GlobalObservation& observation,
+                                   const LocalState& local,
+                                   Eigen::MatrixXd* loading,
+                                   Eigen::MatrixXd* noise) {
+  const auto& cross = observation.local_error_cross_covariance;
+  const auto marginal = ObservationNoise(observation);
+  const auto valid = ValidateJointLocalError(local);
+  if (!valid.ok()) return valid;
+  const auto covariance = JointErrorCovariance(local);
+  if (!observation.conditional_local_error_qualified ||
+      observation.independent_of_local ||
+      observation.local_error_sequence != local.stamp.sequence ||
+      observation.local_error_time.value_or(observation.stamp.time) != local.stamp.time ||
+      cross.rows() != covariance.rows() || cross.cols() != marginal.rows() ||
+      !cross.allFinite()) {
+    return {Reason::CORRELATION_UNQUALIFIED,
+            "Conditional observation needs its qualified exact local error state"};
+  }
+  *loading = covariance.llt().solve(cross).transpose();
+  *noise = marginal - *loading * cross;
+  *noise = (0.5 * (*noise + noise->transpose())).eval();
+  if (!loading->allFinite() || !noise->allFinite()) {
+    return {Reason::INVALID_INPUT,
+            "Conditional observation residual covariance is nonfinite"};
+  }
+  ConditionalNoise model;
+  return MakeConditionalNoise(*noise, marginal, 0, &model);
+}
+
+struct JointMotionModel {
+  MotionIncrement verified;
+  Eigen::MatrixXd transition;
+  ConditionalNoise noise;
+};
+
+Result ModelMotion(const LocalState& previous, const LocalState& local,
+                   const MotionIncrement& motion, const FixedLagConfig& config,
+                   JointMotionModel* model) {
+  if (motion.epoch != previous.epoch || local.epoch != motion.epoch)
+    return {Reason::EPOCH_MISMATCH, "Graph motion changed ODOM epoch"};
+  if (motion.start.time != previous.stamp.time ||
+      motion.end.time != local.stamp.time ||
+      motion.start.sequence != previous.stamp.sequence ||
+      motion.end.sequence != local.stamp.sequence ||
+      !motion.start_covariance.isApprox(previous.covariance, 1e-9) ||
+      !motion.end_covariance.isApprox(local.covariance, 1e-9))
+    return {Reason::HISTORY_UNAVAILABLE, "Graph requires a contiguous local error chain"};
+  auto valid = ComputeMotionIncrement(previous, local, motion.cross_covariance,
+                                      motion.sources, &model->verified);
+  if (!valid.ok()) return valid;
+  if (!motion.delta.matrix().isApprox(model->verified.delta.matrix(), 1e-9) ||
+      motion.correlation_group != model->verified.correlation_group)
+    return {Reason::INVALID_INPUT, "Motion identity or relative pose mismatch"};
+  if (local.joint_error &&
+      local.joint_error->covariance.rows() > config.max_error_dimension)
+    return {Reason::INVALID_INPUT, "Joint error dimension exceeds graph capacity"};
+  valid = ValidateJointMotion(previous, local, motion);
+  if (!valid.ok()) return valid;
+  const auto previous_covariance = JointErrorCovariance(previous);
+  const auto covariance = JointErrorCovariance(local);
+  const Eigen::MatrixXd cross = previous.joint_error || local.joint_error
+      ? motion.joint_cross_covariance : Eigen::MatrixXd(motion.cross_covariance);
+  model->transition = previous_covariance.llt().solve(cross).transpose();
+  Eigen::MatrixXd noise = covariance - model->transition * cross;
+  noise = (0.5 * (noise + noise.transpose())).eval();
+  if (!model->transition.allFinite() || !noise.allFinite())
+    return {Reason::INVALID_INPUT, "Nonfinite conditional motion model"};
+  return MakeConditionalNoise(noise, covariance, 0, &model->noise);
+}
+
 Result CheckObservation(const GlobalObservation& observation) {
   const bool observes_rotation =
       observation.kind == GlobalObservation::Kind::POSE ||
@@ -221,7 +492,13 @@ Result CheckObservation(const GlobalObservation& observation) {
              .isApprox(Eigen::Matrix3d::Identity(), 1e-9) ||
         std::abs(observation.pose.linear().determinant() - 1.0) > 1e-9)) ||
       !observation.quality_valid || observation.ambiguous ||
-      !observation.independent_of_local || observation.source.empty() ||
+      (!observation.independent_of_local &&
+       !observation.conditional_local_error_qualified) ||
+      (observation.conditional_local_error_qualified &&
+       observation.independent_of_local) ||
+      (!observation.conditional_local_error_qualified &&
+       observation.local_error_cross_covariance.size() != 0) ||
+      observation.source.empty() ||
       observation.map_id.empty() || observation.map_version.empty() ||
       observation.calibration_id.empty() || observation.stamp.sequence == 0 ||
       !std::isfinite(observation.stamp.time) || observation.stamp.time <= 0.0 ||
@@ -240,8 +517,8 @@ struct FixedLagGraph::Impl {
     uint64_t key;
     LocalState local;
   };
-  explicit Impl(double lag) : smoother(lag, Parameters()) {}
-  gtsam::IncrementalFixedLagSmoother smoother;
+  explicit Impl(double lag) : smoother(lag) {}
+  AlignmentSmoother smoother;
   std::map<double, Node> nodes;
   std::map<std::pair<std::string, uint64_t>, double> observations;
   std::map<std::string, uint64_t> retired_sequences;
@@ -257,14 +534,28 @@ struct FixedLagGraph::Impl {
       for (const auto& node : nodes) {
         const auto& error =
             estimate.at<gtsam::Vector>(ErrorKey(node.second.key));
-        if (error.size() != 15 || !error.allFinite() ||
-            error.segment<3>(6).norm() > config.max_linearization_angle) {
+        const auto projection = JointOutputJacobian(node.second.local);
+        if (error.size() != projection.cols() || !error.allFinite() ||
+            (projection * error).segment<3>(6).norm() >
+                config.max_linearization_angle) {
           return {Reason::INNOVATION_REJECTED,
                   "Global nuisance error exceeded its linearization domain"};
         }
       }
       bool consistent = true;
       for (const auto& factor : smoother.getFactors()) {
+        const auto* observation =
+            dynamic_cast<const ConditionalObservationFactor*>(factor.get());
+        if (observation)
+          consistent = consistent && observation->ConstraintsConsistent(
+              estimate.at<gtsam::Pose3>(observation->keys()[0]),
+              estimate.at<gtsam::Vector>(observation->keys()[1]));
+        const auto* chain = dynamic_cast<const ErrorChainFactor*>(factor.get());
+        if (chain != nullptr) {
+          consistent = consistent && chain->ConstraintsConsistent(
+              estimate.at<gtsam::Vector>(chain->keys()[0]),
+              estimate.at<gtsam::Vector>(chain->keys()[1]));
+        }
         const auto* motion = dynamic_cast<const MotionFactor*>(factor.get());
         if (motion == nullptr) {
           continue;
@@ -299,8 +590,10 @@ struct FixedLagGraph::Impl {
     const auto pose =
         smoother.calculateEstimate<gtsam::Pose3>(PoseKey(latest.key));
     const Eigen::Isometry3d map_base = FromPose(pose);
-    const gtsam::Matrix tangent =
-        smoother.marginalCovariance(PoseKey(latest.key));
+    gtsam::Matrix tangent;
+    const auto marginal =
+        PosteriorCovariance(smoother, {{PoseKey(latest.key), 6}}, &tangent);
+    if (!marginal.ok()) return marginal;
     if (tangent.rows() != 6 || tangent.cols() != 6 ||
         !map_base.matrix().allFinite() || !tangent.allFinite()) {
       return {Reason::INVALID_INPUT, "Nonfinite graph pose/marginal"};
@@ -364,6 +657,7 @@ Result FixedLagGraph::ValidateConfig() const {
   }
   if (config_.max_states < 2 || config_.max_observations < 1 ||
       config_.max_iterations == 0 || config_.max_iterations > 100 ||
+      config_.max_error_dimension < 15 ||
       config_.max_linearization_angle >= 1.0) {
     return {Reason::CONFIG_INVALID, "Invalid fixed-lag graph capacity"};
   }
@@ -373,8 +667,16 @@ Result FixedLagGraph::ValidateConfig() const {
 bool FixedLagGraph::initialized() const { return !impl_->nodes.empty(); }
 const GlobalState& FixedLagGraph::state() const { return impl_->output; }
 
+Result FixedLagGraph::ValidateConditionalObservation(
+    const LocalState& local, const GlobalObservation& observation) {
+  Eigen::MatrixXd loading, noise;
+  return ConditionalObservationModel(observation, local, &loading, &noise);
+}
+
 Result FixedLagGraph::Initialize(const LocalState& local,
-                                 const GlobalObservation& anchor) {
+                                 const GlobalObservation& anchor,
+                                 const std::vector<LocalState>& following,
+                                 const std::vector<MotionIncrement>& motions) {
   Result valid = ValidateConfig();
   if (!valid.ok()) {
     return valid;
@@ -399,6 +701,17 @@ Result FixedLagGraph::Initialize(const LocalState& local,
         Reason::GLOBAL_UNAVAILABLE,
         "Graph initialization requires a verified full-pose same-time anchor"};
   }
+  if (local.joint_error &&
+      local.joint_error->covariance.rows() > config_.max_error_dimension)
+    return {Reason::INVALID_INPUT, "Joint error dimension exceeds graph capacity"};
+  valid = ValidateJointLocalError(local);
+  if (!valid.ok()) return valid;
+  if (following.size() != motions.size() ||
+      following.size() + 1 > config_.max_states ||
+      (!following.empty() &&
+       following.back().stamp.time - local.stamp.time > config_.lag))
+    return {Reason::HISTORY_UNAVAILABLE, "Bootstrap trajectory exceeds the fixed lag"};
+  const auto covariance = JointErrorCovariance(local);
   const auto started = Clock::now();
   std::unique_ptr<Impl> candidate(new Impl(config_.lag));
   candidate->anchor = anchor;
@@ -413,19 +726,57 @@ Result FixedLagGraph::Initialize(const LocalState& local,
       anchor.stamp.time;
   candidate->sources.insert(anchor.source);
   gtsam::NonlinearFactorGraph factors;
-  factors.emplace_shared<ObservationFactor>(PoseKey(1), anchor,
-                                            config_.robust_threshold);
-  factors.emplace_shared<gtsam::PriorFactor<gtsam::Vector>>(
-      ErrorKey(1), gtsam::Vector::Zero(15),
-      gtsam::noiseModel::Gaussian::Covariance(local.covariance));
   gtsam::Values values;
+  gtsam::FixedLagSmoother::KeyTimestampMap timestamps{
+      {PoseKey(1), local.stamp.time}, {ErrorKey(1), local.stamp.time}};
   values.insert(PoseKey(1), ToPose(anchor.pose));
-  const gtsam::Vector zero = gtsam::Vector::Zero(15);
-  values.insert(ErrorKey(1), zero);
+  values.insert(ErrorKey(1), gtsam::Vector::Zero(covariance.rows()).eval());
+  const Eigen::Isometry3d alignment = anchor.pose * Pose(local).inverse();
+  for (std::size_t i = 0; i < following.size(); ++i) {
+    const auto previous = candidate->nodes.rbegin()->second;
+    const auto& next = following[i];
+    JointMotionModel model;
+    valid = ModelMotion(previous.local, next, motions[i], config_, &model);
+    if (!valid.ok()) return valid;
+    const uint64_t key = candidate->next_key++;
+    candidate->nodes.emplace(next.stamp.time, Impl::Node{key, next});
+    factors.emplace_shared<ErrorChainFactor>(
+        ErrorKey(previous.key), ErrorKey(key), model.transition,
+        model.noise.projection, model.noise.model, model.noise.sigmas);
+    factors.emplace_shared<MotionFactor>(previous.key, key, model.verified,
+                                         previous.local, next);
+    values.insert(PoseKey(key), ToPose(alignment * Pose(next)));
+    values.insert(ErrorKey(key),
+                   gtsam::Vector::Zero(JointErrorCovariance(next).rows()).eval());
+    timestamps[PoseKey(key)] = timestamps[ErrorKey(key)] = next.stamp.time;
+  }
+  if (anchor.conditional_local_error_qualified) {
+    const auto error_node = candidate->nodes.find(
+        anchor.local_error_time.value_or(anchor.stamp.time));
+    if (error_node == candidate->nodes.end())
+      return {Reason::HISTORY_UNAVAILABLE, "Bootstrap has no exact conditioning error node"};
+    Eigen::MatrixXd loading, conditional_noise;
+    valid = ConditionalObservationModel(anchor, error_node->second.local,
+                                         &loading, &conditional_noise);
+    if (!valid.ok()) return valid;
+    ConditionalNoise noise;
+    valid = MakeConditionalNoise(conditional_noise, ObservationNoise(anchor),
+                                 config_.robust_threshold, &noise);
+    if (!valid.ok()) return valid;
+    factors.emplace_shared<ConditionalObservationFactor>(
+        1, error_node->second.key, anchor, loading, noise, config_.robust_threshold);
+  } else {
+    factors.emplace_shared<ObservationFactor>(PoseKey(1), anchor,
+                                             config_.robust_threshold);
+  }
+  factors.emplace_shared<gtsam::PriorFactor<gtsam::Vector>>(
+      ErrorKey(1), gtsam::Vector::Zero(covariance.rows()),
+      gtsam::noiseModel::Gaussian::Covariance(covariance));
   try {
-    candidate->smoother.update(
-        factors, values,
-        {{PoseKey(1), local.stamp.time}, {ErrorKey(1), local.stamp.time}});
+    if (anchor.conditional_local_error_qualified && !following.empty())
+      candidate->smoother.UpdateConditionalFactors(factors, values, timestamps);
+    else
+      candidate->smoother.update(factors, values, timestamps);
     valid = candidate->Finalize(config_, started);
   } catch (const gtsam::IndeterminantLinearSystemException& error) {
     return {Reason::DEGENERATE, error.what()};
@@ -443,41 +794,12 @@ Result FixedLagGraph::AddLocal(const LocalState& local,
     return {Reason::GLOBAL_UNAVAILABLE, "Graph has no verified anchor"};
   }
   const auto& previous = impl_->nodes.rbegin()->second;
-  if (motion.epoch != previous.local.epoch || local.epoch != motion.epoch) {
-    return {Reason::EPOCH_MISMATCH, "Graph motion changed ODOM epoch"};
-  }
-  if (motion.start.time != previous.local.stamp.time ||
-      motion.end.time != local.stamp.time ||
-      motion.start.sequence != previous.local.stamp.sequence ||
-      motion.end.sequence != local.stamp.sequence ||
-      !motion.start_covariance.isApprox(previous.local.covariance, 1e-9) ||
-      !motion.end_covariance.isApprox(local.covariance, 1e-9)) {
-    return {Reason::HISTORY_UNAVAILABLE,
-            "Graph requires a contiguous local error chain"};
-  }
-  MotionIncrement verified;
-  auto valid =
-      ComputeMotionIncrement(previous.local, local, motion.cross_covariance,
-                             motion.sources, &verified);
-  if (!valid.ok()) {
-    return valid;
-  }
-  if (!motion.delta.matrix().isApprox(verified.delta.matrix(), 1e-9) ||
-      motion.correlation_group != verified.correlation_group) {
-    return {Reason::INVALID_INPUT, "Motion identity or relative pose mismatch"};
-  }
-  const Matrix15d transition = previous.local.covariance.llt()
-                                   .solve(motion.cross_covariance)
-                                   .transpose();
-  Matrix15d noise = local.covariance - transition * previous.local.covariance *
-                                           transition.transpose();
-  noise = (0.5 * (noise + noise.transpose())).eval();
-  if (!transition.allFinite() || !noise.allFinite() ||
-      Eigen::LLT<Matrix15d>(noise).info() != Eigen::Success) {
-    return {
-        Reason::DEGENERATE,
-        "Conditional motion noise is singular; no artificial prior is added"};
-  }
+  JointMotionModel model;
+  auto valid = ModelMotion(previous.local, local, motion, config_, &model);
+  if (!valid.ok()) return valid;
+  const auto& verified = model.verified;
+  const auto& transition = model.transition;
+  const auto& conditional = model.noise;
   if (impl_->nodes.size() >= config_.max_states &&
       impl_->nodes.begin()->first >= local.stamp.time - config_.lag) {
     return {Reason::INVALID_INPUT, "Fixed-lag state capacity exceeded"};
@@ -488,8 +810,11 @@ Result FixedLagGraph::AddLocal(const LocalState& local,
   candidate->nodes.emplace(local.stamp.time, Impl::Node{key, local});
   gtsam::NonlinearFactorGraph factors;
   factors.emplace_shared<ErrorChainFactor>(ErrorKey(previous.key),
-                                           ErrorKey(key), transition, noise);
-  factors.emplace_shared<MotionFactor>(previous.key, key, verified);
+                                           ErrorKey(key), transition,
+                                           conditional.projection,
+                                           conditional.model, conditional.sigmas);
+  factors.emplace_shared<MotionFactor>(previous.key, key, verified,
+                                      previous.local, local);
   gtsam::Values values;
   const auto previous_pose =
       candidate->smoother.calculateEstimate<gtsam::Pose3>(
@@ -502,7 +827,8 @@ Result FixedLagGraph::AddLocal(const LocalState& local,
   Matrix6x15d second;
   RelativeMotionJacobians(verified.start_pose, verified.delta, &first, &second);
   const Eigen::Matrix<double, 6, 1> relative_error =
-      first * previous_error + second * next_error;
+      first * JointOutputJacobian(previous.local) * previous_error +
+      second * JointOutputJacobian(local) * next_error;
   Eigen::Isometry3d initial_delta = verified.delta;
   initial_delta.translation() += relative_error.head<3>();
   initial_delta.linear() =
@@ -511,14 +837,16 @@ Result FixedLagGraph::AddLocal(const LocalState& local,
           .eval();
   values.insert(PoseKey(key), previous_pose.compose(ToPose(initial_delta)));
   values.insert(ErrorKey(key), next_error);
+  const char* stage = "motion update: ";
   try {
     candidate->smoother.update(
         factors, values,
         {{PoseKey(key), local.stamp.time}, {ErrorKey(key), local.stamp.time}});
     candidate->Prune(local.stamp.time - config_.lag);
+    stage = "motion snapshot: ";
     valid = candidate->Finalize(config_, started);
   } catch (const gtsam::IndeterminantLinearSystemException& error) {
-    return {Reason::DEGENERATE, error.what()};
+    return {Reason::DEGENERATE, std::string(stage) + error.what()};
   }
   if (!valid.ok()) {
     return valid;
@@ -555,6 +883,18 @@ Result FixedLagGraph::Observe(const GlobalObservation& observation) {
     return {Reason::HISTORY_UNAVAILABLE,
             "Observation needs an exact retained graph state"};
   }
+  Eigen::MatrixXd loading, conditional_noise;
+  auto error_found = found;
+  if (observation.conditional_local_error_qualified) {
+    error_found = impl_->nodes.find(
+        observation.local_error_time.value_or(observation.stamp.time));
+    if (error_found == impl_->nodes.end())
+      return {Reason::HISTORY_UNAVAILABLE,
+              "Conditional observation needs an exact retained error node"};
+    valid = ConditionalObservationModel(
+        observation, error_found->second.local, &loading, &conditional_noise);
+    if (!valid.ok()) return valid;
+  }
   const auto identity =
       std::make_pair(observation.source, observation.stamp.sequence);
   const auto retired = impl_->retired_sequences.find(observation.source);
@@ -583,12 +923,34 @@ Result FixedLagGraph::Observe(const GlobalObservation& observation) {
   const auto predicted = candidate->smoother.calculateEstimate<gtsam::Pose3>(
       PoseKey(found->second.key));
   gtsam::Matrix jacobian;
-  const gtsam::Vector residual = factor.evaluateError(predicted, &jacobian);
-  const gtsam::Matrix innovation =
-      jacobian *
-          candidate->smoother.marginalCovariance(PoseKey(found->second.key)) *
-          jacobian.transpose() +
-      ObservationNoise(observation);
+  gtsam::Vector residual = factor.evaluateError(predicted, &jacobian);
+  gtsam::Matrix innovation;
+  try {
+    const auto estimate = candidate->smoother.calculateEstimate();
+    const auto pose_key = PoseKey(found->second.key);
+    std::vector<std::pair<gtsam::Key, Eigen::Index>> query{{pose_key, 6}};
+    const auto error_key = ErrorKey(error_found->second.key);
+    const Eigen::Index error_dimension = JointOutputJacobian(error_found->second.local).cols();
+    if (observation.conditional_local_error_qualified)
+      query.emplace_back(error_key, error_dimension);
+    Eigen::MatrixXd joint;
+    const auto marginal = PosteriorCovariance(candidate->smoother, query, &joint);
+    if (!marginal.ok()) return marginal;
+    innovation = jacobian * joint.topLeftCorner(6, 6) *
+        jacobian.transpose() + ObservationNoise(observation);
+    if (observation.conditional_local_error_qualified) {
+      const Eigen::MatrixXd cross =
+          jacobian * joint.topRightCorner(6, error_dimension) * loading.transpose();
+      innovation = jacobian * joint.topLeftCorner(6, 6) * jacobian.transpose() +
+          cross + cross.transpose() +
+          loading * joint.bottomRightCorner(error_dimension, error_dimension) *
+              loading.transpose() +
+          conditional_noise;
+      residual += loading * estimate.at<gtsam::Vector>(error_key);
+    }
+  } catch (const gtsam::IndeterminantLinearSystemException& error) {
+    return {Reason::DEGENERATE, std::string("observation marginal: ") + error.what()};
+  }
   Eigen::LLT<Eigen::MatrixXd> whiten(innovation);
   if (whiten.info() != Eigen::Success || !residual.allFinite()) {
     return {Reason::INVALID_INPUT, "Invalid graph innovation"};
@@ -599,13 +961,28 @@ Result FixedLagGraph::Observe(const GlobalObservation& observation) {
             "Graph observed-subspace innovation rejected"};
   }
   gtsam::NonlinearFactorGraph factors;
-  factors.emplace_shared<ObservationFactor>(
-      PoseKey(found->second.key), observation, config_.robust_threshold);
+  if (observation.conditional_local_error_qualified) {
+    ConditionalNoise noise;
+    valid = MakeConditionalNoise(conditional_noise, ObservationNoise(observation),
+                                 config_.robust_threshold, &noise);
+    if (!valid.ok()) return valid;
+    factors.emplace_shared<ConditionalObservationFactor>(
+        found->second.key, error_found->second.key, observation, loading, noise,
+        config_.robust_threshold);
+  } else {
+    factors.emplace_shared<ObservationFactor>(
+        PoseKey(found->second.key), observation, config_.robust_threshold);
+  }
+  const char* stage = "observation update: ";
   try {
-    candidate->smoother.update(factors);
+    if (observation.conditional_local_error_qualified)
+      candidate->smoother.UpdateConditionalFactors(factors);
+    else
+      candidate->smoother.update(factors);
+    stage = "observation snapshot: ";
     valid = candidate->Finalize(config_, started);
   } catch (const gtsam::IndeterminantLinearSystemException& error) {
-    return {Reason::DEGENERATE, error.what()};
+    return {Reason::DEGENERATE, std::string(stage) + error.what()};
   }
   if (!valid.ok()) {
     return valid;

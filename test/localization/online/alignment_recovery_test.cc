@@ -33,8 +33,7 @@ void AddAndExpectNoCandidate(
   GnssAlignmentRecoveryDiagnostics diagnostics;
   GnssAlignmentRecoveryCandidate candidate;
   ASSERT_TRUE(
-      recovery->AddRejectedObservation(observation, &diagnostics, &candidate)
-          .ok());
+      recovery->AddObservation(observation, &diagnostics, &candidate).ok());
   EXPECT_FALSE(diagnostics.candidate_validated);
 }
 
@@ -52,8 +51,7 @@ TEST(GnssAlignmentRecoveryTest, RequiresLaterHoldoutBeforeCandidate) {
     const Eigen::Vector2d odom(index * 2.0, 0.2 * index * index);
     auto observation = Observation(index, odom, translation, kYaw);
     ASSERT_TRUE(
-        recovery.AddRejectedObservation(observation, &diagnostics, &candidate)
-            .ok());
+        recovery.AddObservation(observation, &diagnostics, &candidate).ok());
     EXPECT_FALSE(diagnostics.candidate_validated);
   }
   EXPECT_EQ(diagnostics.reason, "recovery_candidate_waiting_for_holdout");
@@ -61,14 +59,12 @@ TEST(GnssAlignmentRecoveryTest, RequiresLaterHoldoutBeforeCandidate) {
   auto first_holdout =
       Observation(4, Eigen::Vector2d(8.0, 2.1), translation, kYaw);
   ASSERT_TRUE(
-      recovery.AddRejectedObservation(first_holdout, &diagnostics, &candidate)
-          .ok());
+      recovery.AddObservation(first_holdout, &diagnostics, &candidate).ok());
   EXPECT_FALSE(diagnostics.candidate_validated);
   auto second_holdout =
       Observation(5, Eigen::Vector2d(10.0, 5.0), translation, kYaw);
   ASSERT_TRUE(
-      recovery.AddRejectedObservation(second_holdout, &diagnostics, &candidate)
-          .ok());
+      recovery.AddObservation(second_holdout, &diagnostics, &candidate).ok());
   ASSERT_TRUE(diagnostics.candidate_validated);
   EXPECT_NEAR(candidate.global_from_odom_xy_yaw.x(), translation.x(), 1e-8);
   EXPECT_NEAR(candidate.global_from_odom_xy_yaw.y(), translation.y(), 1e-8);
@@ -88,8 +84,7 @@ TEST(GnssAlignmentRecoveryTest,
   GnssAlignmentRecoveryDiagnostics diagnostics;
   auto outlier = Observation(0, Eigen::Vector2d::Zero(),
                              Eigen::Vector2d(1000.0, -1000.0), 0.0);
-  ASSERT_TRUE(
-      recovery.AddRejectedObservation(outlier, &diagnostics, &candidate).ok());
+  ASSERT_TRUE(recovery.AddObservation(outlier, &diagnostics, &candidate).ok());
   EXPECT_FALSE(diagnostics.candidate_validated);
   EXPECT_EQ(diagnostics.reason, "recovery_training_window");
 
@@ -98,8 +93,7 @@ TEST(GnssAlignmentRecoveryTest,
     auto stationary = Observation(index, Eigen::Vector2d(3.0, 4.0),
                                   Eigen::Vector2d(3.0, 4.0), 0.0);
     ASSERT_TRUE(
-        recovery.AddRejectedObservation(stationary, &diagnostics, &candidate)
-            .ok());
+        recovery.AddObservation(stationary, &diagnostics, &candidate).ok());
   }
   EXPECT_EQ(diagnostics.reason, "recovery_yaw_unobservable");
   EXPECT_FALSE(diagnostics.candidate_validated);
@@ -119,19 +113,16 @@ TEST(GnssAlignmentRecoveryTest, FailedHoldoutRestartsTrainingAndRequiresOrder) {
     auto observation = Observation(index, Eigen::Vector2d(index * 3.0, 0.0),
                                    translation, kYaw);
     ASSERT_TRUE(
-        recovery.AddRejectedObservation(observation, &diagnostics, &candidate)
-            .ok());
+        recovery.AddObservation(observation, &diagnostics, &candidate).ok());
   }
   auto bad_holdout = Observation(3, Eigen::Vector2d(9.0, 0.0),
                                  Eigen::Vector2d(-20.0, 70.0), 0.0);
   ASSERT_TRUE(
-      recovery.AddRejectedObservation(bad_holdout, &diagnostics, &candidate)
-          .ok());
+      recovery.AddObservation(bad_holdout, &diagnostics, &candidate).ok());
   EXPECT_EQ(diagnostics.reason, "recovery_holdout_inconsistent");
   EXPECT_FALSE(diagnostics.candidate_validated);
   auto duplicate = bad_holdout;
-  EXPECT_EQ(recovery.AddRejectedObservation(duplicate, &diagnostics, &candidate)
-                .code(),
+  EXPECT_EQ(recovery.AddObservation(duplicate, &diagnostics, &candidate).code(),
             StatusCode::kInvalidArgument);
 }
 
@@ -146,20 +137,19 @@ TEST(GnssAlignmentRecoveryTest, BoundsTotalTrainingAndHoldoutAge) {
     GnssAlignmentRecoveryDiagnostics diagnostics;
     GnssAlignmentRecoveryCandidate candidate;
     for (int index : {0, 2, 4}) {
-      ASSERT_TRUE(recovery
-                      .AddRejectedObservation(
-                          Observation(index, Eigen::Vector2d(index, 0.0),
-                                      Eigen::Vector2d(8.0, 0.0), 0.0),
-                          &diagnostics, &candidate)
-                      .ok());
+      ASSERT_TRUE(
+          recovery
+              .AddObservation(Observation(index, Eigen::Vector2d(index, 0.0),
+                                          Eigen::Vector2d(8.0, 0.0), 0.0),
+                              &diagnostics, &candidate)
+              .ok());
     }
     ASSERT_EQ(diagnostics.reason, "recovery_candidate_waiting_for_holdout");
     const auto holdout =
         Observation(holdout_index, Eigen::Vector2d(holdout_index, 0.0),
                     Eigen::Vector2d(8.0, 0.0), 0.0);
     ASSERT_TRUE(
-        recovery.AddRejectedObservation(holdout, &diagnostics, &candidate)
-            .ok());
+        recovery.AddObservation(holdout, &diagnostics, &candidate).ok());
     if (holdout_index == 5) {
       EXPECT_TRUE(diagnostics.candidate_validated);
     } else {
@@ -168,8 +158,7 @@ TEST(GnssAlignmentRecoveryTest, BoundsTotalTrainingAndHoldoutAge) {
       EXPECT_EQ(diagnostics.training_count, 1U);
       EXPECT_EQ(diagnostics.validation_count, 0U);
       EXPECT_EQ(
-          recovery.AddRejectedObservation(holdout, &diagnostics, &candidate)
-              .code(),
+          recovery.AddObservation(holdout, &diagnostics, &candidate).code(),
           StatusCode::kInvalidArgument);
     }
   }
@@ -179,12 +168,12 @@ TEST(GnssAlignmentRecoveryTest, BoundsTotalTrainingAndHoldoutAge) {
   GnssAlignmentRecoveryDiagnostics diagnostics;
   GnssAlignmentRecoveryCandidate candidate;
   for (int index : {0, 2, 4}) {
-    ASSERT_TRUE(recovery
-                    .AddRejectedObservation(
-                        Observation(index, Eigen::Vector2d(index, 0.0),
-                                    Eigen::Vector2d(8.0, 0.0), 0.0),
-                        &diagnostics, &candidate)
-                    .ok());
+    ASSERT_TRUE(
+        recovery
+            .AddObservation(Observation(index, Eigen::Vector2d(index, 0.0),
+                                        Eigen::Vector2d(8.0, 0.0), 0.0),
+                            &diagnostics, &candidate)
+            .ok());
   }
   EXPECT_EQ(diagnostics.reason, "recovery_window_timeout");
   EXPECT_EQ(diagnostics.training_count, 1U);
@@ -197,12 +186,12 @@ TEST(GnssAlignmentRecoveryTest, CoherentBiasIsNotIndependentIntegrityEvidence) {
   GnssAlignmentRecoveryCandidate candidate;
   const Eigen::Vector2d receiver_bias(20.0, -10.0);
   for (int index = 0; index < 11; ++index) {
-    ASSERT_TRUE(recovery
-                    .AddRejectedObservation(
-                        Observation(index, Eigen::Vector2d(index, 0.0),
-                                    receiver_bias, 0.0),
-                        &diagnostics, &candidate)
-                    .ok());
+    ASSERT_TRUE(
+        recovery
+            .AddObservation(Observation(index, Eigen::Vector2d(index, 0.0),
+                                        receiver_bias, 0.0),
+                            &diagnostics, &candidate)
+            .ok());
   }
   ASSERT_TRUE(diagnostics.candidate_validated);
   EXPECT_NEAR(

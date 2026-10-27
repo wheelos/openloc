@@ -22,6 +22,11 @@ class ContinuousOutput {
   bool correction_budget_exceeded() const {
     return correction_budget_exceeded_;
   }
+  const Result& correction_status() const { return correction_status_; }
+  // Conditional deterministic map only: the caller retains the complete joint
+  // covariance of both internal endpoints, prior output and memory. These
+  // inputs must never be treated as independent process noise.
+  Result LinearizeLastStep(ContinuousOutputErrorTransition* transition) const;
 
  private:
   // This 15D covariance supports finite propagation and degradation budgets.
@@ -32,6 +37,15 @@ class ContinuousOutput {
   Eigen::Vector3d pose_correction_velocity_ = Eigen::Vector3d::Zero();
   bool active_ = false;
   bool correction_budget_exceeded_ = false;
+  Result correction_status_;
+  struct StepInput {
+    LocalState previous_internal;
+    LocalState internal;
+    LocalState output;
+    Eigen::Vector3d memory;
+    double dt;
+  };
+  std::optional<StepInput> last_step_;
 };
 
 }  // namespace unified

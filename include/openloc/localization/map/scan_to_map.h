@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -19,6 +20,7 @@
 #include "pcl/kdtree/kdtree_flann.h"
 #include "pcl/point_cloud.h"
 #include "pcl/point_types.h"
+#include "openloc/localization/local/native_types.h"
 
 namespace openloc {
 namespace localization {
@@ -112,6 +114,10 @@ struct ScanToMapConfig {
   double window_cell_size_m = 20.0;
   Eigen::Vector2d window_origin_xy_m = Eigen::Vector2d::Zero();
   uint32_t maximum_cached_windows = 8;
+  // Opt-in uncalibrated model conditional on a deterministic versioned map.
+  // Map construction/survey uncertainty is NOT qualified by this assumption.
+  bool retain_joint_error_support = false;
+  uint32_t maximum_error_points = 100000;
 };
 
 struct ScanToMapRequest {
@@ -121,6 +127,23 @@ struct ScanToMapRequest {
   bool deskewed = false;
   PointCloud::ConstPtr cloud;
   Eigen::Isometry3d map_from_base_initial = Eigen::Isometry3d::Identity();
+  // Exclusive with cloud; points are already in base_frame. The seed loading
+  // must cover all stochastic seed reuse in this same joint basis. A fixed
+  // configuration seed has a zero loading; a graph/GNSS seed is not fixed.
+  const unified::JointLidarScan* joint_scan = nullptr;
+  Eigen::MatrixXd initial_joint_jacobian;
+};
+
+struct ScanToMapJointError {
+  unified::Result assessment{
+      unified::Reason::CORRELATION_UNQUALIFIED,
+      "Shared registration error model is unavailable"};
+  unified::Stamp conditioning;
+  uint64_t source_sequence = 0;
+  Eigen::MatrixXd pose_jacobian;
+  Eigen::MatrixXd local_cross_covariance;
+  Eigen::Matrix<double, 6, 6> covariance =
+      Eigen::Matrix<double, 6, 6>::Zero();
 };
 
 struct ScanToMapResult {
@@ -183,6 +206,9 @@ struct ScanToMapResult {
   uint32_t ndt_nonplanar_rejected_points = 0;
   uint32_t ndt_other_normal_rejected_points = 0;
   uint32_t map_window_points = 0;
+  // Separate from residual-Hessian diagnostics above. In this model every
+  // source-point error is mediated by the native joint state, not duplicated.
+  std::optional<ScanToMapJointError> joint_error;
 };
 
 // Standalone scan-to-map component. It emits observations only; it does not

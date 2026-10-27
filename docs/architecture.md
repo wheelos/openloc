@@ -42,7 +42,7 @@ plan are maintained in the
 The target extension uses a tightly coupled local ESKF/LIO, one global
 fixed-lag factor graph, and independent health supervision. The local estimator
 alone owns continuous pose, velocity, biases, epoch, and history. The graph
-owns global poses and an internal 15D local-error nuisance chain, not a second
+owns global poses and an internal local-error nuisance chain, not a second
 local estimator. It exports `T_map_odom`, with
 `T_map_base = T_map_odom * T_odom_base`; no absolute factor feeds back into ODOM.
 The existing four-DoF baseline and SE(3) CI diagnostic are alternative owners,
@@ -63,6 +63,28 @@ coupling. It does not add an independent ODOM Gaussian edge on top.
 A positive joint covariance or a single cross-covariance does not establish
 the required conditional/Markov model: that model must be qualified externally.
 
+Calibration is a separate admission axis: the explicit, default-off
+`allow_uncalibrated_inputs` mode permits uncalibrated covariance and diagnostic
+geodetic references, but does not waive sufficient-model, quality, source
+identity or dependency checks. It selects the same graph, not another solver or
+a CI fallback. Its public result is always diagnostic-only and its assessment
+cannot report trusted availability. Exact conditional null directions remain
+constraints even when roundoff makes their covariance LLT appear positive.
+Posterior covariance is propagated through the existing Bayes tree's triangular
+conditionals, with zero noise for exact equations; it does not re-eliminate
+constrained cliques or add artificial process noise.
+
+An optional `JointLocalError` retains a producer's sufficient augmented error
+basis instead of forcing all memory into 15D. Its full-rank covariance and
+15-by-dimension output Jacobian must reproduce the published 15D marginal.
+The connection then supplies the entire rectangular cross-time covariance;
+its projection must reproduce the published cross-covariance. No hidden block
+is discarded. Dimensions may grow or shrink across retained nodes, including
+entry/exit from the legacy 15D path, but the producer must preserve all future
+dependencies. The configured per-node bound defaults to 256; exceeding it is
+an explicit rejection before decomposition, not truncation. Singular memory
+must use a minimal full-rank basis, not artificial diagonal noise.
+
 Map full/projected pose and antenna XY/XYZ inputs share one correction stream.
 XY residuals are `(p_map_base + R_map_base * lever_base).head<2>() - z_xy`,
 using the entire 2x2 noise matrix. Unmeasured Z/attitude entries are not checked
@@ -80,11 +102,105 @@ absolute-observation revision.
 The graph facade requires a verified reference and explicit external motion,
 source uncertainty and independence qualification declarations/evidence IDs.
 These declarations are admission prerequisites, not library-generated proof.
-Independence must cover both local motion and other absolute sources, including
-map construction and GNSS preprocessing. Known shared dependencies are rejected:
-no joint source-correlation factor is implemented. Unknown audit flags do not
-establish independence or override missing qualification. Current diagnostic
-map/ODOM/GNSS inputs do not acquire graph eligibility by changing backends.
+Unconditional independence must cover both local motion and other absolute
+sources, including map construction and GNSS preprocessing. Alternatively,
+`GraphLocalObservationCorrelation` supplies `C = Cov(e, n)` at the exact
+retained joint error node, with `n = measured - true` in the measured subspace.
+The graph derives `B = C^T P^-1`, `R_cond = R - B C`, and jointly factors
+`h(x) - z + B e` against that conditional covariance. Innovation gating uses
+the current joint pose/error marginal, including cross blocks, rather than
+adding independent pose and error variances. Invalid/nonpositive conditional
+residual noise is rejected transactionally; it is not regularized.
+
+This mode requires a matching motion model ID, exact ODOM sequence, explicit
+conditional model qualification and evidence that the retained error state
+mediates **all** local/temporal/source reuse. Conditional residuals must be
+independent of the entire error history and previous/other source residuals.
+The unconditional independence flags cannot also be set. This is an external
+sufficient-state claim, not something inferred from `C`, positive covariance
+or provenance flags. Current native stored scans/deskew/output memory do not
+satisfy it; diagnostic map/ODOM/GNSS remain ineligible. Shared sources without
+this model remain rejected. The backend retains the augmented state through
+its conditional chain, pose coupling, joint innovation and marginalization.
+The actual native sufficient geometry/output-memory model remains open;
+supporting its representation is not evidence that the producer exports it.
+
+The native entry's on-demand deterministic exports do not override this gate.
+`OutputErrorTransition` retains the actual published step's internal/output
+inputs and three correction-speed memory dimensions; its analytic Jacobian
+uses the actual limiter branches. `DeskewErrorMap` composes point/end-pose and
+raw-point derivatives with actual history interpolation, retaining corrected
+left and pre-correction right clones instead of treating them as independent
+samples. `StoredGeometryErrorMap` preserves frozen scan anchors and every
+retained plane's original point support, mean/normal and anchor/deskew loading.
+Repeated source/clone identities are shared. Undefined voxel, eigenvector,
+limiter or rotation branches reject an error model without changing nominal
+ODOM/geometry. A caller must still provide all history/geometry/output cross
+terms; none of these derivative maps creates a stochastic covariance,
+qualifies uncertainty, or permits current native LIO graph admission.
+
+The opt-in native stochastic observer now composes those maps into one
+first-order shared covariance model. Its exact sampled midpoint propagation
+retains original IMU endpoint errors across neighboring/wheel-split intervals;
+`native_imu_sample_period` explicitly declares the noise PSD-to-sample
+conversion. Stationary mean/current-sample correlation, frozen actual LIO
+gain/subspace/whitening, stored raw-point support, and 18D output memory share
+the same bounded minimal basis. Outstanding asynchronous tasks pin their
+original sufficient basis and subsequent primitive drivers until commit or
+discard. A delayed commit joins candidate internal/history/geometry memory to
+the actual live output without replacing published snapshots, even after
+ordinary history retirement. Capacity overflow is rejection, not truncation.
+
+`JointErrorLookup` and `JointErrorMotionBetween` expose this coherent model
+separately from unchanged nominal diagnostic marginals. They do not qualify
+calibrated uncertainty or source independence. Actual `NativeMotionBootstrap`
+retains bounded raw registration/deskew support when the observer is enabled.
+Frozen actual ICP gains, source/target voxel membership and normal derivatives
+are propagated through the relative-pose chain, gyro interpolation and causal
+translation deskew. Numerical sensitivities of the unchanged initializer finish
+the startup model; initial-state/frontier-IMU covariance preserves reuse by the
+next propagation. The owner's declared residual initial uncertainty remains a
+separate uncalibrated assumption. Caller-supplied time/transform-only startup,
+nonunique branches, missing or retired support remain explicitly unmodeled.
+This does not qualify execution deadlines or actual map-source independence.
+
+`PrepareJointLidarScan` retains the actual pre-correction deskewed source points
+and their loadings in this same basis. Once per frontier, after serialized
+commits and before graph export, it finalizes the augmented error snapshot
+without changing the nominal ODOM or its published marginal. Stored scans and
+their dependencies retire together. This is not permission to revise a node
+already consumed by the graph.
+
+The opt-in `ScanToMapRequest::joint_scan` path composes actual frozen ICP
+source/seed derivatives with that native basis. It requires complete seed
+support, a full observed pose and a deterministic versioned map assumption.
+Range/voxel selection retains original source-point identity; shared raw/deskew
+errors are not duplicated as independent pose noise. Its covariance and cross
+blocks are separate from the unchanged residual-Hessian diagnostics. It does
+not model map construction/survey uncertainty or qualify calibration.
+
+Conditional motion and source noise may be positive semidefinite. A normalized spectral
+decomposition represents zero modes as exact error-chain equations and keeps
+positive modes stochastic, without artificial priors or epsilon process noise.
+Fixed-lag marginalization and observed-subspace factors preserve those
+constraints. Cross-time sources connect the original measurement pose to their
+explicit retained conditioning-error node. Delayed cold acquisition assembles
+the needed trajectory and anchor in one graph update, without an unanchored
+intermediate solver. Conditional updates re-eliminate the same retained factors
+pose-first instead of recombining constrained Bayes separators; this preserves
+rank without adding noise, another solver or a fallback.
+
+The opt-in Apollo consumer transports one bounded, immutable joint snapshot,
+its actual motion cross-covariance/source IDs and optional shared scan after
+the frontier's serialized LIO commits. The nominal ODOM wire is unchanged.
+Explicit configuration selects exactly one diagnostic or target-graph owner,
+including across alignment reset and consumer ACK barriers. Shared map ICP
+uses the transported actual points/loadings and a fully modeled local seed;
+it cannot re-decode an independent raw cloud or use an unmodeled posterior
+seed. The deterministic-map assumption and external GNSS source declarations
+remain explicit. The cross-process regression covers fully delayed actual raw
+scans, same-graph map/GGA updates and unchanged local ODOM, not live throughput,
+two-capture target-graph acceptance or calibrated accuracy.
 
 This entry is synchronous and has no hidden queue: the host schedules delayed
 observations after their exact retained ODOM node exists; neither graph
@@ -212,6 +328,50 @@ does not establish zero translational velocity or wheel-qualified motion
 confidence. Consumers must distinguish `EvaluateIntegrity()` from
 `Evaluate()`; without trusted wheel evidence, the latter reports degraded
 motion eligibility even when the state is initialized and finite.
+
+`NativeOdometry` is the explicit public PIMPL boundary for that same native
+owner, linked with `//:native_odometry`. Local value contracts live under
+`include/openloc/localization/local/`; private candidates include those exact
+definitions instead of maintaining a second configuration/state model.
+No private estimator, PCL, GTSAM or middleware type appears in the facade
+header. Raw IMU/wheel/timed LiDAR, relative-motion initialization, exact state
+lookup, integrity/capability and diagnostic tracing delegate to the existing
+owner. Opaque delayed LiDAR tasks retain its owner identity, epoch, complete
+IMU catch-up and single-commit rules. The host serializes owner calls and joins
+a snapshot worker before commit; the facade introduces neither a scheduler
+nor another estimator. Optional `NativeMotionBootstrap`
+(`//:native_motion_bootstrap`) now exposes the existing relative startup
+registration behind a PIMPL, without private/PCL/middleware types in its public
+header. It consumes the same ordered calibrated IMU and previous raw scan,
+then submits only relative poses to `NativeOdometry::InitializeMotion`;
+no supplied map, absolute seed or second local owner is introduced.
+The host still selects startup policy and feeds scans at the actual local
+IMU frontier; asynchronous decode/worker policy and publication remain outside
+the algorithm. Neither facade starts threads or automatically runs a sensor
+application.
+The native replay and delayed worker use this entry. Native LIO still revokes
+joint-error qualification; the boundary does not manufacture graph motion,
+accept absolute corrections, publish TF or establish production readiness.
+
+Apollo's opt-in host consumer is outside this library, under
+`modules/openloc_localization/`. Its IMU-only executable feeds this public
+owner and a separate Cyber snapshot timer; diagnostic messages retain native
+IMU-origin/local-ODOM semantics instead of masquerading as ENU/rear-axle
+`LocalizationEstimate`. Diagnostic TF edges use epoch-specific frame names and
+the original measurement time; stale samples carry no pose. This does not
+move Cyber into OpenLoc. A second executable adds strict calibrated raw
+point-cloud ingress, public relative startup and LIO in one bounded owner
+worker. Three optimized recorded-data worker arms preserve exact native ODOM
+and scan-frontier decisions; the recorded adapter bypasses Cyber sensor readers.
+The host can now execute public LIO snapshots off-owner, retain accepted IMUs
+and commit after exact catch-up without rewriting published poses; overdue
+tasks are discarded. Startup geometry still shares the owner thread.
+Three separate-process recorded Cyber runs also consume all source IMU/cloud
+messages with explicit original receive-clock/replay labels and idempotent
+admission acknowledgements. This is diagnostic delivery evidence, not a
+qualification of open-loop live ingress or source latency.
+A complete global application, independent startup scheduling, reset protocol and qualified 100 Hz output
+are not implemented by this boundary.
 
 The current wheel contract is a signed base-forward speed in m/s at the
 estimator motion reference, with variance in (m/s)^2; sensor adapters own

@@ -625,6 +625,48 @@ class LocalizationEngine::Impl {
     const Eigen::Vector3d antenna_in_odom =
         antenna_pose.pose.translation - alignment_reference_in_odom_ +
         antenna_pose.pose.rotation * config_.gnss_antenna_in_base;
+    if (!has_admitted_fix_ && !heading_initialized_ &&
+        config_.enable_single_antenna_bootstrap) {
+      internal::GnssAlignmentRecoveryObservation observation;
+      observation.timestamp_ns = fix.timestamp.nanoseconds;
+      observation.odom_antenna_xy = antenna_in_odom.head<2>();
+      observation.global_antenna_xy = fix.position.head<2>();
+      observation.covariance_xy = fix.covariance.topLeftCorner<2, 2>();
+      internal::GnssAlignmentRecoveryDiagnostics bootstrap_diagnostics;
+      internal::GnssAlignmentRecoveryCandidate candidate;
+      status = recovery_.AddObservation(observation, &bootstrap_diagnostics,
+                                        &candidate);
+      if (!status.ok()) {
+        recovery_.Reset();
+        return status;
+      }
+
+      FactorRecord record;
+      record.timestamp_ns = fix.timestamp.nanoseconds;
+      record.source = "gnss_single_antenna_bootstrap";
+      record.type = "GLOBAL_XY_YAW";
+      record.residual =
+          Eigen::VectorXd::Constant(1, bootstrap_diagnostics.training_rms_m);
+      record.normalized_innovation_squared =
+          bootstrap_diagnostics.validation_nis;
+      record.innovation_threshold =
+          internal::GnssAlignmentRecoveryConfig{}.innovation_gate_threshold;
+      record.covariance_diagonal = fix.covariance.diagonal();
+      record.state_id = segment->state_id;
+      record.reason = bootstrap_diagnostics.reason;
+      record.accepted = bootstrap_diagnostics.candidate_validated;
+      AppendRecord(std::move(record));
+      if (!bootstrap_diagnostics.candidate_validated) {
+        return Status(StatusCode::kRejectedMeasurement,
+                      "single-antenna bootstrap awaits observable baseline "
+                      "and GNSS holdout validation");
+      }
+
+      return CommitRecoveryCandidate(
+          fix, candidate, bootstrap_diagnostics,
+          "single_antenna_course_bootstrap_holdout_validated", true);
+    }
+
     internal::GnssFactorDiagnostics diagnostics;
     const bool initializing = !has_admitted_fix_;
     if (fix.horizontal_only()) {
@@ -669,68 +711,16 @@ class LocalizationEngine::Impl {
         observation.covariance_xy = fix.covariance.topLeftCorner<2, 2>();
         internal::GnssAlignmentRecoveryDiagnostics recovery_diagnostics;
         internal::GnssAlignmentRecoveryCandidate candidate;
-        const Status recovery_status = recovery_.AddRejectedObservation(
+        const Status recovery_status = recovery_.AddObservation(
             observation, &recovery_diagnostics, &candidate);
         if (!recovery_status.ok()) {
           recovery_.Reset();
           return recovery_status;
         }
         if (recovery_diagnostics.candidate_validated) {
-          Eigen::Vector4d recovered_alignment;
-          recovered_alignment.head<2>() =
-              candidate.global_from_odom_xy_yaw.head<2>();
-          recovered_alignment[3] = candidate.global_from_odom_xy_yaw[2];
-          Eigen::Vector4d recovered_sigma = config_.initial_alignment_sigma;
-          recovered_sigma.head<2>() = candidate.sigma_xy_yaw.head<2>();
-          recovered_sigma[3] = candidate.sigma_xy_yaw[2];
-          internal::AlignmentEstimate current_estimate;
-          status = smoother_->Estimate(&current_estimate);
-          if (!status.ok()) {
-            recovery_.Reset();
-            return status;
-          }
-          recovered_alignment[2] = current_estimate.map_from_odom[2];
-          recovered_sigma[2] = std::max(
-              recovered_sigma[2],
-              std::sqrt(std::max(0.0, current_estimate.covariance(2, 2))));
-          uint64_t recovered_state_id = 0;
-          status = smoother_->Reanchor(latest_odometry_timestamp_ns_,
-                                       recovered_alignment, recovered_sigma,
-                                       &recovered_state_id);
-          if (!status.ok()) {
-            recovery_.Reset();
-            return status;
-          }
-          segments_.clear();
-          segments_.push_back(
-              Segment{latest_odometry_timestamp_ns_, recovered_state_id});
-          distance_since_segment_m_ = 0.0;
-          pending_large_reset_count_ = 0;
-          ++alignment_revision_;
-          last_admitted_fix_ = fix.timestamp;
-          has_admitted_fix_ = true;
-          last_good_fix_ = fix;
-          has_previous_quality_fix_ = true;
-          FactorRecord recovery_record;
-          recovery_record.timestamp_ns = fix.timestamp.nanoseconds;
-          recovery_record.source = "gnss_recovery";
-          recovery_record.type = "GLOBAL_XY_YAW";
-          recovery_record.residual =
-              Eigen::VectorXd::Constant(1, recovery_diagnostics.training_rms_m);
-          recovery_record.normalized_innovation_squared =
-              recovery_diagnostics.validation_nis;
-          recovery_record.innovation_threshold =
-              internal::GnssAlignmentRecoveryConfig{}.innovation_gate_threshold;
-          recovery_record.accepted = true;
-          recovery_record.reason = "recovery_holdout_validated_global_reanchor";
-          recovery_record.state_id = recovered_state_id;
-          AppendRecord(std::move(recovery_record));
-          recovery_.Reset();
-          status = ApplyCorrectionPolicy();
-          if (!status.ok()) {
-            return status;
-          }
-          return RefreshEstimate();
+          return CommitRecoveryCandidate(
+              fix, candidate, recovery_diagnostics,
+              "recovery_holdout_validated_global_reanchor", false);
         }
       } else {
         recovery_.Reset();
@@ -745,6 +735,88 @@ class LocalizationEngine::Impl {
         has_admitted_vertical_fix_ || !fix.horizontal_only();
     last_good_fix_ = fix;
     has_previous_quality_fix_ = true;
+    status = ApplyCorrectionPolicy();
+    if (!status.ok()) {
+      return status;
+    }
+    return RefreshEstimate();
+  }
+
+  Status CommitRecoveryCandidate(
+      const PositionFix& fix,
+      const internal::GnssAlignmentRecoveryCandidate& candidate,
+      const internal::GnssAlignmentRecoveryDiagnostics& diagnostics,
+      const std::string& reason, bool initial_bootstrap) {
+    Eigen::Vector4d recovered_alignment;
+    recovered_alignment.head<2>() = candidate.global_from_odom_xy_yaw.head<2>();
+    recovered_alignment[3] = candidate.global_from_odom_xy_yaw[2];
+    Eigen::Vector4d recovered_sigma = config_.initial_alignment_sigma;
+    recovered_sigma.head<2>() = candidate.sigma_xy_yaw.head<2>();
+    recovered_sigma[3] = candidate.sigma_xy_yaw[2];
+    internal::AlignmentEstimate current_estimate;
+    Status status = smoother_->Estimate(&current_estimate);
+    if (!status.ok()) {
+      recovery_.Reset();
+      return status;
+    }
+    recovered_alignment[2] = current_estimate.map_from_odom[2];
+    recovered_sigma[2] =
+        std::max(recovered_sigma[2],
+                 std::sqrt(std::max(0.0, current_estimate.covariance(2, 2))));
+    uint64_t recovered_state_id = 0;
+    status =
+        smoother_->Reanchor(latest_odometry_timestamp_ns_, recovered_alignment,
+                            recovered_sigma, &recovered_state_id);
+    if (!status.ok()) {
+      recovery_.Reset();
+      return status;
+    }
+    segments_.clear();
+    segments_.push_back(
+        Segment{latest_odometry_timestamp_ns_, recovered_state_id});
+    distance_since_segment_m_ = 0.0;
+    pending_large_reset_count_ = 0;
+    ++alignment_revision_;
+    last_admitted_fix_ = fix.timestamp;
+    has_admitted_fix_ = true;
+    has_admitted_vertical_fix_ =
+        has_admitted_vertical_fix_ || !fix.horizontal_only();
+    last_good_fix_ = fix;
+    has_previous_quality_fix_ = true;
+
+    if (initial_bootstrap) {
+      if (factor_records_.empty() ||
+          factor_records_.back().timestamp_ns != fix.timestamp.nanoseconds ||
+          factor_records_.back().source != "gnss_single_antenna_bootstrap") {
+        recovery_.Reset();
+        return Status(StatusCode::kStateUnavailable,
+                      "validated bootstrap record is unavailable");
+      }
+      FactorRecord& bootstrap_record = factor_records_.back();
+      bootstrap_record.residual =
+          Eigen::VectorXd::Constant(1, diagnostics.training_rms_m);
+      bootstrap_record.normalized_innovation_squared =
+          diagnostics.validation_nis;
+      bootstrap_record.accepted = true;
+      bootstrap_record.reason = reason;
+      bootstrap_record.state_id = recovered_state_id;
+    } else {
+      FactorRecord recovery_record;
+      recovery_record.timestamp_ns = fix.timestamp.nanoseconds;
+      recovery_record.source = "gnss_recovery";
+      recovery_record.type = "GLOBAL_XY_YAW";
+      recovery_record.residual =
+          Eigen::VectorXd::Constant(1, diagnostics.training_rms_m);
+      recovery_record.normalized_innovation_squared =
+          diagnostics.validation_nis;
+      recovery_record.innovation_threshold =
+          internal::GnssAlignmentRecoveryConfig{}.innovation_gate_threshold;
+      recovery_record.accepted = true;
+      recovery_record.reason = reason;
+      recovery_record.state_id = recovered_state_id;
+      AppendRecord(std::move(recovery_record));
+    }
+    recovery_.Reset();
     status = ApplyCorrectionPolicy();
     if (!status.ok()) {
       return status;
@@ -853,6 +925,9 @@ class LocalizationEngine::Impl {
     heading_initialized_ = true;
     has_admitted_heading_ = true;
     last_admitted_heading_ = heading.timestamp;
+    if (!has_admitted_fix_) {
+      recovery_.Reset();
+    }
     return RefreshEstimate();
   }
 
@@ -1110,13 +1185,17 @@ class LocalizationEngine::Impl {
 
   void AppendRecord(FactorRecord record) {
     if (record.reason != "pending_odometry_bracket") {
-      const auto pending =
-          std::find_if(factor_records_.rbegin(), factor_records_.rend(),
-                       [&record](const FactorRecord& existing) {
-                         return existing.timestamp_ns == record.timestamp_ns &&
-                                existing.source == record.source &&
-                                existing.reason == "pending_odometry_bracket";
-                       });
+      const auto pending = std::find_if(
+          factor_records_.rbegin(), factor_records_.rend(),
+          [&record](const FactorRecord& existing) {
+            const bool same_source =
+                existing.source == record.source ||
+                (existing.source == "gnss" &&
+                 record.source == "gnss_single_antenna_bootstrap" &&
+                 (existing.type == "ABS_POS2" || existing.type == "ABS_POS3"));
+            return existing.timestamp_ns == record.timestamp_ns &&
+                   same_source && existing.reason == "pending_odometry_bracket";
+          });
       if (pending != factor_records_.rend()) {
         *pending = std::move(record);
         result_.factor_records = factor_records_;

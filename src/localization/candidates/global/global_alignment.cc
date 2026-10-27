@@ -13,6 +13,7 @@
 #include "Eigen/Cholesky"
 #include "Eigen/LU"
 #include "candidates/global/fixed_lag_graph.h"
+#include "alignment_recovery.h"
 
 namespace openloc {
 namespace localization {
@@ -41,6 +42,14 @@ GlobalAlignment::GlobalAlignment(const GlobalConfig& config)
 GlobalAlignment::~GlobalAlignment() = default;
 
 Result GlobalAlignment::ValidateConfig() const {
+  if (config_.graph_allow_uncalibrated_inputs && !config_.enable_fixed_lag_graph)
+    return {Reason::CONFIG_INVALID,
+            "Uncalibrated modeled inputs require the fixed-lag graph owner"};
+  if (config_.enable_diagnostic_horizontal_bootstrap &&
+      (!config_.diagnostic_only || config_.enable_fixed_lag_graph)) {
+    return {Reason::CONFIG_INVALID,
+            "Horizontal bootstrap requires the explicit diagnostic owner"};
+  }
   if (config_.enable_fixed_lag_graph &&
       (config_.diagnostic_only || !config_.motion_error_model_qualified ||
        !std::isfinite(config_.graph_solve_budget_ms) ||
@@ -48,6 +57,7 @@ Result GlobalAlignment::ValidateConfig() const {
        !std::isfinite(config_.graph_robust_threshold) ||
        config_.graph_robust_threshold <= 0.0 || config_.graph_max_states < 2 ||
        config_.graph_max_observations < 1 ||
+       config_.graph_max_error_dimension < 15 ||
        config_.graph_max_iterations == 0 ||
        config_.graph_max_iterations > 100 ||
        !std::isfinite(config_.graph_max_linearization_angle) ||
@@ -95,6 +105,8 @@ Result GlobalAlignment::Reject(Reason reason, const std::string& message,
 }
 
 void GlobalAlignment::ClearEpoch(const Epoch& epoch) {
+  horizontal_bootstrap_.reset();
+  horizontal_source_.clear();
   graph_.reset();
   motion_history_.clear();
   history_.clear();
@@ -103,7 +115,8 @@ void GlobalAlignment::ClearEpoch(const Epoch& epoch) {
   evidence_.clear();
   state_ = GlobalState();
   state_.epoch = epoch;
-  state_.diagnostic_only = config_.diagnostic_only;
+  state_.diagnostic_only =
+      config_.diagnostic_only || config_.graph_allow_uncalibrated_inputs;
   candidate_frames_ = 0;
   candidate_time_ = 0.0;
   reason_ = Reason::GLOBAL_UNAVAILABLE;
@@ -127,6 +140,18 @@ Result GlobalAlignment::AddLocal(const LocalState& local,
   }
   if (retired_sessions_.count(local.epoch.session) != 0) {
     return {Reason::EPOCH_MISMATCH, "retired producer session"};
+  }
+  if (config_.enable_fixed_lag_graph) {
+    if (local.joint_error &&
+        local.joint_error->covariance.rows() > config_.graph_max_error_dimension) {
+      Invalidate(Reason::INVALID_INPUT);
+      return {Reason::INVALID_INPUT, "Joint error exceeds configured graph capacity"};
+    }
+    const auto joint = ValidateJointLocalError(local);
+    if (!joint.ok()) {
+      Invalidate(joint.reason);
+      return joint;
+    }
   }
   if (!history_.empty()) {
     const auto& last = history_.back();
@@ -165,7 +190,8 @@ Result GlobalAlignment::AddLocal(const LocalState& local,
     history_.clear();
     motion_history_.clear();
   }
-  if (!config_.diagnostic_only && !local.uncertainty_qualified) {
+  if (!config_.diagnostic_only && !config_.graph_allow_uncalibrated_inputs &&
+      !local.uncertainty_qualified) {
     return {Reason::UNCERTAINTY_UNQUALIFIED,
             "local uncertainty model is unqualified"};
   }
@@ -186,6 +212,11 @@ Result GlobalAlignment::AddLocal(const LocalState& local,
       return {
           Reason::HISTORY_UNAVAILABLE,
           "Motion gap revoked global alignment; fresh local history retained"};
+    }
+    const auto joint = ValidateJointMotion(history_.back(), local, *motion);
+    if (!joint.ok()) {
+      Invalidate(joint.reason);
+      return joint;
     }
     motion_history_[local.stamp.time] = *motion;
   }
@@ -233,6 +264,7 @@ Result GlobalAlignment::SeedDiagnostic(const Eigen::Isometry3d& map_to_odom,
 void GlobalAlignment::AdoptGraphState() {
   const uint64_t correction = state_.correction_id + 1;
   state_ = graph_->state();
+  state_.diagnostic_only = config_.graph_allow_uncalibrated_inputs;
   state_.correction_id = correction;
 }
 
@@ -245,15 +277,33 @@ Result GlobalAlignment::InitializeGraph(const GlobalObservation& observation,
   policy.robust_threshold = config_.graph_robust_threshold;
   policy.max_states = config_.graph_max_states;
   policy.max_observations = config_.graph_max_observations;
+  policy.max_error_dimension = config_.graph_max_error_dimension;
   policy.max_iterations = config_.graph_max_iterations;
   policy.max_linearization_angle = config_.graph_max_linearization_angle;
   std::unique_ptr<FixedLagGraph> candidate(new FixedLagGraph(policy));
-  auto result = candidate->Initialize(local, observation);
+  std::vector<LocalState> bootstrap;
+  std::vector<MotionIncrement> bootstrap_motion;
+  const double conditioning_time =
+      observation.local_error_time.value_or(observation.stamp.time);
+  if (observation.conditional_local_error_qualified) {
+    for (const auto& snapshot : history_) {
+      if (snapshot.stamp.time <= local.stamp.time ||
+          snapshot.stamp.time > conditioning_time)
+        continue;
+      const auto motion = motion_history_.find(snapshot.stamp.time);
+      if (motion == motion_history_.end())
+        return {Reason::HISTORY_UNAVAILABLE, "Graph bootstrap motion is missing"};
+      bootstrap.push_back(snapshot);
+      bootstrap_motion.push_back(motion->second);
+    }
+  }
+  auto result = candidate->Initialize(local, observation, bootstrap, bootstrap_motion);
   if (!result.ok()) {
     return result;
   }
   for (const auto& snapshot : history_) {
-    if (snapshot.stamp.time <= local.stamp.time) {
+    if (snapshot.stamp.time <= (bootstrap.empty() ? local.stamp.time :
+                                                  bootstrap.back().stamp.time)) {
       continue;
     }
     const auto motion = motion_history_.find(snapshot.stamp.time);
@@ -338,7 +388,10 @@ Result GlobalAlignment::Observe(const GlobalObservation& observation) {
     return Reject(valid_config.reason, valid_config.message, &source);
   }
   if (observation.source.empty() || !observation.quality_valid ||
-      (config_.enable_fixed_lag_graph && !observation.independent_of_local) ||
+      (config_.enable_fixed_lag_graph && !observation.independent_of_local &&
+       !observation.conditional_local_error_qualified) ||
+      (!config_.enable_fixed_lag_graph &&
+       observation.conditional_local_error_qualified) ||
       !ValidGlobalObservationGeometry(observation) ||
       observation.stamp.sequence == 0 ||
       !std::isfinite(observation.stamp.time) || observation.stamp.time <= 0.0 ||
@@ -349,7 +402,7 @@ Result GlobalAlignment::Observe(const GlobalObservation& observation) {
                       observation.stamp.receive_time)) {
     return Reject(Reason::INVALID_INPUT, "invalid global evidence", &source);
   }
-  if (!config_.diagnostic_only &&
+  if (!config_.diagnostic_only && !config_.graph_allow_uncalibrated_inputs &&
       (!observation.uncertainty_qualified || observation.diagnostic_only)) {
     return Reject(Reason::UNCERTAINTY_UNQUALIFIED,
                   "global observation covariance is unqualified", &source);
@@ -377,6 +430,14 @@ Result GlobalAlignment::Observe(const GlobalObservation& observation) {
   if (observation.epoch != state_.epoch) {
     return Reject(Reason::EPOCH_MISMATCH, "global observation epoch mismatch",
                   &source);
+  }
+  if (observation.conditional_local_error_qualified) {
+    LocalState local;
+    const auto found = LookupExact(
+        observation.local_error_time.value_or(observation.stamp.time), &local);
+    if (!found.ok()) return Reject(found.reason, found.message, &source);
+    const auto model = FixedLagGraph::ValidateConditionalObservation(local, observation);
+    if (!model.ok()) return Reject(model.reason, model.message, &source);
   }
   if (config_.enable_fixed_lag_graph && graph_ && state_.valid &&
       observation.stamp.receive_time - state_.last_full_observation >
@@ -501,6 +562,9 @@ Result GlobalAlignment::Observe(const GlobalObservation& observation) {
     }
     state_.verifying = false;
     candidate_frames_ = 0;
+    state_.horizontal.reset();
+    horizontal_bootstrap_.reset();
+    horizontal_source_.clear();
   } else {
     if (observation.stamp.time < state_.last_observation) {
       return Reject(Reason::TIMESTAMP_REGRESSION,
@@ -560,6 +624,10 @@ Result GlobalAlignment::ObservePartial(const GlobalObservation& observation,
       return Reject(Reason::GLOBAL_UNAVAILABLE,
                     "projected pose requires a verified alignment basin",
                     source);
+    }
+    if (config_.enable_diagnostic_horizontal_bootstrap &&
+        observation.kind == GlobalObservation::Kind::HORIZONTAL_POSITION) {
+      return ObserveHorizontal(observation, local, source);
     }
     // A directly measured point is useful before global rotation is known.
     evidence_[observation.source] = {observation, local};
@@ -662,12 +730,143 @@ Result GlobalAlignment::ObservePartial(const GlobalObservation& observation,
   return {};
 }
 
+Result GlobalAlignment::ObserveHorizontal(const GlobalObservation& observation,
+                                         const LocalState& local,
+                                         SourceCounters* source) {
+  if (!observation.measurement_timestamp_ns) {
+    return Reject(Reason::INVALID_INPUT,
+                  "Horizontal acquisition requires original integer time",
+                  source);
+  }
+  if (!horizontal_source_.empty() &&
+      horizontal_source_ != observation.source) {
+    return Reject(Reason::INVALID_INPUT,
+                  "Horizontal acquisition uses one declared position source",
+                  source);
+  }
+  if (state_.horizontal &&
+      observation.stamp.time - state_.horizontal->last_observation >
+          config_.global_timeout) {
+    state_.horizontal.reset();
+    horizontal_bootstrap_.reset();
+  }
+  const Eigen::Vector2d antenna =
+      (local.position + local.orientation * observation.point_in_base).head<2>();
+  std::string message;
+  if (!state_.horizontal) {
+    if (!horizontal_bootstrap_) {
+      horizontal_bootstrap_ =
+          std::make_unique<internal::GnssAlignmentRecovery>();
+      horizontal_source_ = observation.source;
+    }
+    internal::GnssAlignmentRecoveryObservation input;
+    input.timestamp_ns = *observation.measurement_timestamp_ns;
+    input.odom_antenna_xy = antenna;
+    input.global_antenna_xy = observation.pose.translation().head<2>();
+    input.covariance_xy = observation.covariance.topLeftCorner<2, 2>();
+    internal::GnssAlignmentRecoveryDiagnostics diagnostics;
+    internal::GnssAlignmentRecoveryCandidate candidate;
+    const auto status =
+        horizontal_bootstrap_->AddObservation(input, &diagnostics, &candidate);
+    if (!status.ok()) {
+      return Reject(Reason::INVALID_INPUT, status.message(), source);
+    }
+    message = diagnostics.reason;
+    if (diagnostics.candidate_validated) {
+      const double yaw = candidate.global_from_odom_xy_yaw.z();
+      HorizontalGlobalState horizontal;
+      horizontal.odom_reference_xy = candidate.odom_reference_xy;
+      horizontal.alignment.head<2>() =
+          candidate.global_from_odom_xy_yaw.head<2>() +
+          Eigen::Rotation2Dd(yaw) * candidate.odom_reference_xy;
+      horizontal.alignment.z() = yaw;
+      horizontal.covariance =
+          candidate.sigma_xy_yaw.array().square().matrix().asDiagonal();
+      state_.horizontal = horizontal;
+      horizontal_bootstrap_.reset();
+      ++state_.correction_id;
+    }
+  } else {
+    if (observation.stamp.time < state_.horizontal->last_observation) {
+      return Reject(Reason::TIMESTAMP_REGRESSION,
+                    "horizontal observation older than committed frontier",
+                    source);
+    }
+    auto predicted = Predict(observation.stamp.time).horizontal.value();
+    const Eigen::Matrix2d rotation =
+        Eigen::Rotation2Dd(predicted.alignment.z()).toRotationMatrix();
+    const Eigen::Vector2d rotated =
+        rotation * (antenna - predicted.odom_reference_xy);
+    Eigen::Matrix<double, 2, 3> h;
+    h.leftCols<2>().setIdentity();
+    h.col(2) = Eigen::Vector2d(-rotated.y(), rotated.x());
+    const Eigen::Vector2d residual =
+        observation.pose.translation().head<2>() -
+        (rotated + predicted.alignment.head<2>());
+    Eigen::Matrix<double, 2, 6> local_jacobian;
+    local_jacobian.leftCols<3>() = rotation *
+        Eigen::Matrix<double, 2, 3>::Identity();
+    local_jacobian.rightCols<3>() =
+        -local_jacobian.leftCols<3>() *
+        local.orientation.toRotationMatrix() * Skew(observation.point_in_base);
+    const Eigen::Matrix2d noise =
+        2.0 * (observation.covariance.topLeftCorner<2, 2>() +
+               local_jacobian * PoseCovariance(local) *
+                   local_jacobian.transpose());
+    const Eigen::Matrix2d innovation =
+        2.0 * (h * predicted.covariance * h.transpose() + noise);
+    const double distance = residual.dot(innovation.ldlt().solve(residual));
+    if (!std::isfinite(distance) || distance > config_.innovation_gate) {
+      return Reject(Reason::INNOVATION_REJECTED,
+                    "horizontal innovation rejected", source);
+    }
+    // Diagnostic CI only; preserve the unmeasured conditional prior.
+    const Eigen::Matrix2d measured = h * predicted.covariance * h.transpose();
+    const Eigen::Matrix3d information =
+        predicted.covariance.ldlt().solve(Eigen::Matrix3d::Identity()) -
+        0.5 * h.transpose() * measured.ldlt().solve(h) +
+        0.5 * h.transpose() * noise.ldlt().solve(h);
+    predicted.covariance =
+        information.ldlt().solve(Eigen::Matrix3d::Identity());
+    predicted.alignment +=
+        predicted.covariance * (0.5 * h.transpose() * noise.ldlt().solve(residual));
+    predicted.alignment.z() = std::atan2(std::sin(predicted.alignment.z()),
+                                        std::cos(predicted.alignment.z()));
+    predicted.covariance =
+        (0.5 * (predicted.covariance + predicted.covariance.transpose())).eval();
+    if (!predicted.alignment.allFinite() ||
+        !predicted.covariance.allFinite() ||
+        predicted.covariance.llt().info() != Eigen::Success) {
+      return Reject(Reason::INVALID_INPUT,
+                    "horizontal update is not finite positive definite",
+                    source);
+    }
+    state_.horizontal = predicted;
+    ++state_.correction_id;
+    message = "diagnostic_horizontal_updated";
+  }
+  if (state_.horizontal) {
+    state_.horizontal->last_observation = observation.stamp.time;
+    state_.horizontal->last_observation_ns =
+        *observation.measurement_timestamp_ns;
+    state_.horizontal->covariance_time = observation.stamp.time;
+  }
+  evidence_[observation.source] = {observation, local};
+  ++source->accepted;
+  source->reason = Reason::NONE;
+  reason_ = Reason::DEGENERATE;
+  return {Reason::NONE, message};
+}
+
 void GlobalAlignment::Invalidate(Reason reason) {
   graph_.reset();
   state_.valid = false;
   state_.verifying = false;
   candidate_frames_ = 0;
   evidence_.clear();
+  state_.horizontal.reset();
+  horizontal_bootstrap_.reset();
+  horizontal_source_.clear();
   reason_ = reason;
 }
 
@@ -678,7 +877,7 @@ Result GlobalAlignment::Evaluate(double now) const {
   if (history_.empty()) {
     return {Reason::HISTORY_UNAVAILABLE, "local history empty"};
   }
-  if (config_.diagnostic_only) {
+  if (config_.diagnostic_only || config_.graph_allow_uncalibrated_inputs) {
     return {Reason::INVALID_INPUT,
             "diagnostic covariance/prior cannot qualify trusted output"};
   }
@@ -709,6 +908,16 @@ Result GlobalAlignment::Evaluate(double now) const {
 
 GlobalState GlobalAlignment::Predict(double time) const {
   GlobalState predicted = state_;
+  if (predicted.horizontal && std::isfinite(time) &&
+      time > predicted.horizontal->covariance_time) {
+    auto& horizontal = *predicted.horizontal;
+    const double elapsed = time - horizontal.covariance_time;
+    horizontal.covariance.diagonal().head<2>().array() +=
+        elapsed * config_.position_drift_variance_rate;
+    horizontal.covariance(2, 2) +=
+        elapsed * config_.attitude_drift_variance_rate;
+    horizontal.covariance_time = time;
+  }
   if (predicted.valid && std::isfinite(time) && time > state_.covariance_time) {
     const double elapsed = time - state_.covariance_time;
     Matrix6d reference_noise = Matrix6d::Zero();

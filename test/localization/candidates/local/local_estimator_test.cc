@@ -26,6 +26,16 @@ namespace unified {
 
 class LocalEstimatorTestAccess {
  public:
+  static void RecordInternal(LocalEstimator* estimator, const LocalState& state,
+                             bool lidar_correction = false) {
+    estimator->state_ = state;
+    estimator->RecordInternalHistory(lidar_correction);
+  }
+  static Result LookupInternal(const LocalEstimator& estimator, double time,
+                               LocalState* state,
+                               LocalEstimator::InternalHistoryErrorMap* map = nullptr) {
+    return estimator.LookupInternal(time, state, map);
+  }
   static void SetWheelBiasFeedback(LocalEstimator* estimator, bool gyro,
                                    bool accel, bool forward_only = false) {
     estimator->wheel_updates_gyro_bias_ = gyro;
@@ -34,8 +44,9 @@ class LocalEstimatorTestAccess {
   }
   static Result Propagate(const LocalEstimator& estimator,
                           const ImuSample& start, const ImuSample& end,
-                          LocalState* state, Matrix15d* transition) {
-    return estimator.Propagate(start, end, state, transition);
+                          LocalState* state, Matrix15d* transition,
+                          NativeJointError* observer = nullptr) {
+    return estimator.Propagate(start, end, state, transition, observer);
   }
   static Result UpdateWheel(LocalEstimator* estimator, const WheelSample& wheel,
                             const ImuSample& imu, LocalState* state,
@@ -74,6 +85,129 @@ LocalConfig TestConfig() {
   config.max_attitude_std = 1.0;
   config.innovation_gate = 100.0;
   return config;
+}
+
+TEST(LocalEstimatorHistoryTest, DoesNotSpreadLidarCorrectionsIntoEarlierMotion) {
+  LocalEstimator local(TestConfig());
+  LocalState left;
+  left.epoch = {"history", 1};
+  left.valid = true;
+  left.stamp = {1.0, 1.0, 1, "test-clock"};
+  left.velocity = Eigen::Vector3d::UnitX();
+  LocalEstimatorTestAccess::RecordInternal(&local, left);
+  LocalState propagated = left;
+  propagated.stamp.time = 1.02;
+  propagated.position.x() = 0.02;
+  LocalEstimatorTestAccess::RecordInternal(&local, propagated);
+  LocalState corrected = propagated;
+  corrected.position.x() += 0.2;
+  corrected.velocity.x() += 0.5;
+  corrected.orientation = ExpRotation(Eigen::Vector3d(0.0, 0.0, 0.1));
+  LocalEstimatorTestAccess::RecordInternal(&local, corrected, true);
+  LocalState at;
+  ASSERT_TRUE(LocalEstimatorTestAccess::LookupInternal(local, 1.01, &at).ok());
+  EXPECT_NEAR(at.position.x(), 0.01, 1e-12);
+  EXPECT_DOUBLE_EQ(at.velocity.x(), 1.0);
+  EXPECT_NEAR(LogRotation(at.orientation).norm(), 0.0, 1e-12);
+  ASSERT_TRUE(LocalEstimatorTestAccess::LookupInternal(local, 1.02, &at).ok());
+  EXPECT_TRUE(at.position.isApprox(corrected.position));
+  EXPECT_TRUE(at.orientation.isApprox(corrected.orientation));
+
+  LocalState next = corrected;
+  next.stamp.time = 1.04;
+  next.position.x() += 0.03;
+  LocalEstimatorTestAccess::RecordInternal(&local, next);
+  ASSERT_TRUE(LocalEstimatorTestAccess::LookupInternal(local, 1.03, &at).ok());
+  EXPECT_NEAR(at.position.x(), 0.235, 1e-12);
+  EXPECT_DOUBLE_EQ(at.velocity.x(), 1.5);
+  EXPECT_TRUE(at.orientation.isApprox(corrected.orientation));
+}
+
+TEST(LocalEstimatorHistoryTest, ErrorMapUsesActualPreCorrectionSlerpEndpoints) {
+  LocalState first;
+  first.epoch = {"history-error", 1};
+  first.valid = true;
+  first.stamp = {1, 1, 1, "test-clock"};
+  first.orientation = ExpRotation(Eigen::Vector3d(0.2, -0.1, 0.3));
+  LocalState second = first;
+  second.stamp = {1.02, 1.02, 2, "test-clock"};
+  second.position = Eigen::Vector3d(0.1, 0.02, 0);
+  second.orientation = ExpRotation(Eigen::Vector3d(-0.4, 0.2, -0.1));
+  auto evaluate = [&](const LocalState& left, const LocalState& right,
+                      LocalState* state,
+                      LocalEstimator::InternalHistoryErrorMap* map) {
+    LocalEstimator local(TestConfig());
+    LocalEstimatorTestAccess::RecordInternal(&local, left);
+    LocalEstimatorTestAccess::RecordInternal(&local, right);
+    auto corrected = right;
+    corrected.position.x() += 3;
+    corrected.orientation = ExpRotation(Eigen::Vector3d(0.7, 0.4, -0.5));
+    LocalEstimatorTestAccess::RecordInternal(&local, corrected, true);
+    return LocalEstimatorTestAccess::LookupInternal(local, 1.007, state, map);
+  };
+  LocalState nominal;
+  LocalEstimator::InternalHistoryErrorMap map;
+  ASSERT_TRUE(evaluate(first, second, &nominal, &map).ok());
+  EXPECT_TRUE(map.second_propagated);
+  EXPECT_DOUBLE_EQ(map.first.time, first.stamp.time);
+  EXPECT_DOUBLE_EQ(map.second.time, second.stamp.time);
+  EXPECT_EQ(map.second.sequence, second.stamp.sequence);
+  EXPECT_NEAR(map.first_error(0, 0), 0.65, 1e-12);
+  EXPECT_NEAR(map.second_error(0, 0), 0.35, 1e-12);
+  constexpr double step = 1e-6;
+  for (int endpoint = 0; endpoint < 2; ++endpoint) {
+    for (int axis = 0; axis < 3; ++axis) {
+      auto perturb = [&](double delta) {
+        auto left = first;
+        auto right = second;
+        Eigen::Vector3d rotation = Eigen::Vector3d::Zero();
+        rotation[axis] = delta;
+        auto& perturbed = endpoint == 0 ? left : right;
+        perturbed.orientation *= ExpRotation(rotation);
+        LocalState result;
+        EXPECT_TRUE(evaluate(left, right, &result, nullptr).ok());
+        return Eigen::Vector3d(
+            LogRotation(nominal.orientation.conjugate() * result.orientation));
+      };
+      const Eigen::Vector3d derivative =
+          (perturb(step) - perturb(-step)) / (2 * step);
+      const Matrix15d& jacobian = endpoint == 0 ? map.first_error : map.second_error;
+      EXPECT_TRUE(derivative.isApprox(jacobian.block<3, 1>(6, 6 + axis), 1e-8));
+    }
+  }
+  second.orientation.coeffs() *= -1;
+  LocalState opposite_quaternion;
+  LocalEstimator::InternalHistoryErrorMap opposite_map;
+  ASSERT_TRUE(evaluate(first, second, &opposite_quaternion, &opposite_map).ok());
+  EXPECT_TRUE(opposite_map.first_error.isApprox(map.first_error, 1e-12));
+  EXPECT_TRUE(opposite_map.second_error.isApprox(map.second_error, 1e-12));
+}
+
+TEST(LocalEstimatorHistoryTest, NonuniqueInterpolationCannotOverwriteErrorModel) {
+  LocalEstimator local(TestConfig());
+  LocalState first;
+  first.valid = true;
+  first.stamp = {1, 1, 1, "test-clock"};
+  first.epoch = {"history-error", 1};
+  LocalEstimatorTestAccess::RecordInternal(&local, first);
+  auto second = first;
+  second.stamp = {1.02, 1.02, 2, "test-clock"};
+  second.orientation = ExpRotation(Eigen::Vector3d(std::acos(-1), 0, 0));
+  LocalEstimatorTestAccess::RecordInternal(&local, second);
+  LocalState output;
+  output.position.x() = 42;
+  LocalEstimator::InternalHistoryErrorMap map;
+  map.first_error(0, 0) = 42;
+  EXPECT_EQ(LocalEstimatorTestAccess::LookupInternal(local, 1.01, &output, &map).reason,
+            Reason::CORRELATION_UNQUALIFIED);
+  EXPECT_DOUBLE_EQ(output.position.x(), 42);
+  EXPECT_DOUBLE_EQ(map.first_error(0, 0), 42);
+  ASSERT_TRUE(LocalEstimatorTestAccess::LookupInternal(local, 1.02, &output, &map).ok());
+  EXPECT_FALSE(map.second_propagated);
+  EXPECT_TRUE(map.first_error.isIdentity());
+  EXPECT_TRUE(map.second_error.isZero());
+  EXPECT_DOUBLE_EQ(map.first.time, 1.02);
+  EXPECT_DOUBLE_EQ(map.second.time, 1.02);
 }
 
 void EnableTestLidar(LocalConfig* config) {
@@ -203,6 +337,115 @@ class LocalEstimatorTest : public ::testing::Test {
   LocalConfig config_;
   std::unique_ptr<LocalEstimator> estimator_;
 };
+
+class LocalEstimatorLidarTaskTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    config_ = TestConfig();
+    EnableTestLidar(&config_);
+    config_.allow_imu_only_initialization = true;
+    estimator_ = std::make_unique<LocalEstimator>(config_);
+    for (uint64_t sequence = 1; sequence <= 3; ++sequence) {
+      estimator_->AddImu(MakeImu(1.0 + 0.01 * (sequence - 1), sequence));
+    }
+    ASSERT_TRUE(estimator_->state().valid);
+    ASSERT_EQ(estimator_->AddLidar(CorridorScan(estimator_->internal_state(), 1)).reason,
+              Reason::GEOMETRY_UNAVAILABLE);
+    estimator_->AddImu(MakeImu(1.03, 4));
+    ASSERT_TRUE(estimator_->EvaluateIntegrity(1.03).ok());
+  }
+
+  std::unique_ptr<LocalEstimator::LidarTask> Prepare() {
+    std::unique_ptr<LocalEstimator::LidarTask> task;
+    const auto result = estimator_->PrepareLidarTask(
+        CorridorScan(estimator_->internal_state(), 2, 0.1), &task);
+    EXPECT_TRUE(result.ok()) << result.message;
+    return task;
+  }
+
+  LocalConfig config_;
+  std::unique_ptr<LocalEstimator> estimator_;
+};
+
+TEST_F(LocalEstimatorLidarTaskTest, CatchUpCommitsOnlyPrivateStateAndGeometry) {
+  auto task = Prepare();
+  ASSERT_NE(task, nullptr);
+  const LocalState before_compute = estimator_->state();
+  ASSERT_TRUE(task->Compute().ok());
+  ExpectSameState(before_compute, estimator_->state());
+  EXPECT_EQ(task->Compute().reason, Reason::DUPLICATE);
+  const ImuSample next = MakeImu(1.04, 5);
+  estimator_->AddImu(next);
+  const LocalState before_commit = estimator_->state();
+  EXPECT_EQ(estimator_->CommitLidarTask(task.get()).reason, Reason::HISTORY_UNAVAILABLE);
+  ExpectSameState(before_commit, estimator_->state());
+  ASSERT_EQ(task->ReplayImu(next).reason, Reason::CORRELATION_UNQUALIFIED);
+  ASSERT_TRUE(estimator_->CommitLidarTask(task.get()).ok());
+  ExpectSameState(task->internal_state(), estimator_->internal_state());
+  LocalState expected_output = before_commit;
+  expected_output.covariance_model_valid = false;
+  ExpectSameState(expected_output, estimator_->state());
+  LocalState published;
+  ASSERT_TRUE(estimator_->Lookup(1.03, &published).ok());
+  ExpectSameState(before_compute, published);
+  EXPECT_EQ(estimator_->CommitLidarTask(task.get()).reason, Reason::INVALID_INPUT);
+  EXPECT_EQ(task->ReplayImu(MakeImu(1.05, 6)).reason, Reason::INVALID_INPUT);
+  EXPECT_EQ(estimator_->AddImu(MakeImu(1.05, 6)).reason,
+            Reason::CORRELATION_UNQUALIFIED);
+  EXPECT_TRUE(estimator_->EvaluateIntegrity(1.05).ok());
+  EXPECT_FALSE(estimator_->state().covariance_model_valid);
+  EXPECT_EQ(estimator_->last_motion(), nullptr);
+}
+
+TEST_F(LocalEstimatorLidarTaskTest, RejectsSiblingOwnerAndConcurrentLidarCommit) {
+  auto task = Prepare();
+  auto sibling = Prepare();
+  ASSERT_TRUE(task->Compute().ok());
+  ASSERT_TRUE(sibling->Compute().ok());
+  LocalEstimator other(config_);
+  EXPECT_EQ(other.CommitLidarTask(task.get()).reason, Reason::INVALID_INPUT);
+  ASSERT_TRUE(estimator_->CommitLidarTask(task.get()).ok());
+  const LocalState committed = estimator_->internal_state();
+  EXPECT_EQ(estimator_->CommitLidarTask(sibling.get()).reason, Reason::LIDAR_STALE);
+  ExpectSameState(committed, estimator_->internal_state());
+}
+
+TEST_F(LocalEstimatorLidarTaskTest, RejectsSkippedReplayAndOldEpoch) {
+  auto task = Prepare();
+  ASSERT_TRUE(task->Compute().ok());
+  estimator_->AddImu(MakeImu(1.04, 5));
+  estimator_->AddImu(MakeImu(1.05, 6));
+  task->ReplayImu(MakeImu(1.05, 6));
+  EXPECT_EQ(estimator_->CommitLidarTask(task.get()).reason, Reason::HISTORY_UNAVAILABLE);
+  LocalState reset = estimator_->internal_state();
+  ++reset.epoch.generation;
+  LocalEstimatorTestAccess::RecordInternal(estimator_.get(), reset);
+  EXPECT_EQ(estimator_->CommitLidarTask(task.get()).reason, Reason::EPOCH_MISMATCH);
+}
+
+TEST_F(LocalEstimatorLidarTaskTest, RejectsExpiredTaskWithoutOutputMutation) {
+  auto task = Prepare();
+  ASSERT_TRUE(task->Compute().ok());
+  for (uint64_t sequence = 5; sequence <= 15; ++sequence) {
+    const ImuSample sample = MakeImu(1.0 + 0.01 * (sequence - 1), sequence);
+    estimator_->AddImu(sample);
+    task->ReplayImu(sample);
+  }
+  const LocalState before = estimator_->state();
+  EXPECT_EQ(estimator_->CommitLidarTask(task.get()).reason, Reason::LIDAR_STALE);
+  ExpectSameState(before, estimator_->state());
+}
+
+TEST_F(LocalEstimatorTest, LidarTaskRejectsWheelAidedInstance) {
+  EnableTestLidar(&config_);
+  estimator_ = std::make_unique<LocalEstimator>(config_);
+  Initialize();
+  std::unique_ptr<LocalEstimator::LidarTask> task;
+  EXPECT_EQ(estimator_->PrepareLidarTask(
+      CorridorScan(estimator_->internal_state(), 1), &task).reason,
+      Reason::CORRELATION_UNQUALIFIED);
+  EXPECT_EQ(task, nullptr);
+}
 
 TEST(LocalEstimatorConfigTest, RejectsMissingInvalidAndUnrepresentableConfig) {
   std::vector<LocalConfig> invalid;
@@ -425,14 +668,21 @@ TEST_F(LocalEstimatorTest,
   EXPECT_EQ(estimator_->AddLidar(CorridorScan(estimator_->internal_state(), 1))
                 .reason,
             Reason::GEOMETRY_UNAVAILABLE);
+  EXPECT_TRUE(estimator_->state().covariance_model_valid);
   ASSERT_TRUE(estimator_->AddWheel(MakeWheel(1.03, 4)).ok());
   ASSERT_TRUE(estimator_->AddImu(MakeImu(1.03, 4)).ok());
   const LocalState published_before = estimator_->state();
+  ASSERT_NE(estimator_->last_motion(), nullptr);
   ASSERT_TRUE(
       estimator_->AddLidar(CorridorScan(estimator_->internal_state(), 2, 0.1))
           .ok());
   EXPECT_FALSE(estimator_->internal_state().covariance_model_valid);
   EXPECT_FALSE(estimator_->state().covariance_model_valid);
+  LocalState retained;
+  ASSERT_TRUE(estimator_->Lookup(published_before.stamp.time, &retained).ok());
+  EXPECT_FALSE(retained.covariance_model_valid);
+  ASSERT_TRUE(estimator_->Lookup(1.02, &retained).ok());
+  EXPECT_TRUE(retained.covariance_model_valid);
   EXPECT_EQ(estimator_->Evaluate(estimator_->state().stamp.time).reason,
             Reason::CORRELATION_UNQUALIFIED);
   EXPECT_EQ(estimator_->last_motion(), nullptr);
@@ -597,6 +847,32 @@ TEST_F(LocalEstimatorTest, TiltAlignmentUsesConfiguredGravityAndGyroAverage) {
   EXPECT_LT(estimator_->state().velocity.norm(), 1e-12);
   EXPECT_LT(estimator_->state().position.norm(), 1e-12);
   ExpectPositiveCovariance(estimator_->state());
+}
+
+TEST(LocalEstimatorDiagnosticsTest, PropagationTraceRetainsNonzeroBiases) {
+  LocalEstimator local(TestConfig());
+  std::vector<LocalEstimatorTrace> trace;
+  local.SetTraceCallback(
+      [&trace](const LocalEstimatorTrace& event) { trace.push_back(event); });
+  LocalState state;
+  state.covariance = Matrix15d::Identity() * 0.01;
+  state.gyro_bias = Eigen::Vector3d(0.01, -0.02, 0.03);
+  state.accel_bias = Eigen::Vector3d(0.1, -0.2, 0.3);
+  const LocalState before = state;
+  const ImuSample start = MakeImu(1.0, 1);
+  const ImuSample end = MakeImu(1.01, 2);
+  Matrix15d transition = Matrix15d::Identity();
+  ASSERT_TRUE(LocalEstimatorTestAccess::Propagate(
+      local, start, end, &state, &transition).ok());
+  ASSERT_EQ(trace.size(), 1U);
+  EXPECT_TRUE(trace[0].gyro_bias_before.isApprox(before.gyro_bias));
+  EXPECT_TRUE(trace[0].gyro_bias_after.isApprox(state.gyro_bias));
+  EXPECT_TRUE(trace[0].accel_bias_before.isApprox(before.accel_bias));
+  EXPECT_TRUE(trace[0].accel_bias_after.isApprox(state.accel_bias));
+  EXPECT_TRUE(trace[0].specific_force_body.isApprox(
+      start.acceleration - before.accel_bias));
+  EXPECT_TRUE(trace[0].angular_rate_body.isApprox(
+      start.angular_velocity - before.gyro_bias));
 }
 
 TEST(LocalEstimatorDiagnosticsTest,
@@ -987,7 +1263,9 @@ TEST(LocalEstimatorFeedbackDiagnosticTest,
 
 TEST(LocalEstimatorPropagationTest,
      ErrorTransitionMatchesFiniteDifferenceOfMechanization) {
-  const LocalConfig config = TestConfig();
+  LocalConfig config = TestConfig();
+  config.enable_native_joint_error = true;
+  config.native_imu_sample_period = 0.02;
   const LocalEstimator estimator(config);
   LocalState nominal;
   nominal.position = Eigen::Vector3d(0.4, -0.2, 0.1);
@@ -1008,6 +1286,15 @@ TEST(LocalEstimatorPropagationTest,
   ASSERT_TRUE(LocalEstimatorTestAccess::Propagate(estimator, start, end,
                                                   &nominal_end, &transition)
                   .ok());
+  NativeJointError model(config);
+  model.Initialize(nominal);
+  model.BeginImu(start, end);
+  LocalState observed = nominal;
+  Matrix15d ignored_transition = Matrix15d::Identity();
+  ASSERT_TRUE(LocalEstimatorTestAccess::Propagate(
+      estimator, start, end, &observed, &ignored_transition, &model).ok());
+  ASSERT_TRUE(model.active()) << model.status().message;
+  const Eigen::MatrixXd stochastic_state = model.Get("internal");
 
   const auto perturb = [](LocalState* state, int index, double amount) {
     if (index < 3) {
@@ -1054,6 +1341,37 @@ TEST(LocalEstimatorPropagationTest,
         (2.0 * epsilon);
     EXPECT_LT((numerical - transition.col(column)).cwiseAbs().maxCoeff(), 2e-5)
         << "error_state_column=" << column;
+    EXPECT_LT((numerical - stochastic_state.col(column)).cwiseAbs().maxCoeff(), 1e-8)
+        << "exact_sampled_error_column=" << column;
+  }
+  for (int endpoint = 0; endpoint < 2; ++endpoint) {
+    const Eigen::MatrixXd raw = model.Get(endpoint == 0 ? "imu:first" : "imu:last");
+    const Eigen::MatrixXd covariance = raw * raw.transpose();
+    const Eigen::MatrixXd loading =
+        covariance.llt().solve(raw * stochastic_state.transpose()).transpose();
+    for (int column = 0; column < 6; ++column) {
+      auto positive_start = start, negative_start = start;
+      auto positive_end = end, negative_end = end;
+      auto& positive = endpoint == 0 ? positive_start : positive_end;
+      auto& negative = endpoint == 0 ? negative_start : negative_end;
+      if (column < 3) {
+        positive.acceleration[column] += epsilon;
+        negative.acceleration[column] -= epsilon;
+      } else {
+        positive.angular_velocity[column - 3] += epsilon;
+        negative.angular_velocity[column - 3] -= epsilon;
+      }
+      LocalState plus = nominal, minus = nominal;
+      Matrix15d unused = Matrix15d::Identity();
+      ASSERT_TRUE(LocalEstimatorTestAccess::Propagate(
+          estimator, positive_start, positive_end, &plus, &unused).ok());
+      ASSERT_TRUE(LocalEstimatorTestAccess::Propagate(
+          estimator, negative_start, negative_end, &minus, &unused).ok());
+      const Eigen::Matrix<double, 15, 1> numerical =
+          (error(nominal_end, plus) - error(nominal_end, minus)) / (2 * epsilon);
+      EXPECT_LT((numerical - loading.col(column)).cwiseAbs().maxCoeff(), 1e-8)
+          << "raw endpoint=" << endpoint << " column=" << column;
+    }
   }
 }
 

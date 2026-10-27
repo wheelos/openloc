@@ -18,7 +18,8 @@ namespace localization {
 namespace unified {
 
 Result DeskewLidarScan(const LidarScan& scan, const StateLookup& lookup,
-                       DeskewedScan* deskewed) {
+                       DeskewedScan* deskewed,
+                       std::vector<DeskewPointError>* errors) {
   if (deskewed == nullptr || scan.points.empty() ||
       scan.epoch.session.empty() || scan.epoch.generation == 0 ||
       scan.frame_id.empty() || scan.calibration_id.empty() ||
@@ -43,6 +44,8 @@ Result DeskewLidarScan(const LidarScan& scan, const StateLookup& lookup,
   next.stamp = scan.stamp;
   next.epoch = scan.epoch;
   next.points_in_end_base.reserve(scan.points.size());
+  std::vector<DeskewPointError> next_errors;
+  if (errors) next_errors.reserve(scan.points.size());
   const Eigen::Isometry3d end_from_local = Pose(end).inverse();
   for (const auto& point : scan.points) {
     if (!point.position.allFinite() || !std::isfinite(point.time) ||
@@ -63,8 +66,26 @@ Result DeskewLidarScan(const LidarScan& scan, const StateLookup& lookup,
     }
     next.points_in_end_base.push_back(end_from_local * Pose(at_point) *
                                       scan.base_from_lidar * point.position);
+    if (errors) {
+      DeskewPointError error;
+      error.point_time = point.time;
+      const Eigen::Matrix3d point_rotation =
+          end_from_local.linear() * at_point.orientation.toRotationMatrix();
+      error.point_state.block<3, 3>(0, 0) = end_from_local.linear();
+      error.point_state.block<3, 3>(0, 6) =
+          -point_rotation * Skew(scan.base_from_lidar * point.position);
+      error.end_state.block<3, 3>(0, 0) = -end_from_local.linear();
+      error.end_state.block<3, 3>(0, 6) =
+          Skew(next.points_in_end_base.back());
+      error.raw_point = point_rotation * scan.base_from_lidar.linear();
+      if (!error.point_state.allFinite() || !error.end_state.allFinite() ||
+          !error.raw_point.allFinite())
+        return {Reason::INVALID_INPUT, "LiDAR deskew error map is nonfinite"};
+      next_errors.push_back(std::move(error));
+    }
   }
   *deskewed = std::move(next);
+  if (errors) *errors = std::move(next_errors);
   return {};
 }
 
@@ -95,6 +116,93 @@ std::vector<uint64_t> LocalLio::geometry_source_sequences() const {
     sequences.push_back(scan.sequence);
   }
   return sequences;
+}
+
+std::vector<std::pair<uint64_t, std::size_t>>
+LocalLio::stored_point_counts() const {
+  std::vector<std::pair<uint64_t, std::size_t>> counts;
+  for (const auto& scan : scans_)
+    counts.emplace_back(scan.sequence, scan.points.size());
+  return counts;
+}
+
+Result LocalLio::GeometryErrorMap(
+    std::vector<StoredPlaneError>* errors,
+    std::map<uint64_t, LocalState>* anchors) const {
+  if (!errors)
+    return {Reason::INVALID_INPUT, "Stored-geometry error destination is missing"};
+  if (planes_.empty())
+    return {Reason::GEOMETRY_UNAVAILABLE, "No retained local planes to linearize"};
+  std::unordered_map<VoxelKey, std::vector<StoredPlanePointError>, VoxelHash> support;
+  std::map<uint64_t, LocalState> next_anchors;
+  std::unordered_set<uint64_t> source_sequences;
+  for (const auto& scan : scans_) {
+    if (scan.sequence == 0 || !source_sequences.insert(scan.sequence).second)
+      return {Reason::CORRELATION_UNQUALIFIED,
+              "Stored geometry has ambiguous raw source identities"};
+    if (anchors) next_anchors.emplace(scan.sequence, scan.anchor);
+    for (std::size_t index = 0; index < scan.points.size(); ++index) {
+      const auto& point = scan.points[index];
+      const auto key = Key(point);
+      if (planes_.find(key) == planes_.end()) continue;
+      const Eigen::Vector3d coordinate = point / config_.lidar_voxel_size;
+      if ((coordinate - coordinate.array().round().matrix())
+              .cwiseAbs().minCoeff() < 1e-8)
+        return {Reason::CORRELATION_UNQUALIFIED,
+                "Stored geometry lies on a voxel-assignment boundary"};
+      StoredPlanePointError item;
+      item.source_sequence = scan.sequence;
+      item.point_index = index;
+      item.point = point;
+      item.deskewed_point = scan.anchor.orientation.toRotationMatrix();
+      item.anchor_state.block<3, 3>(0, 0).setIdentity();
+      item.anchor_state.block<3, 3>(0, 6) =
+          -Skew(point - scan.anchor.position) * item.deskewed_point;
+      support[key].push_back(std::move(item));
+    }
+  }
+  std::vector<StoredPlaneError> next;
+  next.reserve(planes_.size());
+  for (const auto& plane : planes_) {
+    StoredPlaneError error;
+    error.center = plane.second.point;
+    error.normal = plane.second.normal;
+    error.points = std::move(support.at(plane.first));
+    const double count = static_cast<double>(error.points.size());
+    Eigen::Matrix3d second = Eigen::Matrix3d::Zero();
+    for (const auto& point : error.points)
+      second += point.point * point.point.transpose();
+    Eigen::Matrix3d covariance =
+        second / count - error.center * error.center.transpose();
+    covariance = (0.5 * (covariance + covariance.transpose())).eval();
+    const Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> solver(covariance);
+    if (solver.info() != Eigen::Success)
+      return {Reason::INVALID_INPUT, "Stored-plane eigendecomposition failed"};
+    const auto& values = solver.eigenvalues();
+    if (values[1] - values[0] <=
+        64 * std::numeric_limits<double>::epsilon() *
+            std::max(1.0, values.cwiseAbs().maxCoeff()))
+      return {Reason::CORRELATION_UNQUALIFIED,
+              "Stored-plane normal has no unique error derivative"};
+    for (auto& point : error.points) {
+      point.center = Eigen::Matrix3d::Identity() / count;
+      const Eigen::Vector3d centered = point.point - error.center;
+      for (int column = 1; column < 3; ++column) {
+        const Eigen::Vector3d direction = solver.eigenvectors().col(column);
+        point.normal +=
+            direction *
+            (centered.dot(error.normal) * direction.transpose() +
+             centered.dot(direction) * error.normal.transpose()) /
+            (count * (values[0] - values[column]));
+      }
+      if (!point.normal.allFinite())
+        return {Reason::INVALID_INPUT, "Stored-plane error derivative is nonfinite"};
+    }
+    next.push_back(std::move(error));
+  }
+  *errors = std::move(next);
+  if (anchors) *anchors = std::move(next_anchors);
+  return {};
 }
 
 void LocalLio::Rebuild() {
@@ -150,9 +258,11 @@ Result LocalLio::BuildUpdate(const DeskewedScan& scan, const LocalState& state,
   std::vector<Eigen::Matrix<double, 1, 15>> rows;
   std::vector<double> innovations;
   std::vector<double> variances;
+  std::vector<LioUpdate::Residual> residuals;
   std::unordered_set<VoxelKey, VoxelHash> used;
   const Eigen::Matrix3d rotation = state.orientation.toRotationMatrix();
-  for (const auto& point_in_base : scan.points_in_end_base) {
+  for (std::size_t index = 0; index < scan.points_in_end_base.size(); ++index) {
+    const auto& point_in_base = scan.points_in_end_base[index];
     const Eigen::Vector3d point = Pose(state) * point_in_base;
     const VoxelKey key = Key(point);
     const auto found = planes_.find(key);
@@ -180,6 +290,7 @@ Result LocalLio::BuildUpdate(const DeskewedScan& scan, const LocalState& state,
     rows.push_back(row);
     innovations.push_back(-residual);
     variances.push_back(variance);
+    residuals.push_back({index, plane.point, plane.normal});
   }
   if (rows.size() < config_.lidar_min_correspondences) {
     return {Reason::GEOMETRY_UNAVAILABLE,
@@ -235,20 +346,55 @@ Result LocalLio::BuildUpdate(const DeskewedScan& scan, const LocalState& state,
   update->noise = Eigen::MatrixXd::Identity(rank, rank);
   update->observed_pose_basis = basis;
   update->correspondences = rows.size();
+  update->residuals = std::move(residuals);
+  update->residual_projection = observed_rows;
+  for (std::size_t i = 0; i < variances.size(); ++i)
+    update->residual_projection.col(i) /= std::sqrt(variances[i]);
   return {};
 }
 
-Result LocalLio::ApplyUpdate(const LioUpdate& update, LocalState* state) const {
+Result LocalLio::ApplyUpdate(const LioUpdate& update, const LocalState& prior,
+                             LocalState* state,
+                             Eigen::MatrixXd* applied_gain) const {
+  Eigen::Matrix<double, 15, 1> error;
+  error.segment<3>(0) = state->position - prior.position;
+  error.segment<3>(3) = state->velocity - prior.velocity;
+  error.segment<3>(6) =
+      LogRotation(prior.orientation.conjugate() * state->orientation);
+  error.segment<3>(9) = state->gyro_bias - prior.gyro_bias;
+  error.segment<3>(12) = state->accel_bias - prior.accel_bias;
+  const Eigen::Vector3d attitude_error = error.segment<3>(6);
+  const double squared_angle = attitude_error.squaredNorm();
+  double first = 0.5;
+  double second = 1.0 / 6.0;
+  if (squared_angle < 1e-8) {
+    first -= squared_angle / 24.0;
+    second -= squared_angle / 120.0;
+  } else {
+    const double angle = std::sqrt(squared_angle);
+    first = (1.0 - std::cos(angle)) / squared_angle;
+    second = (angle - std::sin(angle)) / (angle * squared_angle);
+  }
+  const Eigen::Matrix3d skew = Skew(attitude_error);
+  Matrix15d chart = Matrix15d::Identity();
+  chart.block<3, 3>(6, 6) =
+      Eigen::Matrix3d::Identity() - first * skew + second * skew * skew;
+  const Matrix15d covariance =
+      chart * prior.covariance * chart.transpose();
+  const Eigen::Matrix<double, 15, 1> prior_step = chart * error;
   const Eigen::MatrixXd innovation_covariance =
-      update.observation * state->covariance * update.observation.transpose() +
+      update.observation * covariance * update.observation.transpose() +
       update.noise;
   Eigen::LDLT<Eigen::MatrixXd> factor(innovation_covariance);
   if (factor.info() != Eigen::Success) {
     return {Reason::INVALID_INPUT, "LiDAR innovation covariance is invalid"};
   }
   const Eigen::MatrixXd gain =
-      factor.solve(update.observation * state->covariance).transpose();
-  const Eigen::Matrix<double, 15, 1> correction = gain * update.innovation;
+      factor.solve(update.observation * covariance).transpose();
+  // Relinearize one observation against its fixed prior, rather than counting
+  // the same scan as another independent update on every iteration.
+  const Eigen::Matrix<double, 15, 1> correction =
+      gain * (update.innovation + update.observation * prior_step) - prior_step;
   LocalState next = *state;
   next.position += correction.segment<3>(0);
   next.velocity += correction.segment<3>(3);
@@ -259,9 +405,18 @@ Result LocalLio::ApplyUpdate(const LioUpdate& update, LocalState* state) const {
   // The local planes reuse earlier local states and raw points. Their exact
   // cross-correlation is not available here, so they may steer the nominal
   // state but cannot reduce the filter covariance as independent anchors.
-  next.covariance = state->covariance;
+  next.covariance_model_valid = false;
+  next.uncertainty_qualified = false;
+  Eigen::Matrix<double, 15, 1> total;
+  total.segment<3>(0) = next.position - prior.position;
+  total.segment<3>(3) = next.velocity - prior.velocity;
+  total.segment<3>(6) =
+      LogRotation(prior.orientation.conjugate() * next.orientation);
+  total.segment<3>(9) = next.gyro_bias - prior.gyro_bias;
+  total.segment<3>(12) = next.accel_bias - prior.accel_bias;
+  next.covariance = prior.covariance;
   next.covariance.diagonal() += config_.lidar_correction_variance_scale *
-                                correction.cwiseProduct(correction);
+                                total.cwiseProduct(total);
   next.covariance =
       (0.5 * (next.covariance + next.covariance.transpose())).eval();
   if (!next.position.allFinite() || !next.velocity.allFinite() ||
@@ -270,6 +425,7 @@ Result LocalLio::ApplyUpdate(const LioUpdate& update, LocalState* state) const {
     return {Reason::INVALID_INPUT, "LiDAR update is not finite SPD"};
   }
   *state = next;
+  if (applied_gain) *applied_gain = gain;
   return {};
 }
 
@@ -277,6 +433,7 @@ void LocalLio::Insert(const DeskewedScan& scan, const LocalState& state) {
   StoredScan stored;
   stored.epoch = scan.epoch;
   stored.sequence = scan.stamp.sequence;
+  stored.anchor = state;
   stored.anchor_variance = state.covariance.block<3, 3>(0, 0).trace() +
                            config_.lidar_voxel_size * config_.lidar_voxel_size *
                                state.covariance.block<3, 3>(6, 6).trace();
@@ -292,7 +449,8 @@ void LocalLio::Insert(const DeskewedScan& scan, const LocalState& state) {
 }
 
 Result LocalLio::Observe(const LidarScan& scan, const StateLookup& lookup,
-                         LocalState* state) {
+                         LocalState* state,
+                         const LioIterationObserver& observer) {
   if (state == nullptr || !state->valid || scan.epoch != state->epoch) {
     return {Reason::EPOCH_MISMATCH,
             "LiDAR update requires the current local epoch"};
@@ -318,10 +476,13 @@ Result LocalLio::Observe(const LidarScan& scan, const StateLookup& lookup,
     if (!result.ok()) {
       return result;
     }
-    result = ApplyUpdate(update, &candidate);
+    const LocalState before = candidate;
+    result = ApplyUpdate(update, *state, &candidate,
+                         observer ? &update.applied_gain : nullptr);
     if (!result.ok()) {
       return result;
     }
+    if (observer) observer(update, *state, before, candidate);
   }
   *state = candidate;
   observed_pose_basis_ = update.observed_pose_basis;

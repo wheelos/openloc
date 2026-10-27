@@ -109,11 +109,15 @@ TEST(LocalMotionTest, PositiveCovarianceWithoutErrorModelCannotProduceMotion) {
   MotionIncrement output;
   output.correlation_group = "unchanged";
   end.covariance_model_valid = false;
-  EXPECT_EQ(Reason::INVALID_INPUT,
+  EXPECT_EQ(Reason::CORRELATION_UNQUALIFIED,
             ComputeMotionIncrement(start, end, start.covariance,
                                    Sources(), &output).reason);
   end.covariance_model_valid = true;
   start.covariance_model_valid = false;
+  EXPECT_EQ(Reason::CORRELATION_UNQUALIFIED,
+            ComputeMotionIncrement(start, end, start.covariance,
+                                   Sources(), &output).reason);
+  end.position.x() = std::numeric_limits<double>::quiet_NaN();
   EXPECT_EQ(Reason::INVALID_INPUT,
             ComputeMotionIncrement(start, end, start.covariance,
                                    Sources(), &output).reason);

@@ -105,7 +105,8 @@ message Quaternion {
   optional double qw = 4;
 }
 
-message Pose {
+// Distinct from the public global/online Pose value contract.
+message HealthPose {
   optional Point3D position = 1;
   optional Quaternion orientation = 2;
   optional Point3D linear_velocity = 3;
@@ -121,7 +122,7 @@ message Uncertainty {
 
 message LocalizationEstimate {
   optional Header header = 1;
-  optional Pose pose = 2;
+  optional HealthPose pose = 2;
   optional Uncertainty uncertainty = 3;
   optional double measurement_time = 4;
 }

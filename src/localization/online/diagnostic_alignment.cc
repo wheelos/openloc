@@ -54,6 +54,8 @@ class DiagnosticGlobalAlignment::Impl {
         ValidateGeodeticReference(config.reference.geodetic);
     if (!reference_status.ok()) return reference_status;
     if (config.reference.id.empty() || config.reference.version.empty() ||
+        (config.enable_horizontal_bootstrap &&
+         !config.assume_gravity_aligned_odom) ||
         config.reference.calibration_id.empty() ||
         config.reference.geodetic.state !=
             GeodeticReferenceState::kDiagnosticOnly ||
@@ -88,6 +90,8 @@ class DiagnosticGlobalAlignment::Impl {
     policy.local_timeout = Seconds(config.maximum_odometry_age_ns);
     policy.global_timeout = Seconds(config.maximum_full_pose_age_ns);
     policy.diagnostic_only = true;
+    policy.enable_diagnostic_horizontal_bootstrap =
+        config.enable_horizontal_bootstrap;
     auto owner = std::make_unique<u::GlobalAlignment>(policy);
     const Status status = Convert(owner->ValidateConfig());
     if (!status.ok()) return status;
@@ -315,6 +319,30 @@ class DiagnosticGlobalAlignment::Impl {
           ValuePose(state.map_to_odom * Transform(latest_.pose)),
           state.covariance, state.correction_id};
     }
+    if (state.horizontal) {
+      const auto& horizontal = *state.horizontal;
+      const double yaw = horizontal.alignment.z();
+      const Eigen::Matrix2d rotation =
+          Eigen::Rotation2Dd(yaw).toRotationMatrix();
+      DiagnosticHorizontalEstimate estimate;
+      estimate.map_from_odom_xy_yaw.head<2>() =
+          horizontal.alignment.head<2>() -
+          rotation * horizontal.odom_reference_xy;
+      estimate.map_from_odom_xy_yaw.z() = yaw;
+      estimate.map_base_xy =
+          rotation * (latest_.pose.translation.head<2>() -
+                      horizontal.odom_reference_xy) +
+          horizontal.alignment.head<2>();
+      estimate.odom_reference_xy = horizontal.odom_reference_xy;
+      estimate.covariance = horizontal.covariance;
+      estimate.last_observation_time =
+          {horizontal.last_observation_ns, config_.clock_domain};
+      estimate.correction_id = state.correction_id;
+      result.horizontal_estimate = estimate;
+      result.horizontal_evidence_fresh =
+          evaluation_time.nanoseconds - horizontal.last_observation_ns <=
+              config_.maximum_full_pose_age_ns;
+    }
     *output = std::move(result);
     return Status::Ok();
   }
@@ -327,7 +355,10 @@ class DiagnosticGlobalAlignment::Impl {
   Status Apply(const GlobalObservationContext& context,
                const u::GlobalObservation& observation) {
     const uint64_t revision = owner_->state().correction_id;
-    const Status status = Convert(owner_->Observe(observation));
+    const auto observed = owner_->Observe(observation);
+    const Status status = observed.ok()
+                              ? Status(StatusCode::kOk, observed.message)
+                              : Convert(observed);
     const bool updated =
         status.ok() && owner_->state().correction_id != revision;
     if (updated && observation.kind == u::GlobalObservation::Kind::POSE) {

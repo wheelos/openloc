@@ -24,6 +24,9 @@ struct GnssQualityGatePolicy {
   double maximum_baseline_length_error_m;
   int64_t fixed_solution_stability_ns;
   int64_t maximum_fixed_solution_gap_ns;
+  // Diagnostic position admission only; NaN denotes missing receiver accuracy,
+  // never an estimated measurement covariance or qualified source.
+  bool allow_missing_horizontal_accuracy_diagnostic = false;
 };
 
 Status ValidateGnssQualityGatePolicy(const GnssQualityGatePolicy& policy);
@@ -65,7 +68,8 @@ class GnssQualityGate {
 
   GnssQualityDecision CheckInput(const Timestamp& timestamp,
                                  const GnssReceiverQuality& receiver,
-                                 const FixedSolutionTrack& track) const;
+                                 const FixedSolutionTrack& track,
+                                 bool allow_missing_accuracy = false) const;
   GnssQualityDecision CheckReceiver(const GnssReceiverQuality& receiver) const;
   GnssQualityDecision CheckStability(const Timestamp& timestamp,
                                      FixedSolutionTrack* track);
