@@ -109,7 +109,8 @@ void ContinuousOutput::Reset(const LocalState& internal) {
 Result ContinuousOutput::Advance(const LocalState& previous_internal,
                                  const LocalState& internal,
                                  const Matrix15d& error_transition,
-                                 double dt) {
+                                 double dt,
+                                 const Matrix15d* process_covariance) {
   if (!internal.valid || !std::isfinite(dt) || dt <= 0.0 ||
       internal.epoch != state_.epoch ||
       previous_internal.epoch != internal.epoch ||
@@ -160,10 +161,19 @@ Result ContinuousOutput::Advance(const LocalState& previous_internal,
     correction_status_ = {Reason::CORRECTION_BUDGET_EXCEEDED, detail.str()};
   }
   next.valid = true;
-  Matrix15d process_noise =
-      internal.covariance -
-      error_transition * previous_internal.covariance *
-          error_transition.transpose();
+  // Subtracting large propagated marginals can destroy small PSD noise terms.
+  Matrix15d process_noise;
+  if (process_covariance) {
+    process_noise = *process_covariance;
+  } else {
+    process_noise =
+        internal.covariance -
+        error_transition * previous_internal.covariance *
+            error_transition.transpose();
+  }
+  if (!process_noise.allFinite()) {
+    return {Reason::INVALID_INPUT, "Continuous-output process covariance is nonfinite"};
+  }
   process_noise =
       (0.5 * (process_noise + process_noise.transpose())).eval();
   Eigen::SelfAdjointEigenSolver<Matrix15d> noise_spectrum(process_noise);

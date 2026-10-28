@@ -167,6 +167,8 @@ Result LocalEstimator::ValidateConfig() const {
     return {Reason::CONFIG_INVALID,
             "Zero-velocity update needs a positive calibrated variance"};
   }
+  if (config_.diagnostic_lidar_tracking_gain && !config_.enable_lidar)
+    return {Reason::CONFIG_INVALID, "Diagnostic LiDAR gain requires LiDAR"};
   if (config_.enable_lidar &&
       (config_.lidar_frame.empty() || config_.lidar_calibration_id.empty() ||
        !Positive(config_.lidar_point_noise_std) ||
@@ -363,6 +365,7 @@ Result LocalEstimator::AddImu(const ImuSample& sample) {
       joint_error_.Set("previous_internal", joint_error_.Get("internal"));
     joint_error_.BeginImu(interval_start, sample);
     Matrix15d error_transition = Matrix15d::Identity();
+    Matrix15d process_covariance = Matrix15d::Zero();
     std::vector<SourceSampleId> sources{{"imu", interval_start.stamp.sequence},
                                         {"imu", sample.stamp.sequence}};
     sources.insert(sources.end(), pending_lidar_sources_.begin(),
@@ -376,7 +379,7 @@ Result LocalEstimator::AddImu(const ImuSample& sample) {
       const ImuSample at_wheel =
           InterpolateImu(interval_start, sample, wheel.stamp.time);
       result = Propagate(cursor, at_wheel, &working, &error_transition,
-                         &joint_error_);
+                         &joint_error_, &process_covariance);
       if (!result.ok()) {
         faulted_ = true;
         state_.valid = false;
@@ -399,7 +402,8 @@ Result LocalEstimator::AddImu(const ImuSample& sample) {
                         "model is invalid",
                         &wheel_health_);
       } else {
-        result = UpdateWheel(wheel, at_wheel, &working, &error_transition);
+        result = UpdateWheel(wheel, at_wheel, &working, &error_transition,
+                             &process_covariance);
         if (result.ok()) {
           sources.push_back({"wheel", wheel.stamp.sequence});
         }
@@ -408,7 +412,8 @@ Result LocalEstimator::AddImu(const ImuSample& sample) {
         wheel_result = result;
       }
     }
-    result = Propagate(cursor, sample, &working, &error_transition, &joint_error_);
+    result = Propagate(cursor, sample, &working, &error_transition, &joint_error_,
+                       &process_covariance);
     if (!result.ok()) {
       faulted_ = true;
       state_.valid = false;
@@ -426,19 +431,27 @@ Result LocalEstimator::AddImu(const ImuSample& sample) {
     if (config_.enable_zero_velocity_update &&
         stationarity_.Qualified(sample.stamp.time)) {
       stationary_result =
-          UpdateZeroVelocity(sample, &working, &error_transition);
+          UpdateZeroVelocity(sample, &working, &error_transition,
+                             &process_covariance);
       if (stationary_result.ok()) {
         sources.push_back({"zero_velocity", sample.stamp.sequence});
       }
     }
     working.stamp = sample.stamp;
     working.angular_velocity = sample.angular_velocity - working.gyro_bias;
+    if (config_.diagnostic_lidar_tracking_gain) {
+      lidar_gain_covariance_ =
+          (error_transition * lidar_gain_covariance_ * error_transition.transpose() +
+           process_covariance).eval();
+      lidar_gain_covariance_ =
+          (0.5 * (lidar_gain_covariance_ + lidar_gain_covariance_.transpose())).eval();
+    }
     state_ = working;
     state_.valid = true;
     if (lio_active_) {
       const Result output = continuous_output_.Advance(
           start_state, state_, error_transition,
-          sample.stamp.time - start_state.stamp.time);
+          sample.stamp.time - start_state.stamp.time, &process_covariance);
       if (!output.ok()) {
         state_.valid = false;
         faulted_ = true;
@@ -549,6 +562,7 @@ Result LocalEstimator::Initialize(const ImuSample& sample) {
             "Stationary initialization is not finite SPD"};
   }
   state_ = initial;
+  lidar_gain_covariance_ = initial.covariance;
   output_state_ = initial;
   continuous_output_.Reset(output_state_);
   initialized_ = true;
@@ -620,6 +634,7 @@ Result LocalEstimator::InitializeMotion(
     return {Reason::INVALID_INPUT,
             "Motion initialization produced invalid state"};
   state_ = initial;
+  lidar_gain_covariance_ = initial.covariance;
   output_state_ = initial;
   continuous_output_.Reset(initial);
   initialized_ = true;
@@ -657,7 +672,8 @@ Result LocalEstimator::InitializeMotion(
 Result LocalEstimator::Propagate(const ImuSample& start, const ImuSample& end,
                                  LocalState* state,
                                  Matrix15d* error_transition,
-                                 NativeJointError* observer) const {
+                                 NativeJointError* observer,
+                                 Matrix15d* process_covariance) const {
   // Inputs are already in body axes at the motion reference; the adapter owns
   // sensor rotation and lever-arm compensation.
   const double dt = end.stamp.time - start.stamp.time;
@@ -724,6 +740,11 @@ Result LocalEstimator::Propagate(const ImuSample& start, const ImuSample& end,
     return {Reason::INVALID_INPUT, "IMU propagation is not finite SPD"};
   }
   *state = next;
+  if (process_covariance) {
+    *process_covariance =
+        (transition * *process_covariance * transition.transpose() +
+         discrete_noise).eval();
+  }
   if (observer && observer->active()) {
     const Eigen::Vector3d phi = rotation * dt;
     const Eigen::Matrix3d half = ExpRotation(0.5 * phi).toRotationMatrix();
@@ -810,7 +831,8 @@ Result LocalEstimator::Propagate(const ImuSample& start, const ImuSample& end,
 
 Result LocalEstimator::UpdateWheel(const WheelSample& sample,
                                    const ImuSample& imu, LocalState* state,
-                                   Matrix15d* error_transition) {
+                                   Matrix15d* error_transition,
+                                   Matrix15d* process_covariance) {
   const int dimension = config_.use_nonholonomic_constraint ? 3 : 1;
   const Eigen::Matrix3d local_to_body =
       state->orientation.toRotationMatrix().transpose();
@@ -873,6 +895,11 @@ Result LocalEstimator::UpdateWheel(const WheelSample& sample,
                   &wheel_health_);
   }
   *state = next;
+  if (process_covariance) {
+    *process_covariance =
+        (residual * *process_covariance * residual.transpose() +
+         gain * measurement_noise * gain.transpose()).eval();
+  }
   joint_error_.AdvanceInternal(
       residual, gain * measurement_noise * gain.transpose());
   *error_transition = (residual * *error_transition).eval();
@@ -935,7 +962,8 @@ Result LocalEstimator::UpdateWheel(const WheelSample& sample,
 
 Result LocalEstimator::UpdateZeroVelocity(const ImuSample& imu,
                                           LocalState* state,
-                                          Matrix15d* error_transition) {
+                                          Matrix15d* error_transition,
+                                          Matrix15d* process_covariance) {
   Eigen::Matrix<double, 3, 15> observation =
       Eigen::Matrix<double, 3, 15>::Zero();
   observation.block<3, 3>(0, 3).setIdentity();
@@ -976,6 +1004,11 @@ Result LocalEstimator::UpdateZeroVelocity(const ImuSample& imu,
                   "Zero-velocity update is not finite SPD", &zupt_health_);
   }
   *state = next;
+  if (process_covariance) {
+    *process_covariance =
+        (residual * *process_covariance * residual.transpose() +
+         gain * measurement_noise * gain.transpose()).eval();
+  }
   joint_error_.AdvanceInternal(
       residual, gain * measurement_noise * gain.transpose());
   *error_transition = (residual * *error_transition).eval();
@@ -1419,7 +1452,8 @@ Result LocalEstimator::AddLidar(const LidarScan& scan) {
           const LocalState& before, const LocalState& after) {
         JointLidarIteration(update, prior, before, after,
                             joint_deskew, joint_planes);
-      });
+      },
+      config_.diagnostic_lidar_tracking_gain ? &lidar_gain_covariance_ : nullptr);
   if (!result.ok() && result.reason != Reason::GEOMETRY_UNAVAILABLE) {
     if (joint_before) joint_error_ = *joint_before;
     return Reject(result.reason, result.message, &lidar_health_);
@@ -1599,6 +1633,7 @@ Result LocalEstimator::CommitLidarTask(LidarTask* task) {
   // Only the private internal trajectory/geometry is replaced. The output
   // smoother and all previously published pose/velocity samples remain live.
   state_ = candidate.state_;
+  lidar_gain_covariance_ = candidate.lidar_gain_covariance_;
   lio_ = candidate.lio_;
   internal_history_ = candidate.internal_history_;
   joint_scans_ = candidate.joint_scans_;

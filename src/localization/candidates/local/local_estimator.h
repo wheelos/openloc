@@ -114,11 +114,14 @@ class LocalEstimator {
   Result Initialize(const ImuSample& sample);
   Result Propagate(const ImuSample& start, const ImuSample& end,
                    LocalState* state, Matrix15d* error_transition,
-                   NativeJointError* observer = nullptr) const;
+                   NativeJointError* observer = nullptr,
+                   Matrix15d* process_covariance = nullptr) const;
   Result UpdateWheel(const WheelSample& sample, const ImuSample& imu,
-                     LocalState* state, Matrix15d* error_transition);
+                     LocalState* state, Matrix15d* error_transition,
+                     Matrix15d* process_covariance = nullptr);
   Result UpdateZeroVelocity(const ImuSample& imu, LocalState* state,
-                            Matrix15d* error_transition);
+                            Matrix15d* error_transition,
+                            Matrix15d* process_covariance = nullptr);
   void ConsumeStationaryWheels(double time);
   void RecordHistory(const Matrix15d& transition = Matrix15d::Identity(),
                      const std::vector<SourceSampleId>& sources = {},
@@ -154,6 +157,8 @@ class LocalEstimator {
   std::shared_ptr<const int> owner_identity_ = std::make_shared<const int>(0);
   LocalState state_;
   LocalState output_state_;
+  // Working conditional gain, not the conservative published uncertainty.
+  Matrix15d lidar_gain_covariance_ = Matrix15d::Identity();
   SourceCounters imu_health_;
   SourceCounters wheel_health_;
   SourceCounters lidar_health_;

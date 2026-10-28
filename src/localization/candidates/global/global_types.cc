@@ -26,6 +26,12 @@ bool ValidGlobalPose(const Eigen::Isometry3d& pose) {
 
 bool ValidGlobalObservationGeometry(const GlobalObservation& observation) {
   switch (observation.kind) {
+    case GlobalObservation::Kind::HEADING:
+      return std::isfinite(observation.heading_rad) &&
+             std::isfinite(observation.heading_variance) &&
+             observation.heading_variance > 0.0 &&
+             observation.direction_in_base.allFinite() &&
+             std::abs(observation.direction_in_base.norm() - 1.0) < 1e-6;
     case GlobalObservation::Kind::POSE:
       return ValidGlobalPose(observation.pose) &&
              ValidCovariance(observation.covariance);

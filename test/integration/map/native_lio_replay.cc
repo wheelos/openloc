@@ -153,10 +153,20 @@ void Run(const std::filesystem::path& input,
          bool arrival_paced, int64_t async_local_delay_ns, bool prefetch_lidar,
          bool timer_output, bool level_odom_gnss_bootstrap,
          double native_joint_sample_period,
-         const std::map<std::string, uint32_t>& native_joint_limits) {
+         const std::map<std::string, uint32_t>& native_joint_limits,
+         const openloc::replay::NativeGlobalOdometryFault& odometry_fault,
+         std::pair<int64_t, int64_t> map_holdout, uint32_t arrival_rate,
+         bool tracking_gain, bool profile_map_timing, bool profile_local_timing) {
   if (!std::filesystem::create_directory(output))
     throw std::runtime_error("output must be a new directory");
   auto config = Configuration((input / "config.csv").string());
+  config.diagnostic_lidar_tracking_gain = tracking_gain;
+  if (tracking_gain) {
+    std::ofstream policy(output / "local_gain_policy.csv");
+    policy << "mode,uncertainty_export,trust_ceiling\n"
+              "diagnostic_conditional_gain,original_conservative_marginal,diagnostic\n";
+    if (!policy) throw std::runtime_error("incomplete diagnostic gain policy");
+  }
   config.enable_motion_initialization = motion_bootstrap;
   config.enable_lidar_stationary_initialization =
       lidar_stationary_initialization;
@@ -176,7 +186,8 @@ void Run(const std::filesystem::path& input,
   if (!map_bundle.empty() || !gnss_bundle.empty())
     map = std::make_unique<openloc::replay::NativeMapDiagnostic>(
         map_bundle, output, map_digests, gnss_bundle, gnss_digests,
-        global_holdback_ns, async_global, level_odom_gnss_bootstrap);
+        global_holdback_ns, async_global, level_odom_gnss_bootstrap,
+        odometry_fault, map_holdout, profile_map_timing);
   std::atomic<bool> global_initialized{false};
   std::unique_ptr<openloc::replay::NativeDiagnosticExecutor> global_executor;
   if (async_global)
@@ -224,6 +235,15 @@ void Run(const std::filesystem::path& input,
   std::ofstream capability(output / "capability.csv");
   std::ofstream corrections(output / "local_corrections.csv");
   std::ofstream joint_audit;
+  std::ofstream local_profile;
+  if (profile_local_timing) {
+    local_profile.open(output / "local_profile.csv");
+    if (!local_profile) throw std::runtime_error("cannot open local timing profile");
+    local_profile << std::setprecision(17)
+                  << "sequence,frontier_ns,bootstrap,points,decode_ms,"
+                     "estimator_ms,decode_start_ns,decode_end_ns,"
+                     "estimator_start_ns,estimator_end_ns\n";
+  }
   if (config.enable_native_joint_error) {
     joint_audit.open(output / "native_joint.csv");
     if (!joint_audit) throw std::runtime_error("cannot open native joint audit");
@@ -300,6 +320,13 @@ void Run(const std::filesystem::path& input,
   int64_t last_receive = 0;
   const auto arrival_origin = Clock::now();
   const int64_t first_receive = csv::Time(imu.front()[1]);
+  if (arrival_paced) {
+    std::ofstream clock(output / "replay_clock.csv");
+    clock << "first_receive_ns,arrival_rate,scope\n"
+          << first_receive << ',' << arrival_rate
+          << ",wall_schedule_only_original_sensor_timestamps_preserved\n";
+    if (!clock) throw std::runtime_error("incomplete replay clock declaration");
+  }
   std::ofstream timer_journal;
   std::unique_ptr<csv::NativeTimerOutput> timer;
   if (timer_output) {
@@ -360,7 +387,8 @@ void Run(const std::filesystem::path& input,
     last_receive = receive;
     if (global_executor) global_executor->Check();
     const auto target =
-        arrival_origin + std::chrono::nanoseconds(receive - first_receive);
+        arrival_origin +
+        std::chrono::nanoseconds((receive - first_receive) / arrival_rate);
     if (arrival_paced) std::this_thread::sleep_until(target);
     u::ImuSample sample;
     sample.stamp = {Seconds(row[0]), Seconds(row[1]), index + 1, "unix"};
@@ -462,6 +490,9 @@ void Run(const std::filesystem::path& input,
       u::Result decision;
       u::MotionInitializationDiagnostics motion_diagnostics;
       double elapsed = 0.0;
+      double decode_ms = 0.0;
+      std::size_t decoded_points = 0;
+      Clock::time_point decode_start, decode_end, estimator_start, estimator_end;
       const bool bootstrapping = !state.valid;
       if (bootstrapping && !motion_bootstrap) {
         ++warmup_scans;
@@ -475,6 +506,7 @@ void Run(const std::filesystem::path& input,
         scan.frame_id = config.lidar_frame;
         scan.calibration_id = config.lidar_calibration_id;
         scan.base_from_lidar = base_from_lidar;
+        if (profile_local_timing) decode_start = Clock::now();
         if (decoded) {
           scan.points = std::move(decoded->points);
         } else {
@@ -486,11 +518,19 @@ void Run(const std::filesystem::path& input,
                   csv::Number(point[3])},
                  Seconds(point[0])});
           }
+          if (profile_local_timing) {
+            decode_end = Clock::now();
+            decode_ms = std::chrono::duration<double, std::milli>(
+                            decode_end - decode_start).count();
+            decoded_points = scan.points.size();
+          }
         }
         if (scan.points.empty()) throw std::runtime_error("empty raw scan");
         if (bootstrapping) {
           started = Clock::now();
+          estimator_start = started;
           decision = bootstrap.Observe(scan, &local, &motion_diagnostics);
+          if (profile_local_timing) estimator_end = Clock::now();
           elapsed =
               std::chrono::duration<double, std::milli>(Clock::now() - started)
                   .count();
@@ -504,9 +544,11 @@ void Run(const std::filesystem::path& input,
         } else {
           const u::LocalState before = local.internal_state();
           started = Clock::now();
+          estimator_start = started;
           decision = local_scheduler
                          ? local_scheduler->Submit(&local, scan, stamp)
                          : local.AddLidar(scan);
+          if (profile_local_timing) estimator_end = Clock::now();
           elapsed =
               std::chrono::duration<double, std::milli>(Clock::now() - started)
                   .count();
@@ -527,6 +569,18 @@ void Run(const std::filesystem::path& input,
             });
           }
         }
+      }
+      if (profile_local_timing) {
+        const auto ns = [](Clock::time_point time) {
+          return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                     time.time_since_epoch()).count();
+        };
+        local_profile << sequence << ',' << stamp << ',' << bootstrapping << ','
+                      << decoded_points << ',' << decode_ms << ',' << elapsed
+                      << ',' << ns(decode_start) << ',' << ns(decode_end) << ','
+                      << ns(estimator_start) << ',' << ns(estimator_end) << '\n';
+        if (!local_profile)
+          throw std::runtime_error("incomplete local timing profile");
       }
       decisions << sequence << ',' << source[0] << ',' << source[1] << ','
                 << stamp << ',' << receive << ','
@@ -609,6 +663,10 @@ void Run(const std::filesystem::path& input,
     if (global_executor) global_executor->Finish();
   }
   if (timer) timer->Finish();
+  if (profile_local_timing) {
+    local_profile.flush();
+    if (!local_profile) throw std::runtime_error("incomplete local timing profile");
+  }
   states.flush();
   initialization.flush();
   capability.flush();
@@ -643,8 +701,11 @@ int main(int argc, char** argv) {
       throw std::runtime_error(
           "usage: native_lio_replay INPUT_DIR NEW_OUTPUT_DIR "
           "[--motion-bootstrap] [--imu-trace] [--diagnostic-map BUNDLE "
-          "--map-input-sha256 PCD_IDENTITY_SEED_SHA256_CONCATENATED]");
+          "--map-input-sha256 PCD_IDENTITY_SEED_SHA256_CONCATENATED] "
+          "[--global-odom-drift START_NS X_MPS Y_MPS | "
+          "--global-odom-step START_NS X_M Y_M]");
     bool motion_bootstrap = false;
+    bool tracking_gain = false;
     bool motion_translation_deskew = false;
     bool lidar_stationary_initialization = false;
     double motion_bootstrap_voxel_size = 0.5;
@@ -658,18 +719,34 @@ int main(int argc, char** argv) {
     bool imu_trace = false;
     bool async_global = false;
     bool arrival_paced = false;
+    uint32_t arrival_rate = 1;
+    bool has_arrival_rate = false;
     int64_t async_local_delay_ns = 0;
     bool prefetch_lidar = false;
     bool timer_output = false;
+    bool profile_map_timing = false;
+    bool profile_local_timing = false;
     bool level_odom_gnss_bootstrap = false;
     double native_joint_sample_period = 0;
     std::map<std::string, uint32_t> native_joint_limits;
+    openloc::replay::NativeGlobalOdometryFault odometry_fault;
+    std::pair<int64_t, int64_t> map_holdout;
     for (int i = 3; i < argc; ++i) {
       const std::string option(argv[i]);
+      if (option == "--diagnostic-lidar-tracking-gain" && !tracking_gain) {
+        tracking_gain = true;
+        continue;
+      }
       if (option == "--motion-bootstrap" && !motion_bootstrap) {
         motion_bootstrap = true;
       } else if (option == "--imu-trace" && !imu_trace) {
         imu_trace = true;
+      } else if (option == "--global-map-holdout" && !map_holdout.first &&
+                 i + 2 < argc) {
+        map_holdout.first = csv::Time(argv[++i]);
+        map_holdout.second = csv::Time(argv[++i]);
+        if (map_holdout.second <= map_holdout.first)
+          throw std::runtime_error("map holdout interval must increase");
       } else if (option == "--native-joint-audit-period-s" &&
                  native_joint_sample_period == 0 && i + 1 < argc) {
         native_joint_sample_period = csv::Number(argv[++i]);
@@ -687,13 +764,43 @@ int main(int argc, char** argv) {
         async_global = true;
       } else if (option == "--arrival-paced" && !arrival_paced) {
         arrival_paced = true;
+      } else if (option == "--arrival-rate" && !has_arrival_rate && i + 1 < argc) {
+        const auto rate = csv::Time(argv[++i]);
+        if (rate != 1 && rate != 2 && rate != 5)
+          throw std::runtime_error("arrival rate must be 1, 2 or 5");
+        arrival_rate = static_cast<uint32_t>(rate);
+        has_arrival_rate = true;
       } else if (option == "--prefetch-lidar" && !prefetch_lidar) {
         prefetch_lidar = true;
       } else if (option == "--timer-output" && !timer_output) {
         timer_output = true;
+      } else if (option == "--profile-map-timing" && !profile_map_timing) {
+        profile_map_timing = true;
+      } else if (option == "--profile-local-timing" && !profile_local_timing) {
+        profile_local_timing = true;
       } else if (option == "--diagnostic-level-odom-gnss-bootstrap" &&
                  !level_odom_gnss_bootstrap) {
         level_odom_gnss_bootstrap = true;
+      } else if (option == "--global-odom-drift" &&
+                 odometry_fault.kind ==
+                     openloc::replay::NativeGlobalOdometryFault::Kind::kNone &&
+                 i + 3 < argc) {
+        odometry_fault.kind =
+            openloc::replay::NativeGlobalOdometryFault::Kind::kDrift;
+        odometry_fault.start_ns = csv::Time(argv[++i]);
+        const double x_mps = csv::Number(argv[++i]);
+        const double y_mps = csv::Number(argv[++i]);
+        odometry_fault.value = {x_mps, y_mps};
+      } else if (option == "--global-odom-step" &&
+                 odometry_fault.kind ==
+                     openloc::replay::NativeGlobalOdometryFault::Kind::kNone &&
+                 i + 3 < argc) {
+        odometry_fault.kind =
+            openloc::replay::NativeGlobalOdometryFault::Kind::kStep;
+        odometry_fault.start_ns = csv::Time(argv[++i]);
+        const double x_m = csv::Number(argv[++i]);
+        const double y_m = csv::Number(argv[++i]);
+        odometry_fault.value = {x_m, y_m};
       } else if (option == "--async-local-lio-ms" &&
                  async_local_delay_ns == 0 && i + 1 < argc) {
         const auto delay_ms = csv::Time(argv[++i]);
@@ -739,6 +846,13 @@ int main(int argc, char** argv) {
     if (map_bundle.empty() != map_digests.empty())
       throw std::runtime_error(
           "map bundle and explicit input hashes required together");
+    if (profile_map_timing && map_bundle.empty())
+      throw std::runtime_error("map timing profiling requires map input");
+    if (profile_local_timing && (prefetch_lidar || async_local_delay_ns))
+      throw std::runtime_error(
+          "local timing profiling requires synchronous decode and LIO");
+    if (map_holdout.first && map_bundle.empty())
+      throw std::runtime_error("map holdout requires an explicit map");
     if (!native_joint_limits.empty() && native_joint_sample_period == 0)
       throw std::runtime_error("native joint limits require native joint audit");
     if (native_joint_sample_period > 0 &&
@@ -753,10 +867,16 @@ int main(int argc, char** argv) {
       throw std::runtime_error("horizontal bootstrap requires GNSS input");
     if (has_holdback && map_bundle.empty() && gnss_bundle.empty())
       throw std::runtime_error("global holdback requires map or GNSS input");
+    if (odometry_fault.kind !=
+            openloc::replay::NativeGlobalOdometryFault::Kind::kNone &&
+        map_bundle.empty() && gnss_bundle.empty())
+      throw std::runtime_error("global ODOM injection requires a global owner");
     if (async_global && (map_bundle.empty() && gnss_bundle.empty()))
       throw std::runtime_error("async global requires map or GNSS input");
     if (async_global && !arrival_paced)
       throw std::runtime_error("async global requires arrival-paced replay");
+    if (has_arrival_rate && !arrival_paced)
+      throw std::runtime_error("arrival rate requires arrival-paced replay");
     if (async_local_delay_ns && !arrival_paced)
       throw std::runtime_error("async local LIO requires arrival-paced replay");
     if (prefetch_lidar && !arrival_paced)
@@ -777,7 +897,8 @@ int main(int argc, char** argv) {
         motion_bootstrap_voxel_size, imu_trace, async_global, arrival_paced,
         async_local_delay_ns, prefetch_lidar, timer_output,
         level_odom_gnss_bootstrap, native_joint_sample_period,
-        native_joint_limits);
+        native_joint_limits, odometry_fault, map_holdout, arrival_rate,
+        tracking_gain, profile_map_timing, profile_local_timing);
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "native_lio_replay: " << error.what() << '\n';

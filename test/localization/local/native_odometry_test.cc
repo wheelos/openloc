@@ -368,6 +368,48 @@ TEST(NativeOdometryPublicTest, JointObserverPreservesNominalAndSharedGeometry) {
   EXPECT_EQ(modeled.lidar_health().accepted, 4);
 }
 
+TEST(NativeOdometryPublicTest, DiagnosticGainMemorySurvivesDelayedCommit) {
+  auto config = Config();
+  config.diagnostic_lidar_tracking_gain = true;
+  NativeOdometry direct(config), delayed(config);
+  for (uint64_t i = 1; i <= 3; ++i) {
+    direct.AddImu(Imu(1 + 0.01 * (i - 1), i));
+    delayed.AddImu(Imu(1 + 0.01 * (i - 1), i));
+  }
+  const auto first = Scan(direct.internal_state(), 1, 0);
+  ASSERT_EQ(direct.AddLidar(first).reason, u::Reason::GEOMETRY_UNAVAILABLE);
+  ASSERT_EQ(delayed.AddLidar(first).reason, u::Reason::GEOMETRY_UNAVAILABLE);
+  direct.AddImu(Imu(1.03, 4));
+  delayed.AddImu(Imu(1.03, 4));
+  const auto second = Scan(direct.internal_state(), 2, 0.1);
+  ASSERT_TRUE(direct.AddLidar(second).ok());
+  std::unique_ptr<NativeOdometry::LidarTask> task;
+  ASSERT_TRUE(delayed.PrepareLidarTask(second, &task).ok());
+  ASSERT_TRUE(task->Compute().ok());
+  const auto next = Imu(1.04, 5);
+  direct.AddImu(next);
+  delayed.AddImu(next);
+  task->ReplayImu(next);
+  ASSERT_TRUE(delayed.CommitLidarTask(task.get()).ok());
+  for (uint64_t sequence = 3; sequence <= 5; ++sequence) {
+    const auto sample = Imu(1.02 + 0.01 * sequence, sequence + 3);
+    direct.AddImu(sample);
+    delayed.AddImu(sample);
+    const auto scan = Scan(direct.internal_state(), sequence, 0.03);
+    ASSERT_TRUE(direct.AddLidar(scan).ok());
+    ASSERT_TRUE(delayed.AddLidar(scan).ok());
+    EXPECT_TRUE(direct.internal_state().position.isApprox(
+        delayed.internal_state().position, 1e-12));
+    EXPECT_TRUE(direct.internal_state().velocity.isApprox(
+        delayed.internal_state().velocity, 1e-12));
+    EXPECT_TRUE(direct.internal_state().covariance.isApprox(
+        delayed.internal_state().covariance, 1e-12));
+  }
+  EXPECT_FALSE(delayed.state().covariance_model_valid);
+  EXPECT_FALSE(delayed.state().uncertainty_qualified);
+  EXPECT_FALSE(delayed.motion_available());
+}
+
 TEST(NativeOdometryPublicTest, JointObserverRejectsCapacityWithoutChangingOdom) {
   auto config = Config();
   config.enable_native_joint_error = true;

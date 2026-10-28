@@ -9,7 +9,9 @@
 #include "openloc/localization/map/scan_to_map.h"
 
 #include <cmath>
+#include <limits>
 
+#include "Eigen/Cholesky"
 #include "gtest/gtest.h"
 
 namespace openloc {
@@ -121,6 +123,143 @@ void Bootstrap(FixedLagGlobalAlignment* owner) {
       ASSERT_TRUE(status.ok()) << status.message();
     }
   }
+}
+
+GlobalHeadingObservation Heading(int index) {
+  GlobalHeadingObservation heading;
+  heading.context = Context(index, "dual-antenna-heading");
+  heading.variance_rad2 = 0.0001;
+  heading.covariance_source = "synthetic-baseline-azimuth";
+  return heading;
+}
+
+TEST(FixedLagAlignmentTest, PositionHeadingAcquiresOnlyDiagnosticHorizontalAxes) {
+  auto config = Config();
+  config.enable_heading_bootstrap = true;
+  FixedLagGlobalAlignment invalid;
+  EXPECT_EQ(StatusCode::kInvalidArgument, invalid.Configure(config).code());
+  config.assume_gravity_aligned_odom = true;
+  for (const bool heading_first : {false, true}) {
+    FixedLagGlobalAlignment owner;
+    ASSERT_TRUE(owner.Configure(config).ok());
+    const auto odom = Odom(0);
+    ASSERT_TRUE(owner.AddOdometry(odom).ok());
+    auto heading = Heading(0);
+    heading.direction_in_base = Eigen::Vector3d::UnitY();
+    heading.heading_rad = 0.4 + std::acos(-1.0) / 2.0;
+    GlobalHorizontalObservation position;
+    position.context = Context(0, "receiver-position");
+    position.point_in_base = Eigen::Vector3d(1.0, -0.5, 0.3);
+    position.position = Eigen::Vector2d(100.0, 20.0) +
+        Eigen::Rotation2Dd(0.4) * position.point_in_base.head<2>();
+    position.covariance = Eigen::Matrix2d::Identity() * 0.01;
+    position.covariance_source = "synthetic-receiver-position";
+    auto qualification = Qualification();
+    // The diagnostic bound does not pretend these receiver messages are
+    // independent of one another or of the local state.
+    qualification.independent_of_local = false;
+    qualification.independent_of_graph_sources = false;
+    qualification.independence_evidence_id.clear();
+    ASSERT_TRUE((heading_first
+        ? owner.SubmitHeadingObservation(heading, qualification)
+        : owner.SubmitHorizontalObservation(position, qualification)).ok());
+    FixedLagAlignmentResult result;
+    ASSERT_TRUE(owner.GetResult(odom.odometry.timestamp, &result).ok());
+    EXPECT_FALSE(result.estimate);
+    EXPECT_FALSE(result.horizontal_estimate);
+    ASSERT_TRUE((heading_first
+        ? owner.SubmitHorizontalObservation(position, qualification)
+        : owner.SubmitHeadingObservation(heading, qualification)).ok());
+    ASSERT_TRUE(owner.GetResult(odom.odometry.timestamp, &result).ok());
+    ASSERT_TRUE(result.horizontal_estimate);
+    EXPECT_FALSE(result.estimate);
+    EXPECT_FALSE(result.full_pose_evidence_fresh);
+    EXPECT_TRUE(result.horizontal_evidence_fresh);
+    EXPECT_TRUE(result.diagnostic_only);
+    EXPECT_FALSE(result.assessment.ok());
+    EXPECT_EQ(LocalizationTrustLevel::kDiagnostic, result.trust_level);
+    EXPECT_TRUE(result.horizontal_estimate->map_base_xy.isApprox(
+        Eigen::Vector2d(100.0, 20.0), 1e-9));
+    EXPECT_NEAR(0.4, result.horizontal_estimate->map_from_odom_xy_yaw.z(), 1e-9);
+    EXPECT_EQ(1u, result.horizontal_estimate->correction_id);
+    EXPECT_TRUE(result.horizontal_estimate->covariance.llt().info() ==
+                Eigen::Success);
+    EXPECT_TRUE(odom.odometry.pose.translation.isZero());
+    std::vector<GraphObservationDecision> decisions;
+    ASSERT_TRUE(owner.GetDecisions(&decisions).ok());
+    ASSERT_EQ(2u, decisions.size());
+    EXPECT_FALSE(decisions.front().observation.alignment_updated);
+    EXPECT_TRUE(decisions.back().observation.alignment_updated);
+    EXPECT_EQ(1u, decisions.back().observation.correction_id);
+    const Timestamp late{odom.odometry.timestamp.nanoseconds +
+        config.maximum_full_pose_age_ns + 1, config.clock_domain};
+    ASSERT_TRUE(owner.GetResult(late, &result).ok());
+    EXPECT_FALSE(result.horizontal_evidence_fresh);
+    EXPECT_FALSE(result.full_pose_evidence_fresh);
+    EXPECT_EQ(LocalizationTrustLevel::kUntrusted, result.trust_level);
+  }
+}
+
+TEST(FixedLagAlignmentTest, HeadingUpdatesSelectedGraphWithoutFullPoseRenewal) {
+  FixedLagGlobalAlignment owner;
+  ASSERT_TRUE(owner.Configure(Config()).ok());
+  Bootstrap(&owner);
+  auto heading = Heading(2);
+  heading.heading_rad = 0.02;
+  ASSERT_TRUE(owner.SubmitHeadingObservation(heading, Qualification()).ok());
+  FixedLagAlignmentResult result;
+  ASSERT_TRUE(owner.GetResult(Odom(2).odometry.timestamp, &result).ok());
+  ASSERT_TRUE(result.estimate);
+  EXPECT_EQ(LocalizationTrustLevel::kDiagnostic, result.trust_level);
+  EXPECT_EQ(StatusCode::kRejectedMeasurement, result.assessment.code());
+  EXPECT_EQ(2u, result.estimate->correction_id);
+  EXPECT_GT(result.estimate->map_from_base.rotation.toRotationMatrix()(1, 0), 0.0);
+  EXPECT_DOUBLE_EQ(kStart * 1e-9 + 2 * kStep * 1e-9,
+                   result.last_full_pose_time_seconds);
+  EXPECT_FALSE(result.horizontal_estimate);
+  EXPECT_EQ(StatusCode::kDuplicateTimestamp,
+            owner.SubmitHeadingObservation(heading, Qualification()).code());
+  heading.context.source = "bad-heading";
+  heading.heading_rad = std::acos(-1.0);
+  EXPECT_EQ(StatusCode::kRejectedMeasurement,
+            owner.SubmitHeadingObservation(heading, Qualification()).code());
+  ASSERT_TRUE(owner.GetResult(Odom(2).odometry.timestamp, &result).ok());
+  EXPECT_EQ(2u, result.estimate->correction_id);
+}
+
+TEST(FixedLagAlignmentTest, HeadingRejectsBadGeometryQualityAndExactTime) {
+  auto config = Config();
+  config.enable_heading_bootstrap = true;
+  config.assume_gravity_aligned_odom = true;
+  FixedLagGlobalAlignment owner;
+  ASSERT_TRUE(owner.Configure(config).ok());
+  ASSERT_TRUE(owner.AddOdometry(Odom(0)).ok());
+  auto heading = Heading(0);
+  heading.variance_rad2 = 0.0;
+  EXPECT_EQ(StatusCode::kInvalidArgument,
+            owner.SubmitHeadingObservation(heading, Qualification()).code());
+  heading.variance_rad2 = std::numeric_limits<double>::quiet_NaN();
+  EXPECT_EQ(StatusCode::kInvalidArgument,
+            owner.SubmitHeadingObservation(heading, Qualification()).code());
+  heading = Heading(0);
+  heading.direction_in_base = Eigen::Vector3d::UnitZ();
+  EXPECT_EQ(StatusCode::kRejectedMeasurement,
+            owner.SubmitHeadingObservation(heading, Qualification()).code());
+  heading = Heading(0);
+  heading.context.source = "unqualified-heading";
+  auto qualification = Qualification();
+  qualification.quality_valid = false;
+  EXPECT_EQ(StatusCode::kRejectedMeasurement,
+            owner.SubmitHeadingObservation(heading, qualification).code());
+  heading.context.measurement_time.nanoseconds += 1;
+  EXPECT_EQ(StatusCode::kOutsideHistory,
+            owner.SubmitHeadingObservation(heading, Qualification()).code());
+  FixedLagAlignmentResult result;
+  ASSERT_TRUE(owner.GetResult(Odom(0).odometry.timestamp, &result).ok());
+  EXPECT_FALSE(result.estimate);
+  EXPECT_FALSE(result.horizontal_estimate);
+  EXPECT_EQ(LocalizationTrustLevel::kUntrusted, result.trust_level);
+  EXPECT_EQ(5u, result.rejected_observations);
 }
 
 TEST(FixedLagAlignmentTest, RejectsDiagnosticAndUnqualifiedDeclarations) {
@@ -929,6 +1068,63 @@ TEST(FixedLagAlignmentTest, FullPoseFreshnessDoesNotFollowPartialUpdates) {
   EXPECT_FALSE(result.assessment.ok());
 }
 
+TEST(FixedLagAlignmentTest, RetainedPartialGraphNeverRenewsFullPoseTrust) {
+  for (const bool retain : {false, true}) {
+    auto config = Config();
+    config.maximum_full_pose_age_ns = 3 * kStep;
+    config.retain_graph_on_full_pose_staleness = retain;
+    FixedLagGlobalAlignment owner;
+    ASSERT_TRUE(owner.Configure(config).ok());
+    Bootstrap(&owner);
+    for (int index = 3; index <= 9; ++index) {
+      auto motion = Connection(index);
+      ASSERT_TRUE(owner.AddOdometry(Odom(index), &motion).ok());
+      auto partial = Map(index);
+      partial.kind = GlobalMapObservation::Kind::kProjectedPose;
+      partial.projection = Eigen::Matrix<double, 5, 6>::Zero();
+      partial.projection.rightCols<5>().setIdentity();
+      partial.projected_covariance = Eigen::Matrix<double, 5, 5>::Identity() * .001;
+      const auto status = owner.SubmitMapObservation(partial, Qualification());
+      if (retain) {
+        ASSERT_TRUE(status.ok()) << status.message();
+      } else if (index >= 6) {
+        EXPECT_FALSE(status.ok());
+      }
+      FixedLagAlignmentResult result;
+      ASSERT_TRUE(owner.GetResult(Odom(index).odometry.timestamp, &result).ok());
+      if (index >= 6) {
+        EXPECT_FALSE(result.full_pose_evidence_fresh);
+        EXPECT_EQ(LocalizationTrustLevel::kUntrusted, result.trust_level);
+      }
+      if (retain) {
+        ASSERT_TRUE(result.estimate);
+        EXPECT_NEAR(100.0 + .1 * index, result.estimate->map_from_base.translation.x(), 1e-8);
+        EXPECT_DOUBLE_EQ(kStart * 1e-9 + 2 * kStep * 1e-9,
+                         result.last_full_pose_time_seconds);
+      }
+    }
+    if (retain) {
+      const auto motion = Connection(10);
+      ASSERT_TRUE(owner.AddOdometry(Odom(10), &motion).ok());
+      ASSERT_TRUE(owner.SubmitMapObservation(Map(10), Qualification()).ok());
+      FixedLagAlignmentResult result;
+      ASSERT_TRUE(owner.GetResult(Odom(10).odometry.timestamp, &result).ok());
+      EXPECT_TRUE(result.full_pose_evidence_fresh);
+      const auto next_motion = Connection(11);
+      ASSERT_TRUE(owner.AddOdometry(Odom(11), &next_motion).ok());
+      auto recovery = Map(11);
+      recovery.recovery = true;
+      EXPECT_FALSE(owner.SubmitMapObservation(recovery, Qualification()).ok());
+      ASSERT_TRUE(owner.GetResult(Odom(11).odometry.timestamp, &result).ok());
+      EXPECT_TRUE(result.verification_pending);
+      EXPECT_FALSE(result.estimate);
+      EXPECT_FALSE(owner.AddOdometry(Odom(12)).ok());
+      ASSERT_TRUE(owner.GetResult(Odom(12).odometry.timestamp, &result).ok());
+      EXPECT_FALSE(result.estimate);
+    }
+  }
+}
+
 TEST(FixedLagAlignmentTest, DoubleTimeAliasesCannotSelectAnotherIntegerEpoch) {
   FixedLagGlobalAlignment owner;
   ASSERT_TRUE(owner.Configure(Config()).ok());
@@ -982,6 +1178,18 @@ TEST(FixedLagAlignmentTest, OutlierDoesNotCommitAndRecoveryRequiresNewFrames) {
   outlier.map_from_base.translation.x() += 1000.0;
   EXPECT_EQ(StatusCode::kRejectedMeasurement,
             owner.SubmitMapObservation(outlier, Qualification()).code());
+  std::vector<GraphObservationDecision> rejected_decisions;
+  ASSERT_TRUE(owner.GetDecisions(&rejected_decisions).ok());
+  ASSERT_FALSE(rejected_decisions.empty());
+  const auto& innovation = rejected_decisions.back().observation.innovation;
+  ASSERT_TRUE(innovation.available);
+  ASSERT_EQ(innovation.observed_dimension, innovation.residual.size());
+  ASSERT_EQ(innovation.residual.size(), innovation.covariance.rows());
+  EXPECT_NEAR(
+      innovation.nis,
+      innovation.residual.dot(
+          innovation.covariance.ldlt().solve(innovation.residual)),
+      1e-8);
   FixedLagAlignmentResult rejected;
   ASSERT_TRUE(owner.GetResult(Odom(3).odometry.timestamp, &rejected).ok());
   ASSERT_TRUE(rejected.estimate.has_value());

@@ -10,6 +10,7 @@
 
 #include "candidates/global/global_types.h"
 #include "candidates/local/local_motion.h"
+#include "openloc/localization/global/observation_types.h"
 
 namespace openloc {
 namespace localization {
@@ -25,6 +26,28 @@ struct FixedLagConfig {
   uint32_t max_error_dimension = 256;
   uint32_t max_iterations = 5;
   double max_linearization_angle = 0.2;
+};
+
+struct GraphFactorEvaluation {
+  std::string type;
+  std::vector<uint64_t> keys;
+  Eigen::VectorXd residual;
+  double error = 0;
+  double weight = 1;
+};
+
+struct GraphEvaluationSnapshot {
+  double cutoff_time = 0;
+  uint64_t retained_nodes = 0;
+  uint64_t archived_nodes = 0;
+  uint64_t retained_relinearizations = 0;
+  Eigen::Isometry3d map_from_base = Eigen::Isometry3d::Identity();
+  // [translation_map metres, left_rotation_map radians], not alignment bound.
+  Matrix6d pose_covariance = Matrix6d::Zero();
+  double objective = 0;
+  uint32_t iterations = 0;
+  double maximum_exact_residual = 0;
+  std::vector<GraphFactorEvaluation> factors;
 };
 
 // All state here, including the nuisance error chain, is global-owned.
@@ -45,14 +68,23 @@ class FixedLagGraph {
   // Only exact retained measurement times; never use a nearest keyframe.
   // Point factors constrain only the supplied XY/XYZ antenna coordinates.
   // Partial observations neither bootstrap nor renew the full-pose lease.
-  Result Observe(const GlobalObservation& observation);
+  Result Observe(const GlobalObservation& observation,
+                 ObservationInnovation* innovation = nullptr);
   bool initialized() const;
   const GlobalState& state() const;
+
+  // Offline evaluation only. Opt in before initialization; archives the exact
+  // committed factors/initial values without eviction. Not a production mode.
+  Result EnableEvaluationHistory();
+  // Batch solves the archived factors with no marginalization and the same
+  // cutoff/admission set. Does not change this owner's state or decisions.
+  Result EvaluateForTesting(bool batch, GraphEvaluationSnapshot* output) const;
 
  private:
   struct Impl;
   FixedLagConfig config_;
   std::unique_ptr<Impl> impl_;
+  bool retain_evaluation_history_ = false;
 };
 
 }  // namespace unified

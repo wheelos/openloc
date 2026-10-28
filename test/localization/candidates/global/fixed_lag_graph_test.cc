@@ -65,6 +65,50 @@ MotionIncrement Motion(const LocalState& start, const LocalState& end) {
   return motion;
 }
 
+TEST(FixedLagGraphTest, BatchReferenceMatchesLinearKnownAnswerAcrossLagAndExactNoise) {
+  for (const double process_variance : {0.0, 0.001}) {
+    FixedLagGraph graph(Policy());
+    GraphEvaluationSnapshot missing;
+    EXPECT_EQ(Reason::INVALID_INPUT,
+              graph.EvaluateForTesting(true, &missing).reason);
+    ASSERT_TRUE(graph.EnableEvaluationHistory().ok());
+    auto previous = Local(0);
+    ASSERT_TRUE(graph.Initialize(previous, Observation(previous, 1)).ok());
+    double mean = 100.0;
+    double variance = 0.01;
+    for (uint64_t index = 1; index <= 8; ++index) {
+      auto local = Local(index);
+      local.covariance = Matrix15d::Identity() * (0.1 + process_variance * index);
+      const auto added = graph.AddLocal(local, Motion(previous, local));
+      ASSERT_TRUE(added.ok()) << added.message;
+      auto fix = Observation(local, index + 1);
+      fix.pose.translation().x() += 0.02;
+      ASSERT_TRUE(graph.Observe(fix).ok());
+      variance += process_variance;
+      const double gain = variance / (variance + 0.01);
+      mean += gain * (100.02 - mean);
+      variance *= 1 - gain;
+      GraphEvaluationSnapshot lag, batch;
+      ASSERT_TRUE(graph.EvaluateForTesting(false, &lag).ok());
+      const auto solved = graph.EvaluateForTesting(true, &batch);
+      ASSERT_TRUE(solved.ok()) << solved.message;
+      EXPECT_NEAR(mean, lag.map_from_base.translation().x(), 1e-7);
+      EXPECT_NEAR(mean, batch.map_from_base.translation().x(), 1e-7);
+      EXPECT_NEAR(variance, lag.pose_covariance(0, 0), 1e-7);
+      EXPECT_NEAR(variance, batch.pose_covariance(0, 0), 1e-7);
+      EXPECT_LT(batch.maximum_exact_residual, 1e-6);
+      EXPECT_EQ(2 + 3 * index, batch.factors.size());
+      EXPECT_EQ(index + 1, batch.archived_nodes);
+      EXPECT_EQ(graph.state().correction_id, 1 + 2 * index);
+      previous = local;
+    }
+    GraphEvaluationSnapshot final;
+    ASSERT_TRUE(graph.EvaluateForTesting(true, &final).ok());
+    EXPECT_LT(final.retained_nodes, final.archived_nodes);
+    EXPECT_EQ(Reason::INVALID_INPUT, graph.EnableEvaluationHistory().reason);
+  }
+}
+
 LocalState JointLocal(uint64_t index) {
   auto state = Local(index);
   const Eigen::Index dimension = index >= 3 && index <= 5 ? 17 : 16;
@@ -97,8 +141,63 @@ MotionIncrement JointMotion(const LocalState& start, const LocalState& end) {
   return motion;
 }
 
+TEST(FixedLagGraphTest, TurningTrajectoryRetainsNonlinearConstraintsAcrossLag) {
+  for (const bool shared : {false, true}) {
+    FixedLagGraph graph(Policy());
+    ASSERT_TRUE(graph.EnableEvaluationHistory().ok());
+    LocalState previous;
+    for (uint64_t index = 0; index <= 8; ++index) {
+      auto local = shared ? JointLocal(index) : Local(index);
+      const double step = static_cast<double>(index);
+      local.position = {2 * step, std::sin(step), 0.1 * step};
+      local.orientation = ExpRotation({0.02 * step, -0.01 * step, 0.15 * step});
+      if (index == 0) {
+        auto anchor = Observation(local, 1);
+        anchor.pose.linear() = local.orientation.toRotationMatrix();
+        ASSERT_TRUE(graph.Initialize(local, anchor).ok());
+      } else {
+        const auto added = graph.AddLocal(
+            local, shared ? JointMotion(previous, local) : Motion(previous, local));
+        ASSERT_TRUE(added.ok()) << added.message;
+        auto fix = Observation(local, index + 1);
+        fix.pose.translation() += local.position +
+            Eigen::Vector3d(0.02 * std::cos(step), -0.01 * std::sin(step), 0.005);
+        fix.pose.linear() =
+            ExpRotation({0.02 * std::sin(step), 0.04, -0.03})
+                .toRotationMatrix() * local.orientation.toRotationMatrix();
+        if (shared) {
+          fix.independent_of_local = false;
+          fix.conditional_local_error_qualified = true;
+          fix.local_error_sequence = local.stamp.sequence;
+          fix.local_error_cross_covariance =
+              Eigen::MatrixXd::Zero(local.joint_error->covariance.rows(), 6);
+          fix.local_error_cross_covariance(15, 0) = 0.005;
+        }
+        const auto observed = graph.Observe(fix);
+        ASSERT_TRUE(observed.ok()) << observed.message;
+        GraphEvaluationSnapshot lag, batch;
+        ASSERT_TRUE(graph.EvaluateForTesting(false, &lag).ok());
+        ASSERT_TRUE(graph.EvaluateForTesting(true, &batch).ok());
+        EXPECT_LE(lag.maximum_exact_residual, 1e-6);
+        EXPECT_LE(batch.maximum_exact_residual, 1e-6);
+        EXPECT_TRUE(lag.pose_covariance.llt().info() == Eigen::Success);
+        EXPECT_LT((lag.map_from_base.translation() -
+                   batch.map_from_base.translation()).norm(), 0.002);
+        if (index >= 4) {
+          EXPECT_LT(lag.retained_nodes, lag.archived_nodes);
+        }
+        if (index == 8) {
+          EXPECT_GT(lag.retained_relinearizations, 0);
+        }
+      }
+      previous = local;
+    }
+  }
+}
+
 TEST(FixedLagGraphTest, HiddenSharedMemorySurvivesDimensionChangesAndLag) {
   FixedLagGraph graph(Policy());
+  ASSERT_TRUE(graph.EnableEvaluationHistory().ok());
   auto previous = JointLocal(0);
   ASSERT_TRUE(graph.Initialize(previous, Observation(previous, 1)).ok());
   Eigen::Matrix2d information = Eigen::Matrix2d::Zero();
@@ -133,6 +232,37 @@ TEST(FixedLagGraphTest, HiddenSharedMemorySurvivesDimensionChangesAndLag) {
     const Eigen::Vector2d posterior = information.ldlt().solve(right);
     const double expected = 100 + posterior.x() + 0.2 * index * posterior.y();
     EXPECT_NEAR(graph.state().map_to_odom.translation().x(), expected, 1e-7);
+    GraphEvaluationSnapshot batch;
+    const auto solved = graph.EvaluateForTesting(true, &batch);
+    ASSERT_TRUE(solved.ok()) << solved.message;
+    EXPECT_NEAR(batch.map_from_base.translation().x(), expected, 1e-7);
+    EXPECT_LT(batch.maximum_exact_residual, 1e-6);
+    previous = local;
+  }
+}
+
+TEST(FixedLagGraphTest, UnobservedAxisUncertaintyGrowsAcrossLag) {
+  FixedLagGraph graph(Policy());
+  ASSERT_TRUE(graph.EnableEvaluationHistory().ok());
+  auto previous = Local(0);
+  ASSERT_TRUE(graph.Initialize(previous, Observation(previous, 1)).ok());
+  double expected_x = 0.01;
+  for (uint64_t index = 1; index <= 8; ++index) {
+    const auto local = Local(index);
+    ASSERT_TRUE(graph.AddLocal(local, Motion(previous, local)).ok());
+    auto fix = Observation(local, index + 1);
+    fix.kind = GlobalObservation::Kind::PROJECTED_POSE;
+    fix.projection = Eigen::MatrixXd::Zero(1, 6);
+    fix.projection(0, 1) = 1;
+    fix.projected_covariance = Eigen::MatrixXd::Constant(1, 1, 0.01);
+    ASSERT_TRUE(graph.Observe(fix).ok());
+    expected_x += 0.001;
+    GraphEvaluationSnapshot lag, batch;
+    ASSERT_TRUE(graph.EvaluateForTesting(false, &lag).ok());
+    ASSERT_TRUE(graph.EvaluateForTesting(true, &batch).ok());
+    EXPECT_NEAR(expected_x, lag.pose_covariance(0, 0), 1e-7);
+    EXPECT_NEAR(expected_x, batch.pose_covariance(0, 0), 1e-7);
+    EXPECT_LT(lag.pose_covariance(1, 1), lag.pose_covariance(0, 0));
     previous = local;
   }
 }
@@ -506,7 +636,19 @@ TEST(FixedLagGraphTest, RejectedUpdatesLeaveTheCommittedSnapshotUntouched) {
   auto outlier = Observation(local, 2);
   outlier.source = "other-survey";
   outlier.pose.translation().x() += 1000.0;
-  EXPECT_EQ(Reason::INNOVATION_REJECTED, graph.Observe(outlier).reason);
+  ObservationInnovation diagnostics;
+  EXPECT_EQ(Reason::INNOVATION_REJECTED,
+            graph.Observe(outlier, &diagnostics).reason);
+  ASSERT_TRUE(diagnostics.available);
+  EXPECT_EQ("map_from_base", diagnostics.prior_state_frame);
+  ASSERT_EQ(diagnostics.observed_dimension, diagnostics.residual.size());
+  ASSERT_EQ(diagnostics.residual.size(), diagnostics.covariance.rows());
+  EXPECT_GT(diagnostics.prior_covariance.trace(), 0.0);
+  EXPECT_NEAR(
+      diagnostics.nis,
+      diagnostics.residual.dot(
+          diagnostics.covariance.ldlt().solve(diagnostics.residual)),
+      1e-8);
   auto wrong_epoch = Local(1);
   wrong_epoch.epoch.generation = 2;
   EXPECT_EQ(Reason::EPOCH_MISMATCH,

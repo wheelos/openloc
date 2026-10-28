@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "candidates/common/types.h"
+#include "candidates/map/exact_map_search.h"
 #include "candidates/map/map_registration_error.h"
 #include "pcl/kdtree/kdtree_flann.h"
 #include "pcl/point_cloud.h"
@@ -137,7 +138,7 @@ class MapMatcher {
   pcl::PointCloud<pcl::Normal>::Ptr normals_;
   enum class NormalFailure { kOther, kRank, kNonplanar };
   std::vector<NormalFailure> normal_failures_;
-  pcl::KdTreeFLANN<pcl::PointXYZ> tree_;
+  ExactMapSearch tree_;
   mutable pcl::NormalDistributionsTransform<pcl::PointXYZ, pcl::PointXYZ>
       registration_;
   double target_voxelization_ms_ = 0.0;

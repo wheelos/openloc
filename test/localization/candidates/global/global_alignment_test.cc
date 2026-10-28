@@ -6,6 +6,7 @@
 
 #include "candidates/global/global_alignment.h"
 
+#include "Eigen/Cholesky"
 #include "gtest/gtest.h"
 
 namespace openloc {
@@ -240,7 +241,16 @@ TEST(GlobalAlignmentTest, MapAndGnssShareAlignmentWithoutChangingLocalHistory) {
   const auto next = Local(gnss.stamp.time, 5);
   ASSERT_TRUE(alignment.AddLocal(next).ok());
   gnss.pose.translation().x() += 1000.0;
-  EXPECT_EQ(Reason::INNOVATION_REJECTED, alignment.Observe(gnss).reason);
+  ObservationInnovation diagnostics;
+  EXPECT_EQ(Reason::INNOVATION_REJECTED,
+            alignment.Observe(gnss, &diagnostics).reason);
+  ASSERT_TRUE(diagnostics.available);
+  ASSERT_EQ(diagnostics.observed_dimension, diagnostics.residual.size());
+  EXPECT_NEAR(
+      diagnostics.nis,
+      diagnostics.residual.dot(
+          diagnostics.covariance.ldlt().solve(diagnostics.residual)),
+      1e-8);
   EXPECT_TRUE(alignment.state().map_to_odom.matrix().isApprox(
       before_outlier.map_to_odom.matrix(), 0.0));
   ASSERT_TRUE(alignment.Lookup(local.stamp.time, &retained).ok());
@@ -345,6 +355,48 @@ TEST(GlobalAlignmentTest, SourceAndLocalUncertaintyControlHorizontalInfluence) {
   const double good = correction(0.01, 0.0001);
   EXPECT_GT(good, correction(1.0, 0.0001));
   EXPECT_GT(good, correction(0.01, 1.0));
+}
+
+TEST(GlobalAlignmentTest, LargeUncertaintyCanAdmitTheSameLargePositionJump) {
+  for (const double local_variance : {0.0001, 200.0}) {
+    auto config = Policy();
+    config.diagnostic_only = true;
+    GlobalAlignment owner(config);
+    auto local = Local(10.0, 1);
+    local.position.setZero();
+    local.covariance = Matrix15d::Identity() * local_variance;
+    ASSERT_TRUE(owner.AddLocal(local).ok());
+    ASSERT_TRUE(owner.SeedDiagnostic(Eigen::Isometry3d::Identity(),
+                                    Matrix6d::Identity(), 10.0).ok());
+    auto fix = Observation(local, 0.0);
+    fix.kind = GlobalObservation::Kind::HORIZONTAL_POSITION;
+    fix.pose.translation() = Eigen::Vector3d(50, -30, 0);
+    fix.covariance.topLeftCorner<2, 2>().setIdentity();
+    ObservationInnovation diagnostic;
+    const auto revision = owner.state().correction_id;
+    const auto result = owner.Observe(fix, &diagnostic);
+    ASSERT_TRUE(diagnostic.available);
+    ASSERT_TRUE(diagnostic.covariance_decomposition_available);
+    const Eigen::Matrix2d expected =
+        Eigen::Matrix2d::Identity() * (2.0 + 4.0 + 4.0 * local_variance);
+    EXPECT_TRUE(diagnostic.covariance.isApprox(expected, 1e-12));
+    EXPECT_TRUE(diagnostic.covariance.isApprox(
+        diagnostic.prior_contribution + diagnostic.observation_contribution +
+        diagnostic.local_contribution, 1e-12));
+    EXPECT_NEAR(3400.0 / expected(0, 0), diagnostic.nis, 1e-10);
+    if (local_variance < 1.0) {
+      EXPECT_EQ(Reason::INNOVATION_REJECTED, result.reason);
+      EXPECT_GT(diagnostic.nis, diagnostic.gate_threshold);
+      EXPECT_EQ(revision, owner.state().correction_id);
+    } else {
+      EXPECT_TRUE(result.ok()) << result.message;
+      EXPECT_LT(diagnostic.nis, diagnostic.gate_threshold);
+      EXPECT_EQ(revision + 1, owner.state().correction_id);
+    }
+    EXPECT_TRUE(owner.latest_local()->position.isZero(0));
+    EXPECT_TRUE(owner.state().diagnostic_only);
+    EXPECT_FALSE(owner.Evaluate(10.0).ok());
+  }
 }
 
 TEST(GlobalAlignmentTest, StaleMapDoesNotRevokeDiagnosticHorizontalFusion) {

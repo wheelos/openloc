@@ -358,6 +358,8 @@ struct LocalConfig {
   // trapezoids and any causal wheel subintervals. Zero leaves it unspecified.
   double native_imu_sample_period = 0.0;
   bool enable_lidar = false;
+  // Diagnostic nominal-gain preconditioner only; never exported as uncertainty.
+  bool diagnostic_lidar_tracking_gain = false;
   std::string lidar_frame;
   std::string lidar_calibration_id;
   double lidar_point_noise_std = 0.0;

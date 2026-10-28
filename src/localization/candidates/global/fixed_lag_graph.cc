@@ -21,8 +21,11 @@
 #include "gtsam/base/numericalDerivative.h"
 #include "gtsam/geometry/Pose3.h"
 #include "gtsam/inference/Symbol.h"
+#include "gtsam/linear/JacobianFactor.h"
 #include "gtsam/linear/linearExceptions.h"
 #include "gtsam/nonlinear/IncrementalFixedLagSmoother.h"
+#include "gtsam/nonlinear/GaussNewtonOptimizer.h"
+#include "gtsam/nonlinear/LinearContainerFactor.h"
 #include "gtsam/nonlinear/NonlinearFactor.h"
 #include "gtsam/slam/PriorFactor.h"
 
@@ -37,12 +40,62 @@ using OptionalJacobian = gtsam::OptionalMatrixType;
 gtsam::Key PoseKey(uint64_t index) { return gtsam::Symbol('x', index); }
 gtsam::Key ErrorKey(uint64_t index) { return gtsam::Symbol('e', index); }
 
+class FrozenMarginalFactor final : public gtsam::NoiseModelFactor {
+ public:
+  FrozenMarginalFactor(const gtsam::JacobianFactor& factor,
+                       const gtsam::Values& reference)
+      : gtsam::NoiseModelFactor(
+            factor.get_model() ? factor.get_model()
+                               : gtsam::noiseModel::Unit::Create(factor.getb().size()),
+            factor.keys()),
+        factor_(factor) {
+    for (const auto key : keys()) reference_.insert(key, reference.at(key));
+  }
+
+  gtsam::Vector unwhitenedError(
+      const gtsam::Values& values,
+      gtsam::OptionalMatrixVecType derivatives = nullptr) const override {
+    gtsam::Values subset;
+    for (const auto key : keys()) subset.insert(key, values.at(key));
+    if (derivatives) {
+      derivatives->resize(size());
+      for (std::size_t i = 0; i < size(); ++i) {
+        const auto key = keys()[i];
+        const auto block = factor_.getA(factor_.begin() + i);
+        if (gtsam::Symbol(key).chr() == 'x') {
+          const auto& reference = reference_.at<gtsam::Pose3>(key);
+          const std::function<gtsam::Vector(const gtsam::Pose3&)> chart =
+              [&](const gtsam::Pose3& pose) {
+                return reference.localCoordinates(pose);
+              };
+          (*derivatives)[i] = block *
+              gtsam::numericalDerivative11<gtsam::Vector, gtsam::Pose3>(
+                  chart, values.at<gtsam::Pose3>(key));
+        } else {
+          (*derivatives)[i] = block;
+        }
+      }
+    }
+    return factor_.unweighted_error(reference_.localCoordinates(subset));
+  }
+
+  gtsam::NonlinearFactor::shared_ptr clone() const override {
+    return std::make_shared<FrozenMarginalFactor>(*this);
+  }
+
+ private:
+  gtsam::JacobianFactor factor_;
+  gtsam::Values reference_;
+};
+
 gtsam::ISAM2Params Parameters() {
   gtsam::ISAM2Params params;
   params.factorization = gtsam::ISAM2Params::QR;
   params.findUnusedFactorSlots = true;
   params.relinearizeSkip = 1;
   params.relinearizeThreshold = 1e-6;
+  // Hard constraints require a complete delta, not wildfire-truncated updates.
+  params.optimizationParams = gtsam::ISAM2GaussNewtonParams(0.0);
   return params;
 }
 
@@ -50,6 +103,33 @@ class AlignmentSmoother final : public gtsam::IncrementalFixedLagSmoother {
  public:
   explicit AlignmentSmoother(double lag)
       : gtsam::IncrementalFixedLagSmoother(lag, Parameters()) {}
+
+  void RelinearizeRetained() {
+    const auto estimate = calculateEstimate();
+    gtsam::NonlinearFactorGraph factors;
+    gtsam::FastMap<gtsam::Key, int> groups;
+    for (const auto& value : estimate)
+      groups[value.key] = gtsam::Symbol(value.key).chr() == 'x' ? 0 : 1;
+    for (const auto& factor : getFactors()) {
+      if (!factor) continue;
+      const auto* marginal =
+          dynamic_cast<const gtsam::LinearContainerFactor*>(factor.get());
+      if (marginal) {
+        // Keep the marginalized information and original chart. Only the chart
+        // derivative changes; eliminated observations are never reconstructed.
+        const auto& reference = marginal->hasLinearizationPoint()
+            ? *marginal->linearizationPoint() : getLinearizationPoint();
+        const gtsam::JacobianFactor linear(*marginal->linearize(reference));
+        factors.emplace_shared<FrozenMarginalFactor>(
+            linear, reference);
+      } else {
+        factors.push_back(factor);
+      }
+    }
+    gtsam::ISAM2 replacement(Parameters());
+    isamResult_ = replacement.update(factors, estimate, {}, groups);
+    isam_ = std::move(replacement);
+  }
 
   void UpdateConditionalFactors(
       const gtsam::NonlinearFactorGraph& factors,
@@ -261,6 +341,9 @@ class MotionFactor final
 };
 
 Eigen::MatrixXd ObservationNoise(const GlobalObservation& observation) {
+  if (observation.kind == GlobalObservation::Kind::HEADING) {
+    return Eigen::Matrix<double, 1, 1>::Constant(observation.heading_variance);
+  }
   if (observation.kind == GlobalObservation::Kind::HORIZONTAL_POSITION) {
     return observation.covariance.topLeftCorner<2, 2>();
   }
@@ -287,6 +370,13 @@ class ObservationFactor final : public gtsam::NoiseModelFactor1<gtsam::Pose3> {
 
   gtsam::Vector PoseResidual(const gtsam::Pose3& pose) const {
     const Eigen::Isometry3d estimate = FromPose(pose);
+    if (observation_.kind == GlobalObservation::Kind::HEADING) {
+      const Eigen::Vector3d direction =
+          estimate.linear() * observation_.direction_in_base;
+      const double angle = std::atan2(direction.y(), direction.x()) -
+                           observation_.heading_rad;
+      return gtsam::Vector1(std::atan2(std::sin(angle), std::cos(angle)));
+    }
     gtsam::Vector residual(6);
     residual.head<3>() =
         estimate.translation() - observation_.pose.translation();
@@ -526,8 +616,18 @@ struct FixedLagGraph::Impl {
   GlobalObservation anchor;
   GlobalState output;
   uint64_t next_key = 1;
+  gtsam::NonlinearFactorGraph evaluation_factors;
+  gtsam::Values evaluation_initial;
+  uint64_t retained_relinearizations = 0;
+
+  void Archive(const gtsam::NonlinearFactorGraph& factors,
+               const gtsam::Values& values) {
+    evaluation_factors.push_back(factors);
+    evaluation_initial.insert(values);
+  }
 
   Result Finalize(const FixedLagConfig& config, Clock::time_point started) {
+    double maximum_motion_residual = 0;
     for (uint32_t iteration = 0; iteration < config.max_iterations;
          ++iteration) {
       const gtsam::Values estimate = smoother.calculateEstimate();
@@ -543,7 +643,22 @@ struct FixedLagGraph::Impl {
         }
       }
       bool consistent = true;
+      maximum_motion_residual = 0;
       for (const auto& factor : smoother.getFactors()) {
+        const auto* marginal =
+            dynamic_cast<const FrozenMarginalFactor*>(factor.get());
+        if (marginal) {
+          const auto constrained =
+              std::dynamic_pointer_cast<gtsam::noiseModel::Constrained>(
+                  marginal->noiseModel());
+          if (constrained) {
+            const auto residual = marginal->unwhitenedError(estimate);
+            consistent = consistent && residual.allFinite();
+            for (Eigen::Index i = 0; i < residual.size(); ++i)
+              if (constrained->sigmas()[i] == 0)
+                consistent = consistent && std::abs(residual[i]) <= 1e-6;
+          }
+        }
         const auto* observation =
             dynamic_cast<const ConditionalObservationFactor*>(factor.get());
         if (observation)
@@ -569,6 +684,8 @@ struct FixedLagGraph::Impl {
         if (!residual.allFinite()) {
           return {Reason::INVALID_INPUT, "Nonfinite graph motion constraint"};
         }
+        maximum_motion_residual = std::max(
+            maximum_motion_residual, residual.cwiseAbs().maxCoeff());
         consistent = consistent && residual.cwiseAbs().maxCoeff() <= 1e-6;
       }
       if (consistent) {
@@ -579,10 +696,19 @@ struct FixedLagGraph::Impl {
         return {Reason::GLOBAL_STALE, "Graph exhausted its solve budget"};
       }
       if (iteration + 1 < config.max_iterations) {
-        smoother.update();
+        if (!smoother.getISAM2().getFixedVariables().empty()) {
+          smoother.RelinearizeRetained();
+          ++retained_relinearizations;
+        } else {
+          smoother.update();
+        }
       }
     }
-    return {Reason::MATCH_FAILED, "Graph motion constraints did not converge"};
+    return {Reason::MATCH_FAILED,
+            "Graph motion constraints did not converge; maximum residual=" +
+                std::to_string(maximum_motion_residual) +
+                "; fixed linearization keys=" +
+                std::to_string(smoother.getISAM2().getFixedVariables().size())};
   }
 
   Result Snapshot(double budget_ms, Clock::time_point started) {
@@ -666,6 +792,89 @@ Result FixedLagGraph::ValidateConfig() const {
 
 bool FixedLagGraph::initialized() const { return !impl_->nodes.empty(); }
 const GlobalState& FixedLagGraph::state() const { return impl_->output; }
+
+Result FixedLagGraph::EnableEvaluationHistory() {
+  if (initialized())
+    return {Reason::INVALID_INPUT, "Evaluation history must start before initialization"};
+  retain_evaluation_history_ = true;
+  return {};
+}
+
+Result FixedLagGraph::EvaluateForTesting(
+    bool batch, GraphEvaluationSnapshot* output) const {
+  if (!output || !initialized() || !retain_evaluation_history_)
+    return {Reason::INVALID_INPUT, "No enabled initialized evaluation history"};
+  GraphEvaluationSnapshot result;
+  result.cutoff_time = impl_->nodes.rbegin()->first;
+  result.retained_nodes = impl_->nodes.size();
+  result.archived_nodes = impl_->evaluation_initial.size() / 2;
+  result.retained_relinearizations = impl_->retained_relinearizations;
+  AlignmentSmoother reference(1.0);
+  const AlignmentSmoother* owner = &impl_->smoother;
+  try {
+    if (batch) {
+      gtsam::GaussNewtonParams parameters;
+      parameters.setLinearSolverType("MULTIFRONTAL_QR");
+      parameters.setMaxIterations(30);
+      parameters.setRelativeErrorTol(1e-10);
+      parameters.setAbsoluteErrorTol(1e-10);
+      gtsam::GaussNewtonOptimizer optimizer(
+          impl_->evaluation_factors, impl_->evaluation_initial, parameters);
+      const auto solution = optimizer.optimize();
+      result.iterations = optimizer.iterations();
+      // One full elimination at the solution. No timestamps, marginalization,
+      // pruning, capacity eviction or omitted historical factors.
+      reference.UpdateConditionalFactors(impl_->evaluation_factors, solution);
+      owner = &reference;
+    }
+    const auto estimate = owner->calculateEstimate();
+    const auto key = PoseKey(impl_->nodes.rbegin()->second.key);
+    const auto pose = estimate.at<gtsam::Pose3>(key);
+    result.map_from_base = FromPose(pose);
+    Eigen::MatrixXd tangent;
+    const auto valid = PosteriorCovariance(*owner, {{key, 6}}, &tangent);
+    if (!valid.ok()) return valid;
+    Matrix6d axes = Matrix6d::Zero();
+    axes.topRightCorner<3, 3>() = pose.rotation().matrix();
+    axes.bottomLeftCorner<3, 3>() = pose.rotation().matrix();
+    result.pose_covariance = axes * tangent * axes.transpose();
+    const auto& factors = batch ? impl_->evaluation_factors : owner->getFactors();
+    for (const auto& factor : factors) {
+      if (!factor) continue;
+      GraphFactorEvaluation item;
+      item.keys.assign(factor->keys().begin(), factor->keys().end());
+      const auto* noise = dynamic_cast<const gtsam::NoiseModelFactor*>(factor.get());
+      item.type = dynamic_cast<const FrozenMarginalFactor*>(factor.get()) ? "marginal" :
+          dynamic_cast<const MotionFactor*>(factor.get()) ? "motion_exact" :
+          dynamic_cast<const ErrorChainFactor*>(factor.get()) ? "error_chain" :
+          dynamic_cast<const ConditionalObservationFactor*>(factor.get()) ? "observation_conditional" :
+          dynamic_cast<const ObservationFactor*>(factor.get()) ? "observation_independent" :
+          noise ? "error_prior" : "marginal";
+      item.error = factor->error(estimate);
+      if (noise) {
+        item.residual = noise->unwhitenedError(estimate);
+        item.weight = noise->weight(estimate);
+        const auto constrained = std::dynamic_pointer_cast<gtsam::noiseModel::Constrained>(
+            noise->noiseModel());
+        if (constrained) {
+          for (Eigen::Index i = 0; i < item.residual.size(); ++i)
+            if (constrained->sigmas()[i] == 0)
+              result.maximum_exact_residual = std::max(
+                  result.maximum_exact_residual, std::abs(item.residual[i]));
+        }
+      }
+      if (!std::isfinite(item.error) || !std::isfinite(item.weight) ||
+          !item.residual.allFinite())
+        return {Reason::INVALID_INPUT, "Nonfinite evaluation factor"};
+      result.objective += item.error;
+      result.factors.push_back(std::move(item));
+    }
+  } catch (const std::exception& error) {
+    return {Reason::MATCH_FAILED, std::string("Evaluation: ") + error.what()};
+  }
+  *output = std::move(result);
+  return {};
+}
 
 Result FixedLagGraph::ValidateConditionalObservation(
     const LocalState& local, const GlobalObservation& observation) {
@@ -784,6 +993,7 @@ Result FixedLagGraph::Initialize(const LocalState& local,
   if (!valid.ok()) {
     return valid;
   }
+  if (retain_evaluation_history_) candidate->Archive(factors, values);
   impl_.swap(candidate);
   return {};
 }
@@ -851,11 +1061,17 @@ Result FixedLagGraph::AddLocal(const LocalState& local,
   if (!valid.ok()) {
     return valid;
   }
+  if (retain_evaluation_history_) candidate->Archive(factors, values);
   impl_.swap(candidate);
   return {};
 }
 
-Result FixedLagGraph::Observe(const GlobalObservation& observation) {
+Result FixedLagGraph::Observe(const GlobalObservation& observation,
+                              ObservationInnovation* diagnostics) {
+  if (diagnostics != nullptr) {
+    *diagnostics = ObservationInnovation();
+    diagnostics->unavailable_reason = "innovation_not_computed";
+  }
   if (!initialized()) {
     return {Reason::GLOBAL_UNAVAILABLE, "Graph has no verified anchor"};
   }
@@ -922,9 +1138,16 @@ Result FixedLagGraph::Observe(const GlobalObservation& observation) {
                            config_.robust_threshold);
   const auto predicted = candidate->smoother.calculateEstimate<gtsam::Pose3>(
       PoseKey(found->second.key));
+  if (observation.kind == GlobalObservation::Kind::HEADING) {
+    const Eigen::Vector3d direction =
+        predicted.rotation().matrix() * observation.direction_in_base;
+    if (direction.head<2>().squaredNorm() < 1e-8)
+      return {Reason::DEGENERATE, "Graph baseline azimuth is undefined"};
+  }
   gtsam::Matrix jacobian;
   gtsam::Vector residual = factor.evaluateError(predicted, &jacobian);
   gtsam::Matrix innovation;
+  Eigen::MatrixXd joint;
   try {
     const auto estimate = candidate->smoother.calculateEstimate();
     const auto pose_key = PoseKey(found->second.key);
@@ -933,7 +1156,6 @@ Result FixedLagGraph::Observe(const GlobalObservation& observation) {
     const Eigen::Index error_dimension = JointOutputJacobian(error_found->second.local).cols();
     if (observation.conditional_local_error_qualified)
       query.emplace_back(error_key, error_dimension);
-    Eigen::MatrixXd joint;
     const auto marginal = PosteriorCovariance(candidate->smoother, query, &joint);
     if (!marginal.ok()) return marginal;
     innovation = jacobian * joint.topLeftCorner(6, 6) *
@@ -956,6 +1178,27 @@ Result FixedLagGraph::Observe(const GlobalObservation& observation) {
     return {Reason::INVALID_INPUT, "Invalid graph innovation"};
   }
   const double distance = residual.dot(whiten.solve(residual));
+  if (diagnostics != nullptr) {
+    diagnostics->available = true;
+    diagnostics->unavailable_reason.clear();
+    diagnostics->prior_state_frame = "map_from_base";
+    diagnostics->observed_dimension =
+        static_cast<uint32_t>(residual.size());
+    diagnostics->prior_state_dimension = 6;
+    diagnostics->residual = residual;
+    diagnostics->covariance = innovation;
+    diagnostics->nis = distance;
+    diagnostics->gate_threshold = config_.innovation_gate;
+    diagnostics->covariance_model =
+        observation.conditional_local_error_qualified
+            ? "graph_conditional_joint_innovation"
+            : "graph_independent_observation_innovation";
+    const Eigen::Isometry3d prior_pose = FromPose(predicted);
+    diagnostics->prior_pose.translation = prior_pose.translation();
+    diagnostics->prior_pose.rotation =
+        Eigen::Quaterniond(prior_pose.linear()).normalized();
+    diagnostics->prior_covariance = joint.topLeftCorner<6, 6>();
+  }
   if (!std::isfinite(distance) || distance > config_.innovation_gate) {
     return {Reason::INNOVATION_REJECTED,
             "Graph observed-subspace innovation rejected"};
@@ -1000,6 +1243,7 @@ Result FixedLagGraph::Observe(const GlobalObservation& observation) {
     candidate->output.last_georeference =
         std::max(candidate->output.last_georeference, observation.stamp.time);
   }
+  if (retain_evaluation_history_) candidate->Archive(factors, {});
   impl_.swap(candidate);
   return {};
 }

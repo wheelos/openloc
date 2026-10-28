@@ -4,6 +4,7 @@
 #include "candidates/local/local_lio.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <map>
 
@@ -334,6 +335,58 @@ TEST(LocalLioGeometryTest, StoredPlaneErrorRetainsSupportAndOriginalNoiseReuse) 
   EXPECT_EQ(errors.size(), 2);
 }
 
+TEST(LocalLioGeometryTest, FrozenVoxelSupportUsesWorldPointsAndResetsWithEpoch) {
+  LocalLio lio(LioConfig());
+  for (uint64_t generation : {1, 2}) {
+    const Epoch epoch{"voxel-cache", generation};
+    LocalState state = State(
+        2, epoch, generation == 1 ? Eigen::Vector3d(-0.4, 0.2, -0.8)
+                                 : Eigen::Vector3d(0.6, -0.8, 1.2),
+        Eigen::Quaterniond::Identity());
+    LidarScan scan;
+    scan.stamp = state.stamp;
+    scan.stamp.sequence = generation;
+    scan.epoch = epoch;
+    scan.frame_id = "lidar";
+    scan.calibration_id = "calibration";
+    std::map<std::array<int, 3>, std::vector<Eigen::Vector3d>> expected;
+    for (double x : {0.11, 0.31, 0.51, 0.71, 0.91}) {
+      for (double y : {0.13, 0.23, 0.33, 0.43, 0.53}) {
+        const Eigen::Vector3d point(x, y, 0.37 + 0.1 * x + 0.2 * y);
+        scan.points.push_back({point, 2});
+        const Eigen::Vector3d world = Pose(state) * point;
+        const std::array<int, 3> key{{
+            static_cast<int>(std::floor(world.x())),
+            static_cast<int>(std::floor(world.y())),
+            static_cast<int>(std::floor(world.z()))}};
+        expected[key].push_back(world);
+      }
+    }
+    EXPECT_EQ(Reason::GEOMETRY_UNAVAILABLE,
+              lio.Observe(scan, [&](double, LocalState* output) {
+                *output = state;
+                return Result{};
+              }, &state).reason);
+    std::vector<StoredPlaneError> errors;
+    ASSERT_TRUE(lio.GeometryErrorMap(&errors).ok());
+    EXPECT_EQ(expected.size(), errors.size());
+    EXPECT_EQ(1U, lio.scan_count());
+    for (const auto& plane : errors) {
+      const auto& center = plane.center;
+      const std::array<int, 3> key{{
+          static_cast<int>(std::floor(center.x())),
+          static_cast<int>(std::floor(center.y())),
+          static_cast<int>(std::floor(center.z()))}};
+      ASSERT_EQ(1U, expected.count(key));
+      ASSERT_EQ(expected.at(key).size(), plane.points.size());
+      for (size_t i = 0; i < plane.points.size(); ++i) {
+        EXPECT_EQ(generation, plane.points[i].source_sequence);
+        EXPECT_TRUE(plane.points[i].point.isApprox(expected.at(key)[i], 1e-12));
+      }
+    }
+  }
+}
+
 TEST(LocalLioGeometryTest, UndefinedStoredGeometryBranchesCannotReplaceErrorMap) {
   const Epoch epoch{"stored-plane-branch", 1};
   LocalState state = State(2, epoch, Eigen::Vector3d::Zero(),
@@ -463,6 +516,102 @@ TEST(LocalLioGeometryTest, RelinearizationDoesNotReapplyTheSamePlanarObservation
   EXPECT_NEAR(iterated.position.x(), once.position.x(), 1e-10);
   EXPECT_NEAR(iterated.velocity.x(), once.velocity.x(), 1e-10);
   EXPECT_TRUE(iterated.covariance.isApprox(once.covariance, 1e-10));
+}
+
+TEST(LocalLioGeometryTest, LargeAnchorUncertaintyDoesNotErasePlanarGeometry) {
+  const Epoch epoch{"uncertain-gauge", 1};
+  auto config = LioConfig();
+  config.lidar_min_correspondences = 10;
+  for (const double variance : {0.01, 1e8}) {
+    LocalLio lio(config);
+    auto state = State(1, epoch, Eigen::Vector3d::Zero(),
+                       Eigen::Quaterniond::Identity());
+    state.covariance = Matrix15d::Identity() * variance;
+    LidarScan scan;
+    scan.stamp = state.stamp;
+    scan.epoch = epoch;
+    scan.frame_id = "lidar";
+    scan.calibration_id = "calibration";
+    for (int x = -2; x <= 2; ++x)
+      for (int y = -2; y <= 2; ++y)
+        for (double dx : {0.15, 0.35, 0.55})
+          for (double dy : {0.17, 0.37, 0.57})
+            scan.points.push_back({Eigen::Vector3d(x + dx, y + dy, 0.42), 1});
+    const auto lookup = [&](double, LocalState* output) {
+      *output = state;
+      return Result{};
+    };
+    ASSERT_EQ(Reason::GEOMETRY_UNAVAILABLE, lio.Observe(scan, lookup, &state).reason);
+    scan.stamp.sequence++;
+    state.position.z() = 0.01;
+    const auto prior = state.covariance;
+    const auto result = lio.Observe(scan, lookup, &state);
+    ASSERT_TRUE(result.ok()) << result.message;
+    EXPECT_EQ(3, lio.observed_pose_basis().rows());
+    EXPECT_LT(lio.observed_pose_basis().col(0).norm(), 1e-10);
+    EXPECT_LT(lio.observed_pose_basis().col(1).norm(), 1e-10);
+    EXPECT_GT(state.position.z(), 0);
+    EXPECT_LT(state.position.z(), 0.01);
+    EXPECT_GE(state.covariance(2, 2), prior(2, 2));
+    EXPECT_FALSE(state.covariance_model_valid);
+    EXPECT_FALSE(state.uncertainty_qualified);
+  }
+}
+
+TEST(LocalLioGeometryTest, DiagnosticGainMemoryCannotReplaceReportedUncertainty) {
+  const Epoch epoch{"gain-memory", 1};
+  auto config = LioConfig();
+  config.lidar_min_correspondences = 10;
+  config.lidar_max_update_iterations = 3;
+  LocalLio lio(config);
+  auto state = State(1, epoch, Eigen::Vector3d::Zero(),
+                     Eigen::Quaterniond::Identity());
+  state.covariance *= 1e10;
+  Matrix15d gain_covariance = Matrix15d::Identity() * 0.01;
+  gain_covariance.block<3, 3>(6, 6) *= 1e-10;
+  LidarScan scan;
+  scan.stamp = state.stamp;
+  scan.epoch = epoch;
+  scan.frame_id = "lidar";
+  scan.calibration_id = "calibration";
+  for (int x = -2; x <= 2; ++x)
+    for (int y = -2; y <= 2; ++y)
+      for (double dx : {0.15, 0.35, 0.55})
+        for (double dy : {0.17, 0.37, 0.57})
+          scan.points.push_back({Eigen::Vector3d(x + dx, y + dy, 0.42), 1});
+  const auto lookup = [&](double, LocalState* output) {
+    *output = state;
+    return Result{};
+  };
+  ASSERT_EQ(Reason::GEOMETRY_UNAVAILABLE,
+            lio.Observe(scan, lookup, &state, {}, &gain_covariance).reason);
+  state.position.z() = 0.01;
+  scan.stamp.sequence++;
+  const auto reported = state.covariance;
+  const auto gain_prior = gain_covariance;
+  Eigen::MatrixXd last_gain, last_h, last_noise;
+  const auto observed = [&](const LioUpdate& update, const auto&, const auto&, const auto&) {
+    last_gain = update.applied_gain;
+    last_h = update.observation;
+    last_noise = update.noise;
+  };
+  ASSERT_TRUE(lio.Observe(scan, lookup, &state, observed, &gain_covariance).ok());
+  const Matrix15d residual = Matrix15d::Identity() - last_gain * last_h;
+  const Matrix15d expected =
+      residual * gain_prior * residual.transpose() +
+      last_gain * last_noise * last_gain.transpose();
+  EXPECT_NEAR(expected(2, 2), gain_covariance(2, 2), 1e-10);
+  EXPECT_NEAR(0.01 * gain_covariance(2, 2) / gain_prior(2, 2),
+              state.position.z(), 1e-9);
+  EXPECT_LT(gain_covariance(2, 2), gain_prior(2, 2));
+  EXPECT_GE(state.covariance(2, 2), reported(2, 2));
+  EXPECT_FALSE(state.covariance_model_valid);
+  EXPECT_FALSE(state.uncertainty_qualified);
+  const auto committed = gain_covariance;
+  scan.points[0].time = 0;
+  EXPECT_EQ(Reason::POINT_TIME_MISSING,
+            lio.Observe(scan, lookup, &state, {}, &gain_covariance).reason);
+  EXPECT_TRUE(committed.isApprox(gain_covariance, 0));
 }
 
 }  // namespace

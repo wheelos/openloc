@@ -18,6 +18,9 @@ struct GnssPositionGatePolicy {
   int64_t maximum_fixed_solution_gap_ns = 2'000'000'000LL;
   // NaN denotes absent receiver accuracy, never a covariance estimate.
   bool allow_missing_horizontal_accuracy_diagnostic = false;
+  // NaN alone denotes an absent HDOP field (e.g. NovAtel BESTPOS).
+  // Zero, negative and infinite HDOP remain invalid; other gates are unchanged.
+  bool allow_missing_hdop = false;
 };
 
 // Receiver admission only, not another global estimator. Callers serialize.

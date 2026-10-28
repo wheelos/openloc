@@ -35,6 +35,39 @@ LocalConfig LinearizationConfig() {
   return config;
 }
 
+TEST(ContinuousOutputTest, AnalyticNoiseAvoidsCancellationOfLargeMarginals) {
+  const auto config = LinearizationConfig();
+  auto previous = State(1, 0);
+  Matrix15d basis = Matrix15d::Identity();
+  for (int row = 1; row < 15; ++row)
+    for (int col = 0; col < row; ++col)
+      basis(row, col) = 0.17 * (row + 1) / (col + 2);
+  previous.covariance = 1e8 * basis * basis.transpose();
+  Matrix15d transition = Matrix15d::Identity();
+  transition.block<3, 3>(0, 3).diagonal().setConstant(0.005);
+  transition.block<3, 3>(3, 6).setConstant(0.0003);
+  const Matrix15d noise = Matrix15d::Identity() * 1e-10;
+  auto current = State(1.005, 0);
+  current.covariance =
+      transition * previous.covariance * transition.transpose() + noise;
+  current.covariance =
+      (0.5 * (current.covariance + current.covariance.transpose())).eval();
+  ContinuousOutput subtracting(config), analytic(config);
+  subtracting.Reset(previous);
+  analytic.Reset(previous);
+  EXPECT_EQ(Reason::INVALID_INPUT,
+            subtracting.Advance(previous, current, transition, 0.005).reason);
+  ASSERT_TRUE(analytic.Advance(previous, current, transition, 0.005, &noise).ok());
+  EXPECT_TRUE(analytic.state().covariance.isApprox(current.covariance, 1e-14));
+  EXPECT_TRUE(analytic.state().position.isZero());
+  auto invalid = noise;
+  invalid(0, 0) = -0.01;
+  EXPECT_EQ(Reason::INVALID_INPUT,
+            analytic.Advance(current, State(1.01, 0), transition, 0.005,
+                             &invalid).reason);
+  EXPECT_DOUBLE_EQ(1.005, analytic.state().stamp.time);
+}
+
 TEST(ContinuousOutputTest, JointErrorMapRetainsEndpointAndCorrectionMemory) {
   auto config = LinearizationConfig();
   ContinuousOutput output(config);

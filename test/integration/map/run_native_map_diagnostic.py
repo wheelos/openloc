@@ -27,6 +27,7 @@ from native_lio_report import (
     summarize_initialization, summarize_local_corrections,
 )
 from prepare_native_lio import digest
+from evaluate_native_fusion import audit_replay
 
 
 def write_csv(path, header, values):
@@ -694,6 +695,7 @@ def report(input_dir, replay, bundle, binary, output, gnss=None, arm="map",
                 "reason": "Motion-derived XY/yaw acquired with later holdouts; "
                           "height, full pose and trusted output remain unavailable.",
             })
+    evidence["evaluation"] = audit_replay(replay, evidence)
     output.mkdir()
     (output / "report.json").write_text(json.dumps(evidence, indent=2) + "\n")
     initialized = ([r for r in rows(replay / "global.csv")
@@ -724,6 +726,30 @@ def report(input_dir, replay, bundle, binary, output, gnss=None, arm="map",
         + html.escape(json.dumps(evidence, indent=2)) + "</pre>"
     )
     return evidence
+
+
+def global_odom_fault_arguments(arm, drift, step):
+    if drift is not None and step is not None:
+        raise ValueError("global ODOM drift and step are mutually exclusive")
+    if drift is None and step is None:
+        return None
+    if arm == "odom":
+        raise ValueError("global ODOM fault requires a global source arm")
+    kind, values = ("drift", drift) if drift is not None else ("step", step)
+    try:
+        start_ns = int(values[0])
+        offset = [float(values[1]), float(values[2])]
+    except (TypeError, ValueError, IndexError) as error:
+        raise ValueError("global ODOM fault requires START_NS X Y") from error
+    if start_ns <= 0 or not all(math.isfinite(value) for value in offset):
+        raise ValueError("global ODOM fault requires a positive time and finite offset")
+    flag = "--global-odom-drift" if kind == "drift" else "--global-odom-step"
+    return {
+        "kind": kind,
+        "start_ns": start_ns,
+        "offset": offset,
+        "arguments": [flag, str(start_ns), *(format(value, ".17g") for value in offset)],
+    }
 
 
 def main():
@@ -766,6 +792,12 @@ def main():
     parser.add_argument("--lidar-stationary-initialization", action="store_true")
     parser.add_argument("--motion-bootstrap-voxel-m", type=float)
     parser.add_argument("--global-holdback-ns", type=int, default=0)
+    parser.add_argument("--global-odom-drift", nargs=3,
+                        metavar=("START_NS", "X_MPS", "Y_MPS"),
+                        help="diagnostic fault applied only to global-owner ODOM")
+    parser.add_argument("--global-odom-step", nargs=3,
+                        metavar=("START_NS", "X_M", "Y_M"),
+                        help="diagnostic fault applied only to global-owner ODOM")
     parser.add_argument("--map-window-radius-m", type=float, default=15.0)
     parser.add_argument("--map-window-cell-m", type=float, default=2.0)
     parser.add_argument("--container",
@@ -795,6 +827,11 @@ def main():
         parser.error("global holdback must be in [0,500000000] ns")
     if args.global_holdback_ns and args.arm == "odom":
         parser.error("global holdback requires map or GNSS input")
+    try:
+        odometry_fault = global_odom_fault_arguments(
+            args.arm, args.global_odom_drift, args.global_odom_step)
+    except ValueError as error:
+        parser.error(str(error))
     if bool(args.recovery_policy) != bool(args.recovery_policy_sha256):
         parser.error("causal recovery policy and explicit hash required together")
     if args.recovery_policy and (
@@ -876,6 +913,8 @@ def main():
         command += ["--motion-bootstrap-voxel-m", str(args.motion_bootstrap_voxel_m)]
     if args.global_holdback_ns:
         command += ["--global-holdback-ns", str(args.global_holdback_ns)]
+    if odometry_fault:
+        command.extend(odometry_fault["arguments"])
     if args.container:
         command = ["docker", "exec", "--user", f"{os.getuid()}:{os.getgid()}",
                    "-w", "/apollo/pkgs/openloc", args.container,
@@ -907,6 +946,15 @@ def main():
                       args.output / "report",
                       args.gnss_input if use_gnss else None, args.arm,
                       execution_runtime)
+    if odometry_fault:
+        evidence["global_odom_fault_injection"] = {
+            "kind": odometry_fault["kind"],
+            "start_ns": odometry_fault["start_ns"],
+            "offset": odometry_fault["offset"],
+            "scope": "global alignment owner input only; local ODOM and scans unchanged",
+        }
+        (args.output / "report/report.json").write_text(
+            json.dumps(evidence, indent=2) + "\n")
     if args.compare_odometry:
         evidence["odometry_isolation"] = compare_odometry(
             args.output / "replay/odometry.csv", args.compare_odometry)

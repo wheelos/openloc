@@ -373,7 +373,12 @@ Result GlobalAlignment::LookupExact(double time, LocalState* local) const {
   return Lookup(time, local);
 }
 
-Result GlobalAlignment::Observe(const GlobalObservation& observation) {
+Result GlobalAlignment::Observe(const GlobalObservation& observation,
+                                ObservationInnovation* diagnostics) {
+  if (diagnostics != nullptr) {
+    *diagnostics = ObservationInnovation();
+    diagnostics->unavailable_reason = "prior_state_unavailable";
+  }
   const auto existing = evidence_.find(observation.source);
   if (!config_.enable_fixed_lag_graph || existing == evidence_.end() ||
       observation.stamp.time >= existing->second.observation.stamp.time) {
@@ -383,13 +388,19 @@ Result GlobalAlignment::Observe(const GlobalObservation& observation) {
     return {Reason::INVALID_INPUT, "too many global sources"};
   }
   auto& source = sources_[observation.source];
+  const bool bounded_horizontal =
+      config_.enable_heading_bootstrap && !state_.valid &&
+      !observation.conditional_local_error_qualified &&
+      (observation.kind == GlobalObservation::Kind::HEADING ||
+       observation.kind == GlobalObservation::Kind::POSITION ||
+       observation.kind == GlobalObservation::Kind::HORIZONTAL_POSITION);
   const auto valid_config = ValidateConfig();
   if (!valid_config.ok()) {
     return Reject(valid_config.reason, valid_config.message, &source);
   }
   if (observation.source.empty() || !observation.quality_valid ||
       (config_.enable_fixed_lag_graph && !observation.independent_of_local &&
-       !observation.conditional_local_error_qualified) ||
+       !observation.conditional_local_error_qualified && !bounded_horizontal) ||
       (!config_.enable_fixed_lag_graph &&
        observation.conditional_local_error_qualified) ||
       !ValidGlobalObservationGeometry(observation) ||
@@ -439,7 +450,8 @@ Result GlobalAlignment::Observe(const GlobalObservation& observation) {
     const auto model = FixedLagGraph::ValidateConditionalObservation(local, observation);
     if (!model.ok()) return Reject(model.reason, model.message, &source);
   }
-  if (config_.enable_fixed_lag_graph && graph_ && state_.valid &&
+  if (config_.enable_fixed_lag_graph &&
+      !config_.graph_retain_on_full_pose_staleness && graph_ && state_.valid &&
       observation.stamp.receive_time - state_.last_full_observation >
           config_.global_timeout) {
     Invalidate(Reason::GLOBAL_STALE);
@@ -473,8 +485,17 @@ Result GlobalAlignment::Observe(const GlobalObservation& observation) {
   if (!lookup.ok()) {
     return Reject(lookup.reason, lookup.message, &source);
   }
+  if (observation.kind == GlobalObservation::Kind::HEADING) {
+    Eigen::Vector3d direction =
+        local.orientation * observation.direction_in_base;
+    if (state_.valid) direction = state_.map_to_odom.linear() * direction;
+    if (direction.head<2>().squaredNorm() < 1e-8) {
+      return Reject(Reason::DEGENERATE,
+                    "baseline azimuth is undefined near vertical", &source);
+    }
+  }
   if (graph_update) {
-    const auto observed = graph_->Observe(observation);
+    const auto observed = graph_->Observe(observation, diagnostics);
     if (!observed.ok()) {
       return Reject(observed.reason, observed.message, &source);
     }
@@ -499,7 +520,7 @@ Result GlobalAlignment::Observe(const GlobalObservation& observation) {
     state_ = Predict(observation.stamp.time);
   }
   if (observation.kind != GlobalObservation::Kind::POSE) {
-    return ObservePartial(observation, local, &source);
+    return ObservePartial(observation, local, &source, diagnostics);
   }
   const Eigen::Isometry3d measured = observation.pose * Pose(local).inverse();
   const Matrix6d covariance =
@@ -576,6 +597,24 @@ Result GlobalAlignment::Observe(const GlobalObservation& observation) {
         2.0 * (state_.covariance + covariance);
     const double distance =
         innovation.dot(innovation_covariance.ldlt().solve(innovation));
+    if (diagnostics != nullptr) {
+      diagnostics->available = true;
+      diagnostics->unavailable_reason.clear();
+      diagnostics->prior_state_frame = "map_from_odom";
+      diagnostics->observed_dimension =
+          static_cast<uint32_t>(innovation.size());
+      diagnostics->prior_state_dimension = 6;
+      diagnostics->residual = innovation;
+      diagnostics->covariance = innovation_covariance;
+      diagnostics->nis = distance;
+      diagnostics->gate_threshold = config_.innovation_gate;
+      diagnostics->residual_basis = "map.translation_m.left_rotation_rad.v1";
+      diagnostics->covariance_model = "diagnostic_ci_full_pose_bound";
+      diagnostics->prior_pose.translation = state_.map_to_odom.translation();
+      diagnostics->prior_pose.rotation =
+          Eigen::Quaterniond(state_.map_to_odom.linear()).normalized();
+      diagnostics->prior_covariance = state_.covariance;
+    }
     if (!std::isfinite(distance) || distance > config_.innovation_gate) {
       return Reject(Reason::INNOVATION_REJECTED, "global innovation rejected",
                     &source);
@@ -612,13 +651,20 @@ Result GlobalAlignment::Observe(const GlobalObservation& observation) {
 
 Result GlobalAlignment::ObservePartial(const GlobalObservation& observation,
                                        const LocalState& local,
-                                       SourceCounters* source) {
+                                       SourceCounters* source,
+                                       ObservationInnovation* diagnostics) {
   if (observation.recovery) {
     return Reject(Reason::DEGENERATE,
                   "partial evidence cannot complete full-pose recovery",
                   source);
   }
   if (!state_.valid) {
+    if (config_.enable_heading_bootstrap &&
+        (observation.kind == GlobalObservation::Kind::HEADING ||
+         observation.kind == GlobalObservation::Kind::POSITION ||
+         observation.kind == GlobalObservation::Kind::HORIZONTAL_POSITION)) {
+      return ObserveHeadingAcquisition(observation, local, source, diagnostics);
+    }
     if (observation.kind != GlobalObservation::Kind::POSITION &&
         observation.kind != GlobalObservation::Kind::HORIZONTAL_POSITION) {
       return Reject(Reason::GLOBAL_UNAVAILABLE,
@@ -627,7 +673,7 @@ Result GlobalAlignment::ObservePartial(const GlobalObservation& observation,
     }
     if (config_.enable_diagnostic_horizontal_bootstrap &&
         observation.kind == GlobalObservation::Kind::HORIZONTAL_POSITION) {
-      return ObserveHorizontal(observation, local, source);
+      return ObserveHorizontal(observation, local, source, diagnostics);
     }
     // A directly measured point is useful before global rotation is known.
     evidence_[observation.source] = {observation, local};
@@ -643,6 +689,7 @@ Result GlobalAlignment::ObservePartial(const GlobalObservation& observation,
   const auto predicted = state_.map_to_odom * Pose(local);
   Eigen::MatrixXd h;
   Eigen::MatrixXd noise;
+  Eigen::MatrixXd observation_noise;
   Eigen::VectorXd residual;
   if (observation.kind == GlobalObservation::Kind::POSITION ||
       observation.kind == GlobalObservation::Kind::HORIZONTAL_POSITION) {
@@ -661,11 +708,35 @@ Result GlobalAlignment::ObservePartial(const GlobalObservation& observation,
     noise = 2.0 * (observation.covariance.topLeftCorner<3, 3>() +
                    local_jacobian * PoseCovariance(local) *
                        local_jacobian.transpose());
+    observation_noise = observation.covariance.topLeftCorner<3, 3>();
     if (observation.kind == GlobalObservation::Kind::HORIZONTAL_POSITION) {
       h = h.topRows(2).eval();
       residual = residual.head(2).eval();
       noise = noise.topLeftCorner(2, 2).eval();
+      observation_noise = observation_noise.topLeftCorner(2, 2).eval();
     }
+  } else if (observation.kind == GlobalObservation::Kind::HEADING) {
+    const Eigen::Vector3d direction =
+        predicted.linear() * observation.direction_in_base;
+    const double squared = direction.head<2>().squaredNorm();
+    if (squared < 1e-8)
+      return Reject(Reason::DEGENERATE, "baseline azimuth is undefined", source);
+    const Eigen::RowVector3d azimuth =
+        Eigen::RowVector3d(-direction.y(), direction.x(), 0.0) / squared;
+    h = Eigen::Matrix<double, 1, 6>::Zero();
+    h.rightCols(3) = -azimuth * Skew(direction);
+    const double delta = observation.heading_rad -
+                         std::atan2(direction.y(), direction.x());
+    residual = Eigen::VectorXd::Constant(
+        1, std::atan2(std::sin(delta), std::cos(delta)));
+    const Eigen::RowVector3d local_jacobian =
+        -azimuth * predicted.linear() * Skew(observation.direction_in_base);
+    noise = Eigen::Matrix<double, 1, 1>::Constant(
+        2.0 * (observation.heading_variance +
+               (local_jacobian * local.covariance.block<3, 3>(6, 6) *
+                local_jacobian.transpose())(0, 0)));
+    observation_noise = Eigen::Matrix<double, 1, 1>::Constant(
+        observation.heading_variance);
   } else {
     Matrix6d alignment_jacobian = Matrix6d::Identity();
     alignment_jacobian.topRightCorner<3, 3>() =
@@ -679,10 +750,39 @@ Result GlobalAlignment::ObservePartial(const GlobalObservation& observation,
                    observation.projection * local_jacobian *
                        PoseCovariance(local) * local_jacobian.transpose() *
                        observation.projection.transpose());
+    observation_noise = observation.projected_covariance;
   }
   const Eigen::MatrixXd innovation =
       2.0 * (h * state_.covariance * h.transpose() + noise);
   const double distance = residual.dot(innovation.ldlt().solve(residual));
+  if (diagnostics != nullptr) {
+    diagnostics->available = true;
+    diagnostics->unavailable_reason.clear();
+    diagnostics->prior_state_frame = "map_from_odom";
+    diagnostics->observed_dimension = static_cast<uint32_t>(residual.size());
+    diagnostics->prior_state_dimension = 6;
+    diagnostics->residual = residual;
+    diagnostics->covariance = innovation;
+    diagnostics->nis = distance;
+    diagnostics->gate_threshold = config_.innovation_gate;
+    diagnostics->covariance_model = "diagnostic_ci_partial_bound";
+    if (observation.kind == GlobalObservation::Kind::HORIZONTAL_POSITION)
+      diagnostics->residual_basis = "map.xy_m.v1";
+    else if (observation.kind == GlobalObservation::Kind::POSITION)
+      diagnostics->residual_basis = "map.xyz_m.v1";
+    else if (observation.kind == GlobalObservation::Kind::HEADING)
+      diagnostics->residual_basis = "map.baseline_azimuth_rad.v1";
+    diagnostics->covariance_decomposition_available = true;
+    diagnostics->prior_contribution =
+        2.0 * h * state_.covariance * h.transpose();
+    diagnostics->observation_contribution = 4.0 * observation_noise;
+    diagnostics->local_contribution =
+        2.0 * noise - diagnostics->observation_contribution;
+    diagnostics->prior_pose.translation = state_.map_to_odom.translation();
+    diagnostics->prior_pose.rotation =
+        Eigen::Quaterniond(state_.map_to_odom.linear()).normalized();
+    diagnostics->prior_covariance = state_.covariance;
+  }
   if (!std::isfinite(distance) || distance > config_.innovation_gate) {
     evidence_.erase(observation.source);
     return Reject(Reason::INNOVATION_REJECTED,
@@ -730,9 +830,128 @@ Result GlobalAlignment::ObservePartial(const GlobalObservation& observation,
   return {};
 }
 
+Result GlobalAlignment::ObserveHeadingAcquisition(
+    const GlobalObservation& observation, const LocalState& local,
+    SourceCounters* source, ObservationInnovation* diagnostics) {
+  if (diagnostics != nullptr) {
+    diagnostics->unavailable_reason =
+        "heading_acquisition_does_not_compute_a_scalar_innovation";
+  }
+  if (!observation.measurement_timestamp_ns ||
+      observation.conditional_local_error_qualified) {
+    return Reject(Reason::CORRELATION_UNQUALIFIED,
+                  "partial heading acquisition requires exact time and an "
+                  "unconditional source model", source);
+  }
+  // This is a separate, uncalibrated horizontal result, not a graph prior.
+  // Retain original source/local pairs; never invent unmeasured Z or tilt.
+  const bool heading_input =
+      observation.kind == GlobalObservation::Kind::HEADING;
+  const GlobalEvidence current{observation, local};
+  const GlobalEvidence* heading = heading_input ? &current : nullptr;
+  const GlobalEvidence* position = heading_input ? nullptr : &current;
+  for (const auto& entry : evidence_) {
+    const auto& candidate = entry.second;
+    const auto& input = candidate.observation;
+    if (input.conditional_local_error_qualified ||
+        !input.measurement_timestamp_ns ||
+        std::abs(input.stamp.time - observation.stamp.time) >
+            config_.global_timeout) continue;
+    if (!heading_input && input.kind == GlobalObservation::Kind::HEADING &&
+        (!heading || input.stamp.time > heading->observation.stamp.time))
+      heading = &candidate;
+    if (heading_input &&
+        (input.kind == GlobalObservation::Kind::POSITION ||
+         input.kind == GlobalObservation::Kind::HORIZONTAL_POSITION) &&
+        (!position || input.stamp.time > position->observation.stamp.time))
+      position = &candidate;
+  }
+  if (heading && position) {
+    const auto& h = heading->observation;
+    const auto& p = position->observation;
+    const Eigen::Vector3d direction =
+        heading->local.orientation * h.direction_in_base;
+    const double squared = direction.head<2>().squaredNorm();
+    if (squared < 1e-8)
+      return Reject(Reason::DEGENERATE, "baseline azimuth is undefined", source);
+    const double delta = h.heading_rad -
+                         std::atan2(direction.y(), direction.x());
+    const double yaw = std::atan2(std::sin(delta), std::cos(delta));
+    const Eigen::Matrix2d rotation =
+        Eigen::Rotation2Dd(yaw).toRotationMatrix();
+    HorizontalGlobalState horizontal;
+    horizontal.odom_reference_xy =
+        (position->local.position +
+         position->local.orientation * p.point_in_base).head<2>();
+    horizontal.alignment.head<2>() = p.pose.translation().head<2>();
+    horizontal.alignment.z() = yaw;
+    const Eigen::RowVector3d azimuth =
+        Eigen::RowVector3d(-direction.y(), direction.x(), 0.0) / squared;
+    const Eigen::RowVector3d heading_jacobian =
+        -azimuth * heading->local.orientation.toRotationMatrix() *
+        Skew(h.direction_in_base);
+    Eigen::Matrix<double, 2, 6> point_jacobian;
+    point_jacobian.leftCols<3>() =
+        rotation * Eigen::Matrix<double, 2, 3>::Identity();
+    point_jacobian.rightCols<3>() =
+        -point_jacobian.leftCols<3>() *
+        position->local.orientation.toRotationMatrix() * Skew(p.point_in_base);
+    // Two correlation bounds: source/local, then position/heading. No claim
+    // that two messages from one receiver are independent measurements.
+    horizontal.covariance.topLeftCorner<2, 2>() = 4.0 *
+        (p.covariance.topLeftCorner<2, 2>() +
+         point_jacobian * PoseCovariance(position->local) *
+             point_jacobian.transpose());
+    horizontal.covariance(2, 2) = 4.0 *
+        (h.heading_variance +
+         (heading_jacobian * heading->local.covariance.block<3, 3>(6, 6) *
+          heading_jacobian.transpose())(0, 0));
+    horizontal.last_observation = std::min(h.stamp.time, p.stamp.time);
+    horizontal.last_observation_ns =
+        std::min(*h.measurement_timestamp_ns, *p.measurement_timestamp_ns);
+    horizontal.covariance_time =
+        std::max(h.stamp.time, p.stamp.time);
+    if (state_.horizontal &&
+        observation.stamp.time - state_.horizontal->last_observation <=
+            config_.global_timeout) {
+      const auto prior = Predict(horizontal.covariance_time).horizontal.value();
+      const Eigen::Matrix2d prior_rotation =
+          Eigen::Rotation2Dd(prior.alignment.z()).toRotationMatrix();
+      const Eigen::Vector2d displacement =
+          horizontal.odom_reference_xy - prior.odom_reference_xy;
+      Eigen::Vector3d residual;
+      residual.head<2>() = horizontal.alignment.head<2>() -
+          (prior.alignment.head<2>() + prior_rotation * displacement);
+      const double angle = yaw - prior.alignment.z();
+      residual.z() = std::atan2(std::sin(angle), std::cos(angle));
+      Eigen::Matrix3d reference_jacobian = Eigen::Matrix3d::Identity();
+      const Eigen::Vector2d rotated = prior_rotation * displacement;
+      reference_jacobian.block<2, 1>(0, 2) =
+          Eigen::Vector2d(-rotated.y(), rotated.x());
+      const Eigen::Matrix3d innovation = 2.0 *
+          (horizontal.covariance + reference_jacobian * prior.covariance *
+                                       reference_jacobian.transpose());
+      const double distance = residual.dot(innovation.ldlt().solve(residual));
+      if (!std::isfinite(distance) || distance > config_.innovation_gate)
+        return Reject(Reason::INNOVATION_REJECTED,
+                      "position/heading acquisition innovation rejected", source);
+    }
+    state_.horizontal = horizontal;
+    ++state_.correction_id;
+  }
+  evidence_[observation.source] = current;
+  ++source->accepted;
+  source->reason = Reason::NONE;
+  reason_ = Reason::DEGENERATE;
+  return {Reason::NONE, state_.horizontal
+                            ? "diagnostic_position_heading_updated"
+                            : "retained_position_heading_waiting_for_pair"};
+}
+
 Result GlobalAlignment::ObserveHorizontal(const GlobalObservation& observation,
                                          const LocalState& local,
-                                         SourceCounters* source) {
+                                         SourceCounters* source,
+                                         ObservationInnovation* diagnostics) {
   if (!observation.measurement_timestamp_ns) {
     return Reject(Reason::INVALID_INPUT,
                   "Horizontal acquisition requires original integer time",
@@ -816,6 +1035,25 @@ Result GlobalAlignment::ObserveHorizontal(const GlobalObservation& observation,
     const Eigen::Matrix2d innovation =
         2.0 * (h * predicted.covariance * h.transpose() + noise);
     const double distance = residual.dot(innovation.ldlt().solve(residual));
+    if (diagnostics != nullptr) {
+      diagnostics->available = true;
+      diagnostics->unavailable_reason.clear();
+      diagnostics->prior_state_frame = "map_from_odom_xy_yaw";
+      diagnostics->observed_dimension = static_cast<uint32_t>(residual.size());
+      diagnostics->prior_state_dimension = 3;
+      diagnostics->residual = residual;
+      diagnostics->covariance = innovation;
+      diagnostics->nis = distance;
+      diagnostics->gate_threshold = config_.innovation_gate;
+      diagnostics->covariance_model = "diagnostic_horizontal_ci_bound";
+      diagnostics->residual_basis = "map.xy_m.v1";
+      diagnostics->prior_pose.translation.head<2>() =
+          predicted.alignment.head<2>();
+      diagnostics->prior_pose.rotation =
+          Eigen::AngleAxisd(predicted.alignment.z(), Eigen::Vector3d::UnitZ());
+      diagnostics->prior_covariance.topLeftCorner<3, 3>() =
+          predicted.covariance;
+    }
     if (!std::isfinite(distance) || distance > config_.innovation_gate) {
       return Reject(Reason::INNOVATION_REJECTED,
                     "horizontal innovation rejected", source);

@@ -14,6 +14,7 @@
 
 #include "candidates/global/global_types.h"
 #include "candidates/local/local_motion.h"
+#include "openloc/localization/global/observation_types.h"
 
 namespace openloc {
 namespace localization {
@@ -36,7 +37,8 @@ class GlobalAlignment {
                   const MotionIncrement* motion = nullptr);
   Result Lookup(double time, LocalState* state) const;
   Result LookupExact(double time, LocalState* state) const;
-  Result Observe(const GlobalObservation& observation);
+  Result Observe(const GlobalObservation& observation,
+                 ObservationInnovation* innovation = nullptr);
   Result Evaluate(double now) const;
   GlobalState Predict(double time) const;
   void Invalidate(Reason reason);
@@ -56,9 +58,15 @@ class GlobalAlignment {
                 SourceCounters* source);
   void ClearEpoch(const Epoch& epoch);
   Result ObservePartial(const GlobalObservation& observation,
-                        const LocalState& local, SourceCounters* source);
+                        const LocalState& local, SourceCounters* source,
+                        ObservationInnovation* innovation);
   Result ObserveHorizontal(const GlobalObservation& observation,
-                           const LocalState& local, SourceCounters* source);
+                           const LocalState& local, SourceCounters* source,
+                           ObservationInnovation* innovation);
+  Result ObserveHeadingAcquisition(const GlobalObservation& observation,
+                                   const LocalState& local,
+                                   SourceCounters* source,
+                                   ObservationInnovation* innovation);
   Result InitializeGraph(const GlobalObservation& observation,
                          const LocalState& local);
   void AdoptGraphState();

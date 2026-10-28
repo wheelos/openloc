@@ -9,6 +9,8 @@ import json
 import math
 from pathlib import Path
 import re
+import shutil
+import sys
 
 from prepare_native_lio import digest
 
@@ -191,7 +193,96 @@ def prepare(args):
     print(json.dumps({"events": len(events), "adapter_reasons": manifest["adapter_reasons"]}))
 
 
+def inject_bundle(input_dir, output, start_ns, stop_ns, shift_xy=(0.0, 0.0),
+                  time_offset_ns=0, dropout=False):
+    """Derive a diagnostic prepared-GNSS fault without modifying raw records."""
+    if (not isinstance(start_ns, int) or not isinstance(stop_ns, int) or
+            not isinstance(time_offset_ns, int) or not 0 < start_ns < stop_ns or
+            len(shift_xy) != 2 or not all(math.isfinite(x) for x in shift_xy)):
+        raise ValueError("fault requires integer times, valid interval and finite XY")
+    if (dropout and (any(shift_xy) or time_offset_ns)) or (
+            not dropout and not any(shift_xy) and not time_offset_ns):
+        raise ValueError("select dropout or a nonzero measurement perturbation")
+    manifest_path = input_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    if (manifest["schema"] != "openloc.native-gnss-diagnostic-input.v1" or
+            manifest["diagnostic_only"] is not True or
+            manifest["uncertainty_qualified"] is not False):
+        raise ValueError("fault input must be explicitly diagnostic")
+    for relative, expected in manifest["files"].items():
+        if Path(relative).name != relative or digest(input_dir / relative) != expected:
+            raise ValueError("fault input artifact pin mismatch")
+    with (input_dir / "events.csv").open(newline="") as stream:
+        reader = csv.DictReader(stream)
+        fields = reader.fieldnames
+        original = list(reader)
+    if len(original) != manifest["events"]:
+        raise ValueError("fault input lost GNSS events")
+    derived, mask = [], []
+    for row in original:
+        stamp = int(row["timestamp_ns"])
+        changed = dict(row)
+        if start_ns <= stamp < stop_ns:
+            if not dropout:
+                shifted = stamp + time_offset_ns
+                if not 0 < shifted <= 2**63 - 1:
+                    raise ValueError("shifted measurement outside int64 time")
+                changed["timestamp_ns"] = str(shifted)
+                for key, offset in zip(("x", "y"), shift_xy):
+                    if offset:
+                        value = float(row[key]) + offset
+                        if not math.isfinite(value):
+                            raise ValueError("nonfinite injected GNSS coordinate")
+                        changed[key] = format(value, ".17g")
+            mask.append({"original": row, "derived": None if dropout else changed})
+            if dropout:
+                continue
+        derived.append(changed)
+    if not mask:
+        raise ValueError("fault interval did not trigger any GNSS event")
+    output.mkdir(parents=True, exist_ok=False)
+    for relative in manifest["files"]:
+        if relative != "events.csv":
+            shutil.copyfile(input_dir / relative, output / relative)
+    with (output / "events.csv").open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(derived)
+    (output / "fault_mask.json").write_text(json.dumps(mask, indent=2) + "\n")
+    manifest.update(
+        events=len(derived), all_arrival_events_retained=not dropout,
+        measurement_time=("injected measurement-time offset; original in fault_mask.json"
+                          if time_offset_ns else manifest.get("measurement_time")),
+        fault_injection={
+            "input_manifest_sha256": digest(manifest_path),
+            "generator_sha256": digest(Path(__file__)),
+            "interval_ns": [start_ns, stop_ns], "shift_xy_m": list(shift_xy),
+            "time_offset_ns": time_offset_ns, "dropout": dropout,
+            "affected_events": len(mask),
+            "scope": "prepared GNSS owner-input boundary, not raw receiver or accuracy truth",
+        },
+        adapter_reasons=dict(Counter(row["adapter_reason"] for row in derived)),
+        receiver_quality_counts=dict(Counter(row["quality"] for row in derived)),
+        files={p.name: digest(p) for p in sorted(output.iterdir())},
+    )
+    (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    return manifest
+
+
 def main():
+    if sys.argv[1:2] == ["inject"]:
+        parser = argparse.ArgumentParser(description=inject_bundle.__doc__)
+        parser.add_argument("--input", type=Path, required=True)
+        parser.add_argument("--output", type=Path, required=True)
+        parser.add_argument("--start-ns", type=int, required=True)
+        parser.add_argument("--stop-ns", type=int, required=True)
+        parser.add_argument("--shift-xy", nargs=2, type=float, default=(0.0, 0.0))
+        parser.add_argument("--time-offset-ns", type=int, default=0)
+        parser.add_argument("--dropout", action="store_true")
+        args = parser.parse_args(sys.argv[2:])
+        inject_bundle(args.input, args.output, args.start_ns, args.stop_ns,
+                      args.shift_xy, args.time_offset_ns, args.dropout)
+        return
     parser = argparse.ArgumentParser(description=__doc__)
     for option in ("bag", "nmea", "profile", "metadata", "input", "output"):
         parser.add_argument("--" + option, type=Path, required=True)

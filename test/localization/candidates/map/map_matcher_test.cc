@@ -86,6 +86,52 @@ TEST(MapMatcherTest, MissingMapAndEmptyHypothesesAreExplicitErrors) {
   EXPECT_EQ(Reason::MAP_NOT_READY, matcher.SetMap(cloud).reason);
 }
 
+TEST(MapMatcherTest, BatchedExactSearchPreservesPclIndicesDistancesAndTies) {
+  Cloud::Ptr cloud = AsymmetricMap();
+  cloud->push_back((*cloud)[0]);
+  cloud->push_back((*cloud)[1]);
+  pcl::KdTreeFLANN<pcl::PointXYZ> reference;
+  ExactMapSearch candidate;
+  reference.setInputCloud(cloud);
+  candidate.setInputCloud(cloud);
+  Cloud queries = *cloud;
+  for (const auto& point : *cloud) {
+    queries.emplace_back(point.x + 0.03f, point.y - 0.07f, point.z + 0.12f);
+  }
+  queries.emplace_back(100.0f, -100.0f, 50.0f);
+  std::vector<float> xyz;
+  for (const auto& point : queries) {
+    xyz.insert(xyz.end(), {point.x, point.y, point.z});
+  }
+  std::vector<size_t> batch_indices;
+  std::vector<float> batch_distances;
+  candidate.NearestBatch(xyz, &batch_indices, &batch_distances);
+  ASSERT_EQ(queries.size(), batch_indices.size());
+  for (size_t i = 0; i < queries.size(); ++i) {
+    std::vector<int> indices, actual_indices;
+    std::vector<float> distances, actual_distances;
+    ASSERT_EQ(1, reference.nearestKSearch(queries[i], 1, indices, distances));
+    EXPECT_EQ(static_cast<size_t>(indices[0]), batch_indices[i]) << i;
+    EXPECT_EQ(distances[0], batch_distances[i]) << i;
+    ASSERT_EQ(15, reference.nearestKSearch(queries[i], 15, indices, distances));
+    ASSERT_EQ(15, candidate.nearestKSearch(
+                      queries[i], 15, actual_indices, actual_distances));
+    EXPECT_EQ(indices, actual_indices) << i;
+    EXPECT_EQ(distances, actual_distances) << i;
+  }
+  candidate.NearestBatch({}, &batch_indices, &batch_distances);
+  EXPECT_TRUE(batch_indices.empty());
+  EXPECT_TRUE(batch_distances.empty());
+  Cloud::Ptr small(new Cloud);
+  small->emplace_back(0.0f, 0.0f, 0.0f);
+  candidate.setInputCloud(small);
+  std::vector<int> indices;
+  std::vector<float> distances;
+  ASSERT_EQ(1, candidate.nearestKSearch((*small)[0], 15, indices, distances));
+  EXPECT_EQ(0, indices[0]);
+  EXPECT_EQ(0.0f, distances[0]);
+}
+
 TEST(MapMatcherTest, ActualIcpRetainsSharedRawLoadingsWithoutChangingNominal) {
   auto config = Config();
   config.algorithm = RegistrationAlgorithm::kPointToPlaneIcp;

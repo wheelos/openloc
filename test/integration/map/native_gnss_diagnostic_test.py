@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import unittest
 
 from native_lio_replay_test import write_csv
-from prepare_native_gnss import event, measurement_ns
+from prepare_native_gnss import event, inject_bundle, measurement_ns
 from prepare_native_lio import digest
 from run_native_map_diagnostic import compare_odometry, gnss_summary, horizontal_summary
 
@@ -22,6 +22,51 @@ def rows(path):
 
 
 class GnssPreparationTest(unittest.TestCase):
+    def test_injected_bundle_preserves_original_identity_and_pins(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            write_csv(source / "events.csv",
+                      "timestamp_ns,receive_ns,sequence,x,y,quality,adapter_reason",
+                      [[100, 110, 1, 0, 1, 4, "ok"], [200, 210, 2, 1, 2, 4, "ok"]])
+            (source / "config.csv").write_text("unchanged policy")
+            (source / "identity.csv").write_text("unchanged frame")
+            manifest = {
+                "schema": "openloc.native-gnss-diagnostic-input.v1",
+                "diagnostic_only": True, "uncertainty_qualified": False, "events": 2,
+                "files": {p.name: digest(p) for p in source.iterdir()},
+            }
+            (source / "manifest.json").write_text(json.dumps(manifest))
+            original_hash = digest(source / "events.csv")
+            injected = inject_bundle(source, root / "jump", 100, 200, (10, -5))
+            self.assertEqual(1, injected["fault_injection"]["affected_events"])
+            changed = rows(root / "jump/events.csv")
+            self.assertEqual(("10", "-4", "100", "110", "1"),
+                             tuple(changed[0][key] for key in
+                                   ("x", "y", "timestamp_ns", "receive_ns", "sequence")))
+            self.assertEqual(original_hash, digest(source / "events.csv"))
+            for name, pin in injected["files"].items():
+                self.assertEqual(pin, digest(root / "jump" / name))
+            inject_bundle(source, root / "offset", 100, 200, time_offset_ns=20)
+            self.assertEqual("120", rows(root / "offset/events.csv")[0]["timestamp_ns"])
+            dropped = inject_bundle(source, root / "drop", 100, 200, dropout=True)
+            self.assertEqual(1, dropped["events"])
+            self.assertFalse(dropped["all_arrival_events_retained"])
+            mask = json.loads((root / "drop/fault_mask.json").read_text())
+            self.assertEqual("1", mask[0]["original"]["sequence"])
+            self.assertIsNone(mask[0]["derived"])
+            for name, options in [
+                    ("none", {}), ("not_triggered", {"start_ns": 300, "stop_ns": 400,
+                                                    "shift_xy": (1, 0)}),
+                    ("bad", {"shift_xy": (float("nan"), 0)}),
+                    ("mixed", {"dropout": True, "time_offset_ns": 1})]:
+                arguments = dict(start_ns=100, stop_ns=200)
+                arguments.update(options)
+                with self.subTest(name=name), self.assertRaises(ValueError):
+                    inject_bundle(source, root / name, **arguments)
+                self.assertFalse((root / name).exists())
+
     def test_original_measurement_and_arrival_are_not_interchangeable(self):
         receive = 1791772774037985641
         self.assertEqual(measurement_ns("023934.00", receive),

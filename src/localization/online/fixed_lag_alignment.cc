@@ -49,6 +49,8 @@ class FixedLagGlobalAlignment::Impl {
         config.reference.calibration_id.empty() ||
         config.map_content_id.empty() || config.motion_error_model_id.empty() ||
         !config.motion_error_model_qualified ||
+        (config.enable_heading_bootstrap &&
+         !config.assume_gravity_aligned_odom) ||
         config.map_frame.value == config.odom_frame.value ||
         config.map_frame.value == config.base_frame.value ||
         config.odom_frame.value == config.base_frame.value ||
@@ -77,11 +79,14 @@ class FixedLagGlobalAlignment::Impl {
     policy.enable_fixed_lag_graph = true;
     policy.motion_error_model_qualified = config.motion_error_model_qualified;
     policy.graph_allow_uncalibrated_inputs = config.allow_uncalibrated_inputs;
+    policy.graph_retain_on_full_pose_staleness =
+        config.retain_graph_on_full_pose_staleness;
     policy.graph_solve_budget_ms = config.solve_budget_ms;
     policy.graph_max_states = config.maximum_states;
     policy.graph_max_observations = config.maximum_observations;
     policy.graph_max_error_dimension = config.maximum_error_dimension;
     policy.verification_frames = config.verification_frames;
+    policy.enable_heading_bootstrap = config.enable_heading_bootstrap;
     auto owner = std::make_unique<u::GlobalAlignment>(policy);
     const auto status = Convert(owner->ValidateConfig());
     if (!status.ok()) return status;
@@ -225,19 +230,24 @@ class FixedLagGlobalAlignment::Impl {
     if (!owner_) return Unconfigured();
     const uint64_t before = owner_->state().correction_id;
     Status status = adapter_status;
+    ObservationInnovation innovation;
+    innovation.unavailable_reason = "rejected_before_innovation";
     if (status.ok()) {
       if (sources_.size() >= 32 && sources_.count(context.source) == 0) {
         status = Status(StatusCode::kRejectedMeasurement,
                         "graph source statistics capacity exceeded");
       } else {
-        status = Apply(context, qualification, observation);
+        status = Apply(context, qualification, observation, &innovation);
       }
+    }
+    if (!innovation.available && innovation.unavailable_reason.empty()) {
+      innovation.unavailable_reason = status.message();
     }
     const bool updated = status.ok() && owner_->state().correction_id != before;
     GlobalObservationDecision decision{
         context,      status,
         ++submitted_, owner_->state().correction_id,
-        updated,      observation.covariance_source};
+        updated,      observation.covariance_source, std::move(innovation)};
     decisions_.push_back({std::move(decision), qualification});
     while (decisions_.size() > config_.maximum_decisions) {
       decisions_.pop_front();
@@ -260,7 +270,8 @@ class FixedLagGlobalAlignment::Impl {
 
   Status Apply(const GlobalObservationContext& context,
                const GraphSourceQualification& qualification,
-               u::GlobalObservation observation) {
+               u::GlobalObservation observation,
+               ObservationInnovation* innovation) {
     if (!owner_) return Unconfigured();
     auto status = ValidateTimestamp(context.measurement_time);
     if (status.ok()) status = ValidateTimestamp(context.receive_time);
@@ -277,15 +288,21 @@ class FixedLagGlobalAlignment::Impl {
       return Status(StatusCode::kMapReferenceMismatch,
                     "graph observation reference differs from configuration");
     }
+    const bool bounded_horizontal =
+        config_.enable_heading_bootstrap && !owner_->state().valid &&
+        (observation.kind == u::GlobalObservation::Kind::HEADING ||
+         observation.kind == u::GlobalObservation::Kind::POSITION ||
+         observation.kind == u::GlobalObservation::Kind::HORIZONTAL_POSITION) &&
+        !qualification.local_correlation;
     if (!alignment_bridge::ValidProvenance(context.provenance) ||
         observation.covariance_source.empty() ||
         qualification.uncertainty_model_id.empty() ||
-        (!qualification.local_correlation &&
+        (!bounded_horizontal && !qualification.local_correlation &&
          qualification.independence_evidence_id.empty()) ||
         !qualification.quality_valid ||
         (!qualification.uncertainty_qualified &&
          !config_.allow_uncalibrated_inputs) ||
-        (!qualification.local_correlation &&
+        (!bounded_horizontal && !qualification.local_correlation &&
          (!qualification.independent_of_local ||
           !qualification.independent_of_graph_sources))) {
       return Status(StatusCode::kRejectedMeasurement,
@@ -297,6 +314,7 @@ class FixedLagGlobalAlignment::Impl {
       const auto dimension = observation.kind == u::GlobalObservation::Kind::POSE ? 6
           : observation.kind == u::GlobalObservation::Kind::POSITION ? 3
           : observation.kind == u::GlobalObservation::Kind::HORIZONTAL_POSITION ? 2
+          : observation.kind == u::GlobalObservation::Kind::HEADING ? 1
           : observation.projection.rows();
       if (qualification.independent_of_local ||
           qualification.independent_of_graph_sources ||
@@ -335,7 +353,7 @@ class FixedLagGlobalAlignment::Impl {
                                   context.provenance.shared_local_scans,
                                   context.provenance.gnss_map_construction}) {
       if (dependency == ObservationDependency::kPresent &&
-          !qualification.local_correlation) {
+          !qualification.local_correlation && !bounded_horizontal) {
         return Status(StatusCode::kRejectedMeasurement,
                       "known shared dependencies have no joint graph factor");
       }
@@ -350,7 +368,7 @@ class FixedLagGlobalAlignment::Impl {
     observation.uncertainty_qualified = qualification.uncertainty_qualified;
     observation.diagnostic_only = config_.allow_uncalibrated_inputs;
     observation.independent_of_local = qualification.independent_of_local;
-    return Convert(owner_->Observe(observation));
+    return Convert(owner_->Observe(observation, innovation));
   }
 
   Status GetResult(const Timestamp& evaluation_time,
@@ -400,6 +418,33 @@ class FixedLagGlobalAlignment::Impl {
     output.submitted_observations = submitted_;
     output.rejected_observations = rejected_;
     for (const auto& entry : sources_) output.sources.push_back(entry.second);
+    const auto predicted = owner_->Predict(Seconds(latest_->timestamp.nanoseconds));
+    if (predicted.horizontal) {
+      const auto& horizontal = *predicted.horizontal;
+      const double yaw = horizontal.alignment.z();
+      const Eigen::Matrix2d rotation =
+          Eigen::Rotation2Dd(yaw).toRotationMatrix();
+      GlobalHorizontalEstimate estimate;
+      estimate.map_from_odom_xy_yaw.head<2>() =
+          horizontal.alignment.head<2>() -
+          rotation * horizontal.odom_reference_xy;
+      estimate.map_from_odom_xy_yaw.z() = yaw;
+      estimate.map_base_xy =
+          rotation * (latest_->pose.translation.head<2>() -
+                      horizontal.odom_reference_xy) +
+          horizontal.alignment.head<2>();
+      estimate.odom_reference_xy = horizontal.odom_reference_xy;
+      estimate.covariance = horizontal.covariance;
+      estimate.last_observation_time =
+          {horizontal.last_observation_ns, config_.clock_domain};
+      estimate.correction_id = state.correction_id;
+      output.horizontal_estimate = estimate;
+      if (!state.valid) output.diagnostic_only = true;
+      output.horizontal_evidence_fresh =
+          evaluation_time.nanoseconds >= horizontal.last_observation_ns &&
+          evaluation_time.nanoseconds - horizontal.last_observation_ns <=
+              config_.maximum_full_pose_age_ns;
+    }
     if (state.valid) {
       FixedLagAlignmentEstimate estimate;
       estimate.map_from_odom = alignment_bridge::ValuePose(state.map_to_odom);
@@ -408,6 +453,16 @@ class FixedLagGlobalAlignment::Impl {
       estimate.alignment_covariance = state.covariance;
       estimate.correction_id = state.correction_id;
       output.estimate = std::move(estimate);
+    }
+    const bool fresh_estimate =
+        output.odometry_fresh &&
+        ((output.estimate && output.full_pose_evidence_fresh) ||
+         (output.horizontal_estimate && output.horizontal_evidence_fresh));
+    if (fresh_estimate && !output.verification_pending) {
+      output.trust_level =
+          output.diagnostic_only || !output.assessment.ok()
+              ? LocalizationTrustLevel::kDiagnostic
+              : LocalizationTrustLevel::kQualified;
     }
     *result = std::move(output);
     return Status::Ok();
@@ -498,6 +553,18 @@ Status FixedLagGlobalAlignment::SubmitPositionObservation(
   observation.pose.translation() = input.position;
   observation.covariance.topLeftCorner<3, 3>() = input.covariance;
   observation.point_in_base = input.point_in_base;
+  observation.covariance_source = input.covariance_source;
+  return impl_->Submit(input.context, qualification, std::move(observation));
+}
+
+Status FixedLagGlobalAlignment::SubmitHeadingObservation(
+    const GlobalHeadingObservation& input,
+    const GraphSourceQualification& qualification) {
+  auto observation = alignment_bridge::Observation(input.context);
+  observation.kind = u::GlobalObservation::Kind::HEADING;
+  observation.heading_rad = input.heading_rad;
+  observation.heading_variance = input.variance_rad2;
+  observation.direction_in_base = input.direction_in_base;
   observation.covariance_source = input.covariance_source;
   return impl_->Submit(input.context, qualification, std::move(observation));
 }

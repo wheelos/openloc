@@ -54,7 +54,7 @@ class DiagnosticGlobalAlignment::Impl {
         ValidateGeodeticReference(config.reference.geodetic);
     if (!reference_status.ok()) return reference_status;
     if (config.reference.id.empty() || config.reference.version.empty() ||
-        (config.enable_horizontal_bootstrap &&
+        ((config.enable_horizontal_bootstrap || config.enable_heading_bootstrap) &&
          !config.assume_gravity_aligned_odom) ||
         config.reference.calibration_id.empty() ||
         config.reference.geodetic.state !=
@@ -92,6 +92,7 @@ class DiagnosticGlobalAlignment::Impl {
     policy.diagnostic_only = true;
     policy.enable_diagnostic_horizontal_bootstrap =
         config.enable_horizontal_bootstrap;
+    policy.enable_heading_bootstrap = config.enable_heading_bootstrap;
     auto owner = std::make_unique<u::GlobalAlignment>(policy);
     const Status status = Convert(owner->ValidateConfig());
     if (!status.ok()) return status;
@@ -355,7 +356,8 @@ class DiagnosticGlobalAlignment::Impl {
   Status Apply(const GlobalObservationContext& context,
                const u::GlobalObservation& observation) {
     const uint64_t revision = owner_->state().correction_id;
-    const auto observed = owner_->Observe(observation);
+    ObservationInnovation innovation;
+    const auto observed = owner_->Observe(observation, &innovation);
     const Status status = observed.ok()
                               ? Status(StatusCode::kOk, observed.message)
                               : Convert(observed);
@@ -364,14 +366,22 @@ class DiagnosticGlobalAlignment::Impl {
     if (updated && observation.kind == u::GlobalObservation::Kind::POSE) {
       last_full_pose_time_ = context.measurement_time;
     }
-    Record(context, status, updated, observation.covariance_source);
+    Record(context, status, updated, observation.covariance_source,
+           &innovation);
     return status;
   }
   void Record(const GlobalObservationContext& context, const Status& status,
-              bool updated, const std::string& covariance_source) {
+              bool updated, const std::string& covariance_source,
+              const ObservationInnovation* innovation = nullptr) {
+    ObservationInnovation recorded;
+    if (innovation != nullptr) {
+      recorded = *innovation;
+    } else {
+      recorded.unavailable_reason = status.message();
+    }
     decisions_.push_back({context, status, ++decision_sequence_,
                           owner_->state().correction_id, updated,
-                          covariance_source});
+                          covariance_source, std::move(recorded)});
     while (decisions_.size() > config_.maximum_decisions)
       decisions_.pop_front();
   }
@@ -416,6 +426,16 @@ Status DiagnosticGlobalAlignment::SubmitHorizontalObservation(
   observation.pose.translation().head<2>() = input.position;
   observation.covariance.topLeftCorner<2, 2>() = input.covariance;
   observation.point_in_base = input.point_in_base;
+  observation.covariance_source = input.covariance_source;
+  return impl_->Submit(input.context, std::move(observation));
+}
+Status DiagnosticGlobalAlignment::SubmitHeadingObservation(
+    const GlobalHeadingObservation& input) {
+  auto observation = Observation(input.context);
+  observation.kind = u::GlobalObservation::Kind::HEADING;
+  observation.heading_rad = input.heading_rad;
+  observation.heading_variance = input.variance_rad2;
+  observation.direction_in_base = input.direction_in_base;
   observation.covariance_source = input.covariance_source;
   return impl_->Submit(input.context, std::move(observation));
 }

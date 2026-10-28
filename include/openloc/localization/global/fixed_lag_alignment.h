@@ -42,6 +42,13 @@ struct FixedLagAlignmentConfig {
   // empirical calibration. Does not waive model validity, source quality,
   // conditional independence or reference identity. Never trusted output.
   bool allow_uncalibrated_inputs = false;
+  // Keep an established graph available to partial observations after the
+  // full-pose lease expires. Does not renew that lease or qualified trust;
+  // explicit recovery, invalid motion/model and epoch changes still revoke it.
+  bool retain_graph_on_full_pose_staleness = false;
+  // Separate diagnostic XY/yaw acquisition, never SE(3) graph initialization.
+  bool enable_heading_bootstrap = false;
+  bool assume_gravity_aligned_odom = false;
 };
 
 struct GraphOdometrySample {
@@ -133,6 +140,12 @@ struct GraphSourceStatistics {
   uint64_t rejected = 0;
 };
 
+enum class LocalizationTrustLevel {
+  kUntrusted,
+  kDiagnostic,
+  kQualified,
+};
+
 struct FixedLagAlignmentResult {
   Timestamp timestamp;
   Timestamp evaluation_time;
@@ -143,6 +156,7 @@ struct FixedLagAlignmentResult {
   FrameId odom_frame;
   FrameId base_frame;
   std::string motion_error_model_id;
+  LocalizationTrustLevel trust_level = LocalizationTrustLevel::kUntrusted;
   bool diagnostic_only = false;
   // Assessment is separate from retrieving a result. An estimate may be
   // retained while stale, degraded, or undergoing candidate verification.
@@ -159,6 +173,8 @@ struct FixedLagAlignmentResult {
   // remain in the aggregate counters and bounded decision journal.
   std::vector<GraphSourceStatistics> sources;
   std::optional<FixedLagAlignmentEstimate> estimate;
+  std::optional<GlobalHorizontalEstimate> horizontal_estimate;
+  bool horizontal_evidence_fresh = false;
 };
 
 /// Thin, synchronous facade over one existing SE(3) fixed-lag graph owner.
@@ -168,7 +184,7 @@ struct FixedLagAlignmentResult {
 /// Input nanoseconds are preserved at the boundary; backend node keys still
 /// use double seconds. Aliased node times are rejected; a measurement must
 /// match the retained original integer timestamp, not just its rounded key.
-/// Full poses alone can bootstrap/recover. XY/XYZ/projected factors neither
+/// Full poses alone can bootstrap/recover the SE(3) graph. XY/XYZ/heading factors neither
 /// synthesize missing measurements nor renew the full-pose lease.
 /// Source and motion qualifications must be established externally. Qualified
 /// conditional source models can couple observations to its retained joint error;
@@ -192,6 +208,9 @@ class FixedLagGlobalAlignment {
       const GraphSourceQualification& qualification);
   Status SubmitPositionObservation(
       const GlobalPositionObservation& observation,
+      const GraphSourceQualification& qualification);
+  Status SubmitHeadingObservation(
+      const GlobalHeadingObservation& observation,
       const GraphSourceQualification& qualification);
   Status GetResult(const Timestamp& evaluation_time,
                    FixedLagAlignmentResult* result) const;

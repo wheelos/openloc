@@ -26,12 +26,16 @@ inline bool ReadLine(std::istream& input, std::string* line) {
 
 inline std::vector<std::string> Fields(const std::string& line,
                                        char delimiter = ',') {
-  std::istringstream input(line);
   std::vector<std::string> result;
-  std::string field;
-  while (std::getline(input, field, delimiter)) {
+  std::size_t begin = 0;
+  while (begin < line.size()) {
+    const auto end = line.find(delimiter, begin);
+    auto field = line.substr(begin, end == std::string::npos
+                                        ? std::string::npos : end - begin);
     if (!field.empty() && field.back() == '\r') field.pop_back();
-    result.push_back(field);
+    result.push_back(std::move(field));
+    if (end == std::string::npos) break;
+    begin = end + 1;
   }
   return result;
 }

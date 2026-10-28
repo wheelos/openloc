@@ -5,6 +5,7 @@
 // http://www.apache.org/licenses/LICENSE-2.0
 
 #include "gnss_quality_gate.h"
+#include "openloc/localization/online/gnss_position_gate.h"
 
 #include <limits>
 
@@ -38,6 +39,50 @@ GnssQualityGatePolicy GatePolicy() {
   policy.fixed_solution_stability_ns = 100;
   policy.maximum_fixed_solution_gap_ns = 250;
   return policy;
+}
+
+TEST(GnssQualityGateTest, MissingHdopIsPositionOnlyExplicitNaNOptIn) {
+  GnssQualityGate gate;
+  auto policy = GatePolicy();
+  auto receiver = FixedReceiver();
+  receiver.hdop = std::numeric_limits<double>::quiet_NaN();
+  ASSERT_TRUE(gate.Configure(policy).ok());
+  EXPECT_EQ(GnssQualityOutcome::kInvalid,
+            gate.CheckPosition(Time(100), receiver).outcome);
+  policy.allow_missing_hdop = true;
+  ASSERT_TRUE(gate.Configure(policy).ok());
+  EXPECT_EQ(GnssQualityOutcome::kWaitingForStability,
+            gate.CheckPosition(Time(100), receiver).outcome);
+  EXPECT_TRUE(gate.CheckPosition(Time(200), receiver).status.ok());
+  EXPECT_EQ(GnssQualityOutcome::kInvalid,
+            gate.CheckHeading(Time(200), receiver, 0.01, 1.0, 1.0).outcome);
+  for (double invalid : {0.0, -1.0, std::numeric_limits<double>::infinity()}) {
+    receiver.hdop = invalid;
+    EXPECT_EQ(GnssQualityOutcome::kInvalid,
+              gate.CheckPosition(Time(300), receiver).outcome);
+  }
+  receiver.hdop = std::numeric_limits<double>::quiet_NaN();
+  receiver.horizontal_accuracy_m = std::numeric_limits<double>::quiet_NaN();
+  EXPECT_EQ(GnssQualityOutcome::kInvalid,
+            gate.CheckPosition(Time(300), receiver).outcome);
+  receiver = FixedReceiver();
+  receiver.hdop = policy.maximum_hdop;
+  EXPECT_EQ(GnssQualityOutcome::kRejected,
+            gate.CheckPosition(Time(300), receiver).outcome);
+}
+
+TEST(GnssQualityGateTest, PublicPositionGatePreservesMissingHdopPolicy) {
+  GnssPositionGate gate;
+  GnssPositionGatePolicy policy;
+  policy.fixed_solution_stability_ns = 100;
+  auto receiver = FixedReceiver();
+  receiver.hdop = std::numeric_limits<double>::quiet_NaN();
+  ASSERT_TRUE(gate.Configure(policy).ok());
+  EXPECT_EQ(StatusCode::kInvalidArgument, gate.Check(Time(100), receiver).code());
+  policy.allow_missing_hdop = true;
+  ASSERT_TRUE(gate.Configure(policy).ok());
+  EXPECT_FALSE(gate.Check(Time(100), receiver).ok());
+  EXPECT_TRUE(gate.Check(Time(200), receiver).ok());
 }
 
 TEST(GnssQualityGateTest, SharesReceiverChecksAcrossPositionAndHeading) {

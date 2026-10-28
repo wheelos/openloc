@@ -16,12 +16,37 @@ from native_lio_report import (
     summarize_global_scheduler, summarize_host_timing, summarize_imu_trace,
 )
 from run_native_map_diagnostic import (
-    causal_worker_summary, fusion_diagnostics, map_summary, prepare_bundle,
+    causal_worker_summary, fusion_diagnostics,
+    global_odom_fault_arguments, map_summary, prepare_bundle,
 )
 from prepare_native_lio import digest
 
 
 class MapReportTest(unittest.TestCase):
+    def test_global_odom_fault_arguments_are_explicit_and_bounded(self):
+        drift = global_odom_fault_arguments(
+            "both", ["1791882567558665752", "0.1", "-0.05"], None)
+        self.assertEqual(drift["kind"], "drift")
+        self.assertEqual(drift["offset"], [0.1, -0.05])
+        self.assertEqual(drift["arguments"][:2],
+                         ["--global-odom-drift", "1791882567558665752"])
+        step = global_odom_fault_arguments(
+            "gnss", None, ["1791882570558665752", "50", "-30"])
+        self.assertEqual(step["kind"], "step")
+        self.assertEqual(step["arguments"][:2],
+                         ["--global-odom-step", "1791882570558665752"])
+        self.assertIsNone(global_odom_fault_arguments("both", None, None))
+        invalid_cases = (
+            ("both", ["1", "0", "0"], ["1", "0", "0"], "mutually exclusive"),
+            ("odom", ["1", "0", "0"], None, "global source arm"),
+            ("gnss", ["0", "0", "0"], None, "positive time"),
+            ("gnss", ["1", "nan", "0"], None, "finite offset"),
+        )
+        for arm, drift_args, step_args, message in invalid_cases:
+            with self.subTest(message=message), self.assertRaisesRegex(
+                    ValueError, message):
+                global_odom_fault_arguments(arm, drift_args, step_args)
+
     def test_source_diagnostics_count_final_outcomes_not_holdback_entries(self):
         base = {
             "source": "map", "sequence": "7", "timestamp_ns": "100",
@@ -252,6 +277,23 @@ class NativeMapReplayTest(unittest.TestCase):
                         for row in states]
             self.assertEqual(deterministic(read("odometry.csv")),
                              deterministic(baseline_rows))
+            heldout = root / "map_holdout"
+            command = [str(self.binary), str(root), str(heldout),
+                       "--diagnostic-map", str(bundle), "--map-input-sha256",
+                       "".join(digest(bundle / name) for name in
+                               ("global.pcd", "identity.csv", "seed.csv", "window.csv")),
+                       "--global-map-holdout", "3500000000", "3800000000"]
+            checked = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(0, checked.returncode, checked.stderr)
+            with (heldout / "map.csv").open() as stream:
+                excluded = [r for r in csv.DictReader(stream)
+                            if r["reason"] == "EVALUATION_HOLDOUT"]
+            self.assertEqual(3, len(excluded))
+            self.assertTrue(all(r["valid"] == "0" and r["global_status"] == "not_submitted"
+                                for r in excluded))
+            with (heldout / "odometry.csv").open() as stream:
+                self.assertEqual(deterministic(baseline_rows),
+                                 deterministic(list(csv.DictReader(stream))))
             trace = summarize_imu_trace(read("imu_trace.csv"),
                                         read("local_corrections.csv"))
             self.assertGreater(trace["recorded_propagations"], 0)

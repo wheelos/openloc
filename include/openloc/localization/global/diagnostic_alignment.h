@@ -35,6 +35,9 @@ struct DiagnosticAlignmentConfig {
   // gravity-level. Neither this declaration nor acquisition qualifies axes.
   bool enable_horizontal_bootstrap = false;
   bool assume_gravity_aligned_odom = false;
+  // Allows a qualified-by-caller baseline azimuth plus XY/XYZ to acquire a
+  // separate diagnostic horizontal result without motion or a full pose.
+  bool enable_heading_bootstrap = false;
 };
 
 struct DiagnosticHorizontalEstimate {
@@ -106,6 +109,7 @@ class DiagnosticGlobalAlignment {
   Status SubmitMapObservation(const GlobalMapObservation& observation);
   Status SubmitHorizontalObservation(
       const GlobalHorizontalObservation& observation);
+  Status SubmitHeadingObservation(const GlobalHeadingObservation& observation);
   Status GetResult(DiagnosticAlignmentResult* result) const;
   /// Evaluates freshness without extrapolating ODOM. Time must be in the
   /// configured clock and no earlier than the latest ODOM timestamp.

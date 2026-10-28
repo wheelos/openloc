@@ -276,6 +276,10 @@ Result MapMatcher::MatchPointToPlaneIcp(const Cloud::ConstPtr& base_cloud,
   double solver_ms = 0.0;
   std::vector<int> indices(1);
   std::vector<float> distances(1);
+  std::vector<Eigen::Vector3d> moved_points(base_cloud->size());
+  std::vector<float> queries(base_cloud->size() * 3);
+  std::vector<size_t> nearest_indices;
+  std::vector<float> nearest_distances;
   for (uint32_t iteration = 0; iteration < config_.maximum_iterations;
        ++iteration) {
     IcpErrorStep error_step;
@@ -289,36 +293,39 @@ Result MapMatcher::MatchPointToPlaneIcp(const Cloud::ConstPtr& base_cloud,
     const auto correspondence_started =
         profile ? std::chrono::steady_clock::now()
                 : std::chrono::steady_clock::time_point{};
-    double iteration_search_ms = 0.0;
     for (std::size_t source_index = 0; source_index < base_cloud->size();
          ++source_index) {
       const auto& point = (*base_cloud)[source_index];
-      const Eigen::Vector3d moved =
+      auto& moved = moved_points[source_index];
+      moved =
           estimate * Eigen::Vector3d(point.x, point.y, point.z);
-      const pcl::PointXYZ query(static_cast<float>(moved.x()),
-                                static_cast<float>(moved.y()),
-                                static_cast<float>(moved.z()));
-      const auto search_started = profile
-                                      ? std::chrono::steady_clock::now()
-                                      : std::chrono::steady_clock::time_point{};
-      const int nearest_count =
-          tree_.nearestKSearch(query, 1, indices, distances);
-      if (profile) {
-        iteration_search_ms +=
-            std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - search_started)
-                .count();
-      }
-      if (nearest_count != 1 || distances[0] > distance_squared) {
+      queries[source_index * 3] = static_cast<float>(moved.x());
+      queries[source_index * 3 + 1] = static_cast<float>(moved.y());
+      queries[source_index * 3 + 2] = static_cast<float>(moved.z());
+    }
+    const auto search_started = profile
+                                    ? std::chrono::steady_clock::now()
+                                    : std::chrono::steady_clock::time_point{};
+    tree_.NearestBatch(queries, &nearest_indices, &nearest_distances);
+    const double iteration_search_ms =
+        profile ? std::chrono::duration<double, std::milli>(
+                      std::chrono::steady_clock::now() - search_started)
+                      .count()
+                : 0.0;
+    for (std::size_t source_index = 0; source_index < base_cloud->size();
+         ++source_index) {
+      const auto& moved = moved_points[source_index];
+      const size_t nearest = nearest_indices[source_index];
+      if (nearest_distances[source_index] > distance_squared) {
         continue;
       }
-      const auto& normal = (*normals_)[static_cast<size_t>(indices[0])];
+      const auto& normal = (*normals_)[nearest];
       const Eigen::Vector3d n(normal.normal_x, normal.normal_y,
                               normal.normal_z);
       if (!n.allFinite() || n.norm() < 0.5) {
         continue;
       }
-      const auto& target = (*map_)[static_cast<size_t>(indices[0])];
+      const auto& target = (*map_)[nearest];
       const Eigen::Vector3d q(target.x, target.y, target.z);
       const double residual = n.dot(moved - q);
       Eigen::Matrix<double, 1, 6> jacobian;
@@ -332,7 +339,7 @@ Result MapMatcher::MatchPointToPlaneIcp(const Cloud::ConstPtr& base_cloud,
       gradient.noalias() += weight * jacobian.transpose() * residual;
       if (steps)
         error_step.correspondences.push_back(
-            {source_index, static_cast<std::size_t>(indices[0]), weight, n});
+            {source_index, nearest, weight, n});
       ++correspondences;
     }
     if (profile) {

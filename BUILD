@@ -150,6 +150,7 @@ cc_library(
     hdrs = ["src/localization/candidates/local/local_lio.h"],
     includes = ["src/localization"],
     deps = [
+        ":local_motion",
         ":localization_types",
         ":observed_subspace",
         "@eigen",
@@ -250,6 +251,7 @@ cc_library(
     includes = ["src/localization"],
     deps = [
         ":gnss_alignment_recovery",
+        ":global_observation_types",
         ":global_types",
         ":local_motion",
         ":localization_types",
@@ -266,6 +268,21 @@ cc_library(
     deps = [
         ":global_alignment",
         ":scan_to_map",
+    ],
+)
+
+cc_binary(
+    name = "fixed_lag_evaluation",
+    testonly = True,
+    srcs = [
+        "test/integration/map/fixed_lag_evaluation.cc",
+        "test/integration/map/replay_csv.h",
+    ],
+    copts = ["-std=c++17"],
+    deps = [
+        ":global_alignment",
+        ":local_motion",
+        "@eigen",
     ],
 )
 
@@ -340,6 +357,7 @@ cc_library(
         "src/localization/candidates/map/map_registration_error.cc",
     ],
     hdrs = [
+        "src/localization/candidates/map/exact_map_search.h",
         "src/localization/candidates/map/map_matcher.h",
         "src/localization/candidates/map/map_registration_error.h",
     ],
@@ -404,6 +422,42 @@ cc_library(
     deps = [
         ":global_observation_types",
         ":global_types",
+    ],
+)
+
+cc_library(
+    name = "marker_observation",
+    srcs = ["src/localization/online/marker_observation.cc"],
+    hdrs = ["include/openloc/localization/global/marker_observation.h"],
+    includes = ["include"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":global_observation_types",
+        ":online_localization_types",
+        "@eigen",
+    ],
+)
+
+cc_test(
+    name = "marker_observation_test",
+    size = "small",
+    srcs = ["test/localization/online/marker_observation_test.cc"],
+    deps = [
+        ":marker_observation",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_binary(
+    name = "localization_scenarios",
+    testonly = True,
+    srcs = [
+        "test/integration/localization_scenarios.cc",
+        "test/integration/map/replay_csv.h",
+    ],
+    deps = [
+        ":fixed_lag_global_alignment",
+        ":marker_observation",
     ],
 )
 
@@ -680,6 +734,7 @@ cc_test(
     size = "small",
     srcs = ["test/localization/online/gnss_quality_gate_test.cc"],
     deps = [
+        ":gnss_position_gate",
         ":online_gnss_quality",
         "@com_google_googletest//:gtest_main",
     ],

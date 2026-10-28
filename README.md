@@ -8,6 +8,11 @@ See [`docs/README.md`](docs/README.md) for documentation navigation,
 [`docs/architecture.md`](docs/architecture.md) for library contracts, and
 [`docs/roadmap.md`](docs/roadmap.md) for implementation status and evidence.
 
+**Current submission baseline:** [2026-10-28 diagnostic functional baseline](docs/baseline-20261028.md)
+summarizes the indoor/outdoor goal, algorithms/diagnostics/evaluation split,
+14-scenario field correspondence, known blockers, performance limits and
+reproducible checks. It is not a production or real-time acceptance claim.
+
 The package layout and ownership boundaries are defined in
 [`docs/architecture.md`](docs/architecture.md). The online baseline and
 extracted global-alignment candidate remain separate; neither is declared a
@@ -198,6 +203,59 @@ live-deadline or accuracy acceptance.
 The graph/adapter and diagnostic API regressions now build and pass in the
 managed development container. See the [roadmap](docs/roadmap.md) for exact
 validation scope; this is not a production-readiness or recorded-data claim.
+
+### Indoor/outdoor algorithms, diagnostics and evaluation
+
+The [delivery plan and scenario checklist](../../ad_agents/context/modules/localization/knowledge/openloc-indoor-outdoor-delivery-plan.md)
+separate online algorithms, existing decision/health diagnostics and offline
+acceptance. The executable matrix covers indoor map/marker without GNSS,
+projected-map/GNSS complementary degradation, joint loss/reentry, bad receiver
+quality, outliers, ambiguous markers, delayed observations and unanchored cold
+start. These are synthetic observation-boundary checks, not raw LiDAR,
+detector, calibration or field-accuracy acceptance.
+
+`BuildMarkerObservation`, from
+`openloc/localization/global/marker_observation.h` and
+`//:marker_observation`, composes
+`T_map_marker * inverse(T_sensor_marker) * inverse(T_base_sensor)` into the
+existing `GlobalMapObservation`; either global owner can consume that value.
+Its full 18D joint covariance uses one `[translation_parent, left_rotation_parent]`
+block per input pose and preserves correlations. Marker ID, reference,
+content, calibration, frame and clock mismatches reject without modifying the
+output. Ambiguity is preserved for owner rejection, not silently resolved.
+It is not a detector or qualification claim: repeated survey/extrinsic errors
+need an explicit temporal/shared model before graph independence is declared.
+
+`FixedLagAlignmentConfig::retain_graph_on_full_pose_staleness` is default-off.
+When explicitly enabled, an established graph can continue partial-source
+updates after the full-pose lease expires; freshness and trust still degrade.
+It does not permit position-only SE(3) cold startup, renew full-pose evidence,
+relax observation gates or bypass explicit recovery/model/epoch revocation.
+Host profiles and default behavior are unchanged.
+
+```bash
+env -u LD_LIBRARY_PATH bazel test -c opt //:marker_observation_test \
+  //:fixed_lag_global_alignment_test
+env -u LD_LIBRARY_PATH bazel build -c opt //:localization_scenarios
+env -u LD_LIBRARY_PATH python3 -m unittest discover \
+  -s test/integration/map -p 'evaluate_localization_scenarios_test.py'
+env -u LD_LIBRARY_PATH python3 test/integration/map/evaluate_localization_scenarios.py \
+  --binary bazel-bin/localization_scenarios --output "$NEW_OUTPUT"
+```
+
+Run in the mapped-user managed container. Output must be new; it includes
+source/runtime pins, per-source terminal decisions, pre-update residual/NIS,
+freshness/trust, JSON and HTML. The current matrix has 14 functional scenarios,
+336 state rows, 498 observation outcomes and 386 recomputed NIS samples.
+GNSS XY-only cold start deliberately reports **no full pose**, not zero error
+or a successful localization result; refusal of unobservable startup is correct
+behavior, not itself a functional failure. The
+[factor/scenario report](.agents/notes/factor_scenario_principles_20261028_v2/index.html)
+also includes known local drift during joint absolute-source loss: increasing
+error is accepted when degradation, ODOM isolation and source recovery match
+the contract. Coverage records observed node intervals, dimensions and delays,
+not a guarantee over untested ranges or real field data. Real-record FixedLag and robust
+indoor/outdoor product acceptance remain open.
 
 ## Build and tests
 
@@ -498,7 +556,147 @@ env -u LD_LIBRARY_PATH python3 test/integration/map/native_map_diagnostic_test.p
   bazel-bin/native_lio_replay
 ```
 
+### No-ground-truth evaluation
+
+The diagnostic report now includes an `evaluation` audit of pinned CSVs,
+source-event accounting, correction revisions, arrival/holdback ordering and
+diagnostic trust ceilings. Map attempts and GNSS arrivals are counted separately
+from submissions and actual corrections. Unresolved submitted events fail
+accounting; missing epoch/consumer evidence stays explicitly unavailable.
+This is not a complete target-graph factor ledger or covariance qualification.
+
+Run the fast, dependency-free evaluation tests inside the mapped-user managed
+test container:
+
+```bash
+env -u LD_LIBRARY_PATH python3 -m unittest discover \
+  -s test/integration/map -p 'analyze_global_innovations_test.py'
+env -u LD_LIBRARY_PATH python3 -m unittest discover \
+  -s test/integration/map -p 'evaluate_native_fusion_test.py'
+env -u LD_LIBRARY_PATH python3 test/integration/map/native_gnss_diagnostic_test.py \
+  bazel-bin/native_lio_replay
+```
+
+Reanalyze an existing frozen diagnostic report into a **new** directory:
+
+```bash
+env -u LD_LIBRARY_PATH python3 test/integration/map/evaluate_native_fusion.py \
+  --report "$RUN/report/report.json" --replay "$RUN/replay" \
+  --baseline "$LOCAL_ONLY/replay" --repeat "$IDENTICAL_RUN/replay" \
+  --output "$NEW_EVALUATION"
+```
+
+`--baseline` checks ODOM and scan isolation; `--repeat` checks deterministic
+ODOM, scan, map, GNSS and global journals (only `imu_ms`/`processing_ms` are
+excluded). These optional checks stay `not_run` if omitted. JSON and offline
+HTML expose per-event outcomes, NIS tails, whitening/QQ, sample-lag
+autocorrelation, innovation component scales and untested evidence.
+Cross-source correlations require a common explicit `residual_basis` describing
+frame, projection, component ordering and units; legacy journals without it
+are not silently paired by dimension. Statistics are descriptive, not calibrated
+coverage or accuracy; innovation scales are not posterior pose error bounds.
+New journals also export the actual gate, covariance model and, where available,
+the alignment-prior, observation and local-state contributions to innovation
+covariance. The evaluator checks their sum and NIS/gate consistency; JSON/HTML
+show each pre-update gate decision. Missing legacy fields remain unavailable.
+A large residual can pass when modeled uncertainty is large; this is not
+evidence that the observation is correct or the uncertainty calibrated.
+
+Prepared-GNSS fault variants preserve original input pins and a per-event mask:
+
+```bash
+env -u LD_LIBRARY_PATH python3 test/integration/map/prepare_native_gnss.py inject \
+  --input "$GNSS_INPUT" --output "$NEW_FAULT_INPUT" \
+  --start-ns "$START_NS" --stop-ns "$STOP_NS" --shift-xy 50 -30
+```
+
+Use `--time-offset-ns` for measurement-clock faults or `--dropout` instead of
+position/time shifts. Arrival times, sequence and quality gates remain unchanged;
+the interval is half-open in original measurement time. These faults are at the
+prepared GNSS boundary, not corrupted raw NMEA/checksum tests. Replaying a fault
+may change later map associations; output differences measure response, not
+known true localization error. Existing `--global-odom-drift`/`--global-odom-step`
+alter only the global owner's ODOM copy, never native local state.
+
+The test-only `//:fixed_lag_evaluation` target archives committed factors when
+explicitly enabled before initialization. Its batch reference optimizes those
+same factors without timestamps or eviction; it is not a second production
+owner. Pose NEES uses the actual pose marginal, not the public alignment bound.
+
+```bash
+env -u LD_LIBRARY_PATH bazel build -c opt //:fixed_lag_evaluation
+env -u LD_LIBRARY_PATH python3 -m unittest discover \
+  -s test/integration/map -p 'evaluate_fixed_lag_test.py'
+env -u LD_LIBRARY_PATH python3 test/integration/map/evaluate_fixed_lag.py \
+  --binary bazel-bin/fixed_lag_evaluation --odometry "$LOCAL_ONLY/replay/odometry.csv" \
+  --output "$NEW_EVALUATION" --trials 128 --nodes 12 --lag-seconds 60
+```
+
+Real replay poses become **fictional** nominal truth for independent, modeled
+and unmodeled AR/shared-bias experiments. The 60 s setting is a deliberately
+non-marginalizing control for a shorter nominal trajectory; use a shorter lag
+to exercise actual eviction. The frozen gate/Huber limit is an evaluation
+policy, not production tuning. Per-trial failures remain in `failures.csv`;
+survivor NEES cannot establish consistency. A successful runner exit is not
+acceptance. The 2026-10-28 repair retains each marginalized Gaussian's original
+`A`, `b`, noise and reference chart, differentiates that chart on Pose3, and
+relinearizes only the bounded retained nonlinear window when fixed separators
+prevent hard-constraint convergence. It does not reconstruct eliminated
+observations. Complete Bayes-tree delta updates also prevent wildfire
+truncation from violating exact constraints. Lag, solve budget, maximum
+iterations, source gates and the 1e-6 feasibility tolerance are unchanged.
+`retained_relinearizations` makes this work visible in evaluation CSV/JSON.
+
+The matched 8-node/5 s and 12-node/60 s experiments now each complete all 640
+trials; the old failures remain frozen evidence. Regression includes both
+previously failing no-eviction seeds and a turning/shared-source/dimension-change
+case that failed before the repair. Correctly modeled semi-synthetic errors
+show no detected mean-NEES inconsistency in these experiments; deliberately
+unmodeled correlation remains inconsistent. Neither establishes calibration
+or real-record FixedLag acceptance. See the
+[current graph diagnostics](.agents/notes/goal_graph_20261028_v1/validation/index.html).
+
+For source exclusion, native replay accepts
+`--global-map-holdout START_NS STOP_NS` with an explicit diagnostic map. It
+journals each half-open interval exclusion before deskew, seed lookup or
+matching, without excluding local LiDAR. Combine it with a prepared GNSS
+`--dropout` variant for separate source holdouts. Raw preparation accepts up
+to 180 s. Same-capture GNSS-built maps and informed seeds remain shared
+information; held-out GNSS is only a weak discrepancy reference. If no map
+match succeeds after reentry, the reentry-jump check is **not triggered**.
+
 ### Native raw IMU/LiDAR diagnostic entry
+
+`LocalConfig::diagnostic_lidar_tracking_gain` is a **default-off diagnostic**
+nominal tracking mode. Replay opts in with
+`--diagnostic-lidar-tracking-gain` and records `local_gain_policy.csv`.
+It keeps a private conditional gain matrix, propagates it with the existing
+analytic IMU transition/process noise, and applies one fixed-prior Joseph
+posterior per accepted scan, including the attitude reset. Delayed tasks
+commit that private memory with their internal trajectory. Plane geometry is
+treated as fixed for this nominal gain; its shared scan/history errors are
+**not** thereby qualified. The original conservative published covariance,
+residual gates, diagnostic ceiling and ODOM/global ownership remain unchanged.
+Do not export this private matrix as pose uncertainty or use the flag to
+bypass native joint-model / FixedLag admission.
+
+Geometric observability uses point/plane geometric noise separately from
+anchor marginal weighting: an increasing absolute anchor marginal must not
+erase the rank of otherwise unchanged relative geometry. By default the
+correction still uses the original conservative anchor variance. The explicit
+diagnostic mode instead uses geometry-only noise for its nominal gain, not
+for residual admission or published uncertainty.
+
+The retained 180 s ChengTou experiment at
+`.agents/notes/goal_continuity_20261027_v1/index.html` compares the original,
+rank-only and explicit diagnostic-gain paths: accepted local scans increase
+from 196 to 1,149 to 1,702 of 1,800; the diagnostic mode accepts all 1,500 scans
+after 30 s. One owner commits 407 map and 126 GNSS corrections with exact local
+isolation. This is functional recovery, not accuracy or calibrated covariance.
+Map 30/60 s exclusion does reenter, but its first same-query global position
+responses are 6.65/22.15 m; map 120 s exclusion does not reenter.
+Three further captures cover local-only 30 s windows, not full-route or
+indoor/outdoor acceptance. Original failures and default settings are retained.
 
 Use `bazel build -c opt //:native_lio_replay` for deployment-oriented timing
 diagnostics. The default unoptimized binary is suitable for contract checks,
@@ -640,6 +838,14 @@ startup. JSON separates valid-row 10 ms deadline misses and wall-clock gaps;
 catch-up bursts do not erase earlier misses. This measures the diagnostic
 CSV host, including point-file I/O, not an Apollo publisher or isolated target
 hardware.
+
+`--arrival-rate 1`, `2` or `5` requires `--arrival-paced` and compresses only
+the wall schedule. Original sensor/receive timestamps stay unchanged;
+`replay_clock.csv` declares the rate and origin. Timing analysis verifies
+the scaled schedule and keeps the measured wall lateness. Accelerated
+diagnostic timers do not qualify live sensor clocks or Apollo consumers.
+Bounded-worker errors remain explicit failures, not silently dropped input
+or successful overload recovery.
 
 Use `--async-global --arrival-paced` with a map and/or GNSS arm to move its
 single global owner, matcher and journals onto one worker. The producer sends
@@ -1627,7 +1833,7 @@ The 2026-10-12 full-record diagnostic returned 19 `MATCHED` scans out of 196
 and missed the provisional latency target; it is not a qualified localization
 result. The run configuration, per-frame diagnostics, and limitations are
 recorded in the
-[map-assisted validation plan](../../wheelos-service/context/modules/localization/knowledge/map-assisted-localization-validation-plan.md).
+[map-assisted validation plan](../../ad_agents/context/modules/localization/knowledge/map-assisted-localization-validation-plan.md).
 The follow-up ablation found that an experimental 0.25 target-overlap gate
 raises the same-record `MATCHED` count to 129/196 but does not establish match
 correctness; the 0.4 source and target defaults remain unchanged. Prewarming

@@ -321,6 +321,40 @@ class NativeReportTest(unittest.TestCase):
 class NativeReplayTest(unittest.TestCase):
     binary = None
 
+    def test_local_profiling_rejects_duplicate_option(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            for flags, message in (
+                (["--profile-local-timing"], "unknown or duplicate"),
+                (["--prefetch-lidar"], "requires synchronous decode and LIO"),
+                (["--async-local-lio-ms", "5"],
+                 "requires synchronous decode and LIO"),
+            ):
+                with self.subTest(flags=flags):
+                    completed = subprocess.run(
+                        [str(self.binary), str(root), str(root / "output"),
+                         "--profile-local-timing", *flags],
+                        capture_output=True, text=True)
+                    self.assertNotEqual(completed.returncode, 0)
+                    self.assertIn(message, completed.stderr)
+                    self.assertFalse((root / "output").exists())
+
+    def test_map_profiling_requires_map_before_creating_output(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            for flags, message in (
+                (["--profile-map-timing"], "map timing profiling requires map"),
+                (["--profile-map-timing", "--profile-map-timing"],
+                 "unknown or duplicate"),
+            ):
+                with self.subTest(flags=flags):
+                    completed = subprocess.run(
+                        [str(self.binary), str(root), str(root / "output"),
+                         *flags], capture_output=True, text=True)
+                    self.assertNotEqual(completed.returncode, 0)
+                    self.assertIn(message, completed.stderr)
+                    self.assertFalse((root / "output").exists())
+
     def test_native_joint_limits_require_audit_and_valid_unique_counts(self):
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
             root = Path(temporary)
@@ -466,6 +500,30 @@ class NativeReplayTest(unittest.TestCase):
             self.assertEqual(states[-1]["capability_reason"],
                              "CORRELATION_UNQUALIFIED")
             self.assertEqual(int(states[-1]["timestamp_ns"]), imu[-1][0])
+            paced = root / "rate2"
+            replay = subprocess.run(
+                [str(self.binary), str(root), str(paced),
+                 "--arrival-paced", "--arrival-rate", "2", "--timer-output"],
+                capture_output=True, text=True)
+            self.assertEqual(0, replay.returncode, replay.stderr)
+            with (paced / "odometry.csv").open() as stream:
+                accelerated = list(csv.DictReader(stream))
+            self.assertEqual(
+                [{k: v for k, v in row.items() if k != "imu_ms"} for row in states],
+                [{k: v for k, v in row.items() if k != "imu_ms"} for row in accelerated])
+            with (paced / "host_timing.csv").open() as stream:
+                timing = list(csv.DictReader(stream))
+            origin = int(timing[0]["target_steady_ns"])
+            self.assertTrue(all(int(row["target_steady_ns"]) - origin ==
+                                (int(row["receive_ns"]) - imu[0][1]) // 2 for row in timing))
+            with (paced / "replay_clock.csv").open() as stream:
+                self.assertEqual("2", next(csv.DictReader(stream))["arrival_rate"])
+            self.assertEqual(2, summarize_host_timing(paced / "host_timing.csv")["arrival_rate"])
+            with (paced / "replay_clock.csv").open("w") as stream:
+                stream.write("first_receive_ns,arrival_rate,scope\n"
+                             f"{imu[0][1]},5,wall_schedule_only_original_sensor_timestamps_preserved\n")
+            with self.assertRaisesRegex(ValueError, "chronology changed"):
+                summarize_host_timing(paced / "host_timing.csv")
             with (root / "output/local_corrections.csv").open() as stream:
                 corrections = list(csv.DictReader(stream))
             self.assertEqual(len(corrections), len(scans))
@@ -474,6 +532,19 @@ class NativeReplayTest(unittest.TestCase):
                              sum(r["reason"] == "NONE" for r in decisions))
             self.assertLess(summary["total_position_correction_path_m"], 1e-10)
             self.assertFalse((root / "output/imu_trace.csv").exists())
+            tracking = subprocess.run(
+                [str(self.binary), str(root), str(root / "tracking"),
+                 "--diagnostic-lidar-tracking-gain"],
+                capture_output=True, text=True)
+            self.assertEqual(0, tracking.returncode, tracking.stderr)
+            with (root / "tracking/local_gain_policy.csv").open() as stream:
+                declaration = next(csv.DictReader(stream))
+            self.assertEqual("diagnostic", declaration["trust_ceiling"])
+            self.assertEqual("original_conservative_marginal", declaration["uncertainty_export"])
+            with (root / "tracking/odometry.csv").open() as stream:
+                tracking_states = list(csv.DictReader(stream))
+            self.assertEqual("0", tracking_states[-1]["covariance_model_valid"])
+            self.assertEqual("0", tracking_states[-1]["motion_available"])
             audited = subprocess.run(
                 [str(self.binary), str(root), str(root / "joint-audit"),
                  "--native-joint-audit-period-s", "0.005",
@@ -506,7 +577,8 @@ class NativeReplayTest(unittest.TestCase):
                  for r in audited_states],
             )
             traced = subprocess.run(
-                [str(self.binary), str(root), str(root / "traced"), "--imu-trace"],
+                [str(self.binary), str(root), str(root / "traced"),
+                 "--imu-trace", "--profile-local-timing"],
                 capture_output=True, text=True,
             )
             self.assertEqual(traced.returncode, 0, traced.stderr)
@@ -516,6 +588,16 @@ class NativeReplayTest(unittest.TestCase):
                 [{k: v for k, v in r.items() if k != "imu_ms"} for r in states],
                 [{k: v for k, v in r.items() if k != "imu_ms"} for r in traced_states],
             )
+            self.assertFalse((root / "output/local_profile.csv").exists())
+            with (root / "traced/local_profile.csv").open() as stream:
+                profile = list(csv.DictReader(stream))
+            self.assertEqual(len(scans), len(profile))
+            for record in profile:
+                self.assertGreater(int(record["points"]), 0)
+                self.assertGreaterEqual(
+                    int(record["decode_end_ns"]), int(record["decode_start_ns"]))
+                self.assertGreaterEqual(
+                    int(record["estimator_end_ns"]), int(record["estimator_start_ns"]))
             with (root / "traced/imu_trace.csv").open() as stream:
                 trace = list(csv.DictReader(stream))
             self.assertTrue(trace)

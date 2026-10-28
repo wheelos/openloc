@@ -207,10 +207,10 @@ def main():
     parser.add_argument("--duration", type=float, required=True)
     args = parser.parse_args()
     if (
-        not math.isfinite(args.duration) or not 0 < args.duration <= 60
+        not math.isfinite(args.duration) or not 0 < args.duration <= 180
         or not math.isfinite(args.start_offset) or args.start_offset < 0
     ):
-        parser.error("require 0 < duration <= 60 s and finite start-offset >= 0")
+        parser.error("require 0 < duration <= 180 s and finite start-offset >= 0")
     prepare(args)
 
 

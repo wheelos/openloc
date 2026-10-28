@@ -21,7 +21,8 @@ Status GnssPositionGate::Configure(const GnssPositionGatePolicy& policy) {
       policy.maximum_differential_age_seconds,
       policy.maximum_horizontal_accuracy_m, 1.0, 0.0,
       policy.fixed_solution_stability_ns, policy.maximum_fixed_solution_gap_ns,
-      policy.allow_missing_horizontal_accuracy_diagnostic};
+      policy.allow_missing_horizontal_accuracy_diagnostic,
+      policy.allow_missing_hdop};
   return impl_->gate.Configure(shared);
 }
 

@@ -14,6 +14,36 @@ class NativeScanReaderTestAccess {
 
 namespace {
 
+TEST(ReplayCsvTest, SplitPreservesStreamSemanticsForEmptyAndMalformedFields) {
+  const std::string alphabet = ",;|\r\n\"x ";
+  const auto compare = [](const std::string& line) {
+    for (char delimiter : {',', ';', '|', '\r'}) {
+      std::istringstream input(line);
+      std::vector<std::string> expected;
+      std::string field;
+      while (std::getline(input, field, delimiter)) {
+        if (!field.empty() && field.back() == '\r') field.pop_back();
+        expected.push_back(field);
+      }
+      EXPECT_EQ(expected, Fields(line, delimiter));
+    }
+  };
+  compare("");
+  std::vector<std::string> previous{""};
+  for (int length = 1; length <= 4; ++length) {
+    std::vector<std::string> next;
+    for (const auto& prefix : previous) {
+      for (char c : alphabet) {
+        next.push_back(prefix + c);
+        compare(next.back());
+      }
+    }
+    previous = std::move(next);
+  }
+  compare("1791882562723170042,1.2345678901234567,-2.5e-10,0\r");
+  compare(std::string(4096, 'x') + ",");
+}
+
 TEST(NativeScanReaderTest, DecodesBoundedPointsAndAdvancesOnePrefetchSlot) {
   const std::filesystem::path root = ::testing::TempDir();
   for (const auto* name : {"scan_a.csv", "scan_b.csv"}) {

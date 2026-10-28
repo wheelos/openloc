@@ -12,6 +12,7 @@
 #include "Eigen/Eigenvalues"
 #include "Eigen/SVD"
 #include "candidates/common/observed_subspace.h"
+#include "candidates/local/local_motion.h"
 
 namespace openloc {
 namespace localization {
@@ -143,7 +144,7 @@ Result LocalLio::GeometryErrorMap(
     if (anchors) next_anchors.emplace(scan.sequence, scan.anchor);
     for (std::size_t index = 0; index < scan.points.size(); ++index) {
       const auto& point = scan.points[index];
-      const auto key = Key(point);
+      const auto& key = scan.voxel_keys[index];
       if (planes_.find(key) == planes_.end()) continue;
       const Eigen::Vector3d coordinate = point / config_.lidar_voxel_size;
       if ((coordinate - coordinate.array().round().matrix())
@@ -214,8 +215,9 @@ void LocalLio::Rebuild() {
   };
   std::unordered_map<VoxelKey, Accumulator, VoxelHash> accumulators;
   for (const auto& scan : scans_) {
-    for (const auto& point : scan.points) {
-      auto& accumulator = accumulators[Key(point)];
+    for (std::size_t index = 0; index < scan.points.size(); ++index) {
+      const auto& point = scan.points[index];
+      auto& accumulator = accumulators[scan.voxel_keys[index]];
       accumulator.sum += point;
       accumulator.second += point * point.transpose();
       accumulator.anchor_variance =
@@ -242,9 +244,10 @@ void LocalLio::Rebuild() {
     Plane plane;
     plane.point = mean;
     plane.normal = solver.eigenvectors().col(0);
-    plane.variance =
+    plane.geometry_variance =
         std::max(solver.eigenvalues()(0), config_.lidar_plane_noise_std *
-                                              config_.lidar_plane_noise_std) +
+                                              config_.lidar_plane_noise_std);
+    plane.variance = plane.geometry_variance +
         config_.lidar_anchor_variance_scale * accumulator.anchor_variance;
     planes_.emplace(item.first, plane);
     if (planes_.size() >= config_.lidar_max_voxels) {
@@ -254,10 +257,11 @@ void LocalLio::Rebuild() {
 }
 
 Result LocalLio::BuildUpdate(const DeskewedScan& scan, const LocalState& state,
-                             LioUpdate* update) const {
+                             LioUpdate* update, bool tracking_gain) const {
   std::vector<Eigen::Matrix<double, 1, 15>> rows;
   std::vector<double> innovations;
   std::vector<double> variances;
+  std::vector<double> geometry_variances;
   std::vector<LioUpdate::Residual> residuals;
   std::unordered_set<VoxelKey, VoxelHash> used;
   const Eigen::Matrix3d rotation = state.orientation.toRotationMatrix();
@@ -289,7 +293,11 @@ Result LocalLio::BuildUpdate(const DeskewedScan& scan, const LocalState& state,
     }
     rows.push_back(row);
     innovations.push_back(-residual);
-    variances.push_back(variance);
+    const double geometry_variance =
+        plane.geometry_variance +
+        config_.lidar_point_noise_std * config_.lidar_point_noise_std;
+    variances.push_back(tracking_gain ? geometry_variance : variance);
+    geometry_variances.push_back(geometry_variance);
     residuals.push_back({index, plane.point, plane.normal});
   }
   if (rows.size() < config_.lidar_min_correspondences) {
@@ -298,6 +306,7 @@ Result LocalLio::BuildUpdate(const DeskewedScan& scan, const LocalState& state,
   }
 
   Eigen::MatrixXd whitened_pose(rows.size(), 6);
+  Eigen::MatrixXd geometry_pose(rows.size(), 6);
   Eigen::MatrixXd whitened_full(rows.size(), 15);
   Eigen::VectorXd whitened_innovation(rows.size());
   for (std::size_t i = 0; i < rows.size(); ++i) {
@@ -308,19 +317,31 @@ Result LocalLio::BuildUpdate(const DeskewedScan& scan, const LocalState& state,
         (config_.lidar_rotation_length * std::sqrt(variances[i]));
     whitened_full.row(i) = rows[i] / std::sqrt(variances[i]);
     whitened_innovation(i) = innovations[i] / std::sqrt(variances[i]);
+    geometry_pose.row(i) =
+        whitened_pose.row(i) * std::sqrt(variances[i] / geometry_variances[i]);
   }
+  // Absolute anchor uncertainty weights the correction; it cannot erase the
+  // rank of unchanged relative geometry. Neither rank nor a nominal update
+  // qualifies the reused planes as independent covariance information.
+  Eigen::JacobiSVD<Eigen::MatrixXd> geometry_svd(geometry_pose);
   Eigen::JacobiSVD<Eigen::MatrixXd> svd(
       whitened_pose, Eigen::ComputeThinU | Eigen::ComputeThinV);
-  if (svd.info() != Eigen::Success) {
+  if (svd.info() != Eigen::Success || geometry_svd.info() != Eigen::Success) {
     return {Reason::DEGENERATE, "Local geometry SVD failed"};
   }
   uint32_t rank = 0;
   for (int i = 0; i < svd.singularValues().size(); ++i) {
-    rank += svd.singularValues()(i) >= config_.lidar_observed_singular_value;
+    rank += geometry_svd.singularValues()(i) >=
+            config_.lidar_observed_singular_value;
   }
   if (rank == 0) {
     return {Reason::DEGENERATE,
             "Local geometry has no trusted observed direction"};
+  }
+  if (svd.singularValues()(rank - 1) <=
+      std::numeric_limits<double>::epsilon() * svd.singularValues()(0)) {
+    return {Reason::DEGENERATE,
+            "Local geometry statistical weighting is numerically singular"};
   }
   Matrix6d metric = Matrix6d::Identity();
   metric.bottomRightCorner<3, 3>() *= config_.lidar_rotation_length;
@@ -355,7 +376,9 @@ Result LocalLio::BuildUpdate(const DeskewedScan& scan, const LocalState& state,
 
 Result LocalLio::ApplyUpdate(const LioUpdate& update, const LocalState& prior,
                              LocalState* state,
-                             Eigen::MatrixXd* applied_gain) const {
+                             Eigen::MatrixXd* applied_gain,
+                             const Matrix15d* tracking_prior,
+                             Matrix15d* tracking_posterior) const {
   Eigen::Matrix<double, 15, 1> error;
   error.segment<3>(0) = state->position - prior.position;
   error.segment<3>(3) = state->velocity - prior.velocity;
@@ -380,7 +403,8 @@ Result LocalLio::ApplyUpdate(const LioUpdate& update, const LocalState& prior,
   chart.block<3, 3>(6, 6) =
       Eigen::Matrix3d::Identity() - first * skew + second * skew * skew;
   const Matrix15d covariance =
-      chart * prior.covariance * chart.transpose();
+      chart * (tracking_prior ? *tracking_prior : prior.covariance) *
+      chart.transpose();
   const Eigen::Matrix<double, 15, 1> prior_step = chart * error;
   const Eigen::MatrixXd innovation_covariance =
       update.observation * covariance * update.observation.transpose() +
@@ -424,6 +448,21 @@ Result LocalLio::ApplyUpdate(const LioUpdate& update, const LocalState& prior,
       Eigen::LLT<Matrix15d>(next.covariance).info() != Eigen::Success) {
     return {Reason::INVALID_INPUT, "LiDAR update is not finite SPD"};
   }
+  if (tracking_posterior) {
+    const Matrix15d residual =
+        Matrix15d::Identity() - gain * update.observation;
+    Matrix15d reset = Matrix15d::Identity();
+    reset.block<3, 3>(6, 6) =
+        RightRotationJacobian(correction.segment<3>(6));
+    Matrix15d posterior = reset *
+        (residual * covariance * residual.transpose() +
+         gain * update.noise * gain.transpose()) * reset.transpose();
+    posterior = (0.5 * (posterior + posterior.transpose())).eval();
+    if (!posterior.allFinite() ||
+        Eigen::LLT<Matrix15d>(posterior).info() != Eigen::Success)
+      return {Reason::INVALID_INPUT, "LiDAR nominal-gain matrix is not finite SPD"};
+    *tracking_posterior = posterior;
+  }
   *state = next;
   if (applied_gain) *applied_gain = gain;
   return {};
@@ -438,8 +477,10 @@ void LocalLio::Insert(const DeskewedScan& scan, const LocalState& state) {
                            config_.lidar_voxel_size * config_.lidar_voxel_size *
                                state.covariance.block<3, 3>(6, 6).trace();
   stored.points.reserve(scan.points_in_end_base.size());
+  stored.voxel_keys.reserve(scan.points_in_end_base.size());
   for (const auto& point : scan.points_in_end_base) {
     stored.points.push_back(Pose(state) * point);
+    stored.voxel_keys.push_back(Key(stored.points.back()));
   }
   scans_.push_back(std::move(stored));
   while (scans_.size() > config_.lidar_max_scans) {
@@ -450,10 +491,17 @@ void LocalLio::Insert(const DeskewedScan& scan, const LocalState& state) {
 
 Result LocalLio::Observe(const LidarScan& scan, const StateLookup& lookup,
                          LocalState* state,
-                         const LioIterationObserver& observer) {
+                         const LioIterationObserver& observer,
+                         Matrix15d* tracking_gain_covariance) {
   if (state == nullptr || !state->valid || scan.epoch != state->epoch) {
     return {Reason::EPOCH_MISMATCH,
             "LiDAR update requires the current local epoch"};
+  }
+  if (tracking_gain_covariance &&
+      (!tracking_gain_covariance->allFinite() ||
+       !tracking_gain_covariance->isApprox(tracking_gain_covariance->transpose(), 1e-9) ||
+       Eigen::LLT<Matrix15d>(*tracking_gain_covariance).info() != Eigen::Success)) {
+    return {Reason::INVALID_INPUT, "Invalid LiDAR nominal-gain prior"};
   }
   if (epoch_ != state->epoch) {
     Reset(state->epoch);
@@ -470,21 +518,27 @@ Result LocalLio::Observe(const LidarScan& scan, const StateLookup& lookup,
   }
   LocalState candidate = *state;
   LioUpdate update;
+  Matrix15d tracking_posterior;
   for (uint32_t iteration = 0; iteration < config_.lidar_max_update_iterations;
        ++iteration) {
-    result = BuildUpdate(deskewed, candidate, &update);
+    result = BuildUpdate(deskewed, candidate, &update,
+                         tracking_gain_covariance != nullptr);
     if (!result.ok()) {
       return result;
     }
     const LocalState before = candidate;
     result = ApplyUpdate(update, *state, &candidate,
-                         observer ? &update.applied_gain : nullptr);
+                         observer ? &update.applied_gain : nullptr,
+                         tracking_gain_covariance,
+                         tracking_gain_covariance ? &tracking_posterior : nullptr);
     if (!result.ok()) {
       return result;
     }
     if (observer) observer(update, *state, before, candidate);
   }
   *state = candidate;
+  if (tracking_gain_covariance)
+    *tracking_gain_covariance = tracking_posterior;
   observed_pose_basis_ = update.observed_pose_basis;
   Insert(deskewed, *state);
   return {};

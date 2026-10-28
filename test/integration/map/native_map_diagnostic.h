@@ -12,6 +12,7 @@
 #include <fstream>
 #include <future>
 #include <iomanip>
+#include <sstream>
 #include <stdexcept>
 #include <variant>
 
@@ -25,6 +26,27 @@
 
 namespace openloc::replay {
 
+template <typename Derived>
+std::string Flatten(const Eigen::MatrixBase<Derived>& value) {
+  std::ostringstream stream;
+  stream << value.rows() << 'x' << value.cols() << ':'
+         << std::setprecision(17);
+  for (Eigen::Index row = 0; row < value.rows(); ++row) {
+    for (Eigen::Index column = 0; column < value.cols(); ++column) {
+      if (row != 0 || column != 0) stream << ';';
+      stream << value(row, column);
+    }
+  }
+  return stream.str();
+}
+
+struct NativeGlobalOdometryFault {
+  enum class Kind { kNone, kDrift, kStep };
+  Kind kind = Kind::kNone;
+  int64_t start_ns = 0;
+  Eigen::Vector2d value = Eigen::Vector2d::Zero();
+};
+
 // Replay-side scheduling/deskew only. Neither the seed nor global corrections
 // are exposed to the local estimator.
 class NativeMapDiagnostic {
@@ -35,18 +57,29 @@ class NativeMapDiagnostic {
                       const std::filesystem::path& gnss_bundle = {},
                       const std::string& gnss_digests = {},
                       int64_t holdback_ns = 0, bool async_recovery = false,
-                      bool level_odom_gnss_bootstrap = false)
+                      bool level_odom_gnss_bootstrap = false,
+                      NativeGlobalOdometryFault odometry_fault = {},
+                      std::pair<int64_t, int64_t> map_holdout = {},
+                      bool profile_map_timing = false)
       : matches_(output / "map.csv"),
         global_(output / "global.csv"),
         decisions_(output / "global_decisions.csv"),
-        admission_(output / "global_admission.csv"),
-        holdback_ns_(holdback_ns),
-        async_recovery_(async_recovery) {
+      odometry_fault_(std::move(odometry_fault)),
+      admission_(output / "global_admission.csv"),
+      holdback_ns_(holdback_ns),
+      async_recovery_(async_recovery),
+      map_holdout_(map_holdout) {
     namespace loc = localization;
     if (level_odom_gnss_bootstrap && gnss_bundle.empty())
       throw std::runtime_error("horizontal bootstrap requires GNSS input");
+    if (odometry_fault_.kind != NativeGlobalOdometryFault::Kind::kNone &&
+        (odometry_fault_.start_ns <= 0 || !odometry_fault_.value.allFinite()))
+      throw std::runtime_error("invalid global ODOM fault injection");
     if (holdback_ns_ < 0 || holdback_ns_ > 500000000)
       throw std::runtime_error("global holdback must be in [0,500000000] ns");
+    if (map_holdout_.first &&
+        (bundle.empty() || map_holdout_.second <= map_holdout_.first))
+      throw std::runtime_error("map holdout requires a map and increasing interval");
     const bool causal_search =
         !bundle.empty() && std::filesystem::exists(bundle / "recovery.csv");
     const bool seed_time_present =
@@ -146,6 +179,7 @@ class NativeMapDiagnostic {
       matcher_config.base_frame = row[6];
       matcher_config.cloud_frame = row[6];
       matcher_config.calibration_id = row[3];
+      matcher_config.enable_icp_profiling = profile_map_timing;
       matcher_config.algorithm =
           loc::map::ScanMatchingAlgorithm::kPointToPlaneIcp;
       const auto window =
@@ -161,6 +195,17 @@ class NativeMapDiagnostic {
         throw std::runtime_error(
             "map window radius/cell outside diagnostic bounds");
       matcher_ = std::make_unique<loc::map::ScanToMapLocalizer>(matcher_config);
+      if (profile_map_timing) {
+        map_profile_.open(output / "map_profile.csv");
+        if (!map_profile_)
+          throw std::runtime_error("cannot open map timing profile");
+        map_profile_ << std::setprecision(17)
+                     << "sequence,iterations,total_ms,cached_window_build_ms,"
+                        "cached_target_voxelization_ms,cached_target_kdtree_ms,"
+                        "cached_target_normal_ms,cached_normal_search_ms,"
+                        "cached_normal_fit_ms,icp_search_ms,"
+                        "icp_linearization_ms,icp_solver_ms\n";
+      }
       loc::map::PointCloud::Ptr cloud(new loc::map::PointCloud);
       if (pcl::io::loadPCDFile((bundle / "global.pcd").string(), *cloud) != 0)
         throw std::runtime_error("cannot load verified prior map");
@@ -210,10 +255,24 @@ class NativeMapDiagnostic {
     decisions_ << "decision_id,timestamp_ns,receive_ns,sequence,status,message,"
                   "alignment_updated,correction_id,covariance_source,"
                   "odometry_deskew,shared_local_scans,target_graph_available,"
-                  "source,gnss_map_construction\n";
+                  "source,gnss_map_construction,innovation_available,"
+                  "innovation_unavailable_reason,observed_dimension,"
+                  "prior_state_frame,prior_state_dimension,"
+                  "pre_update_residual,innovation_covariance,nis,"
+                  "prior_pose_xyz_qxyzw,prior_covariance,gate_threshold,"
+                  "residual_basis,covariance_model,covariance_decomposition_available,"
+                  "innovation_prior_contribution,innovation_observation_contribution,"
+                  "innovation_local_contribution\n";
     admission_ << "source,sequence,measurement_ns,source_receive_ns,"
                   "enqueue_processing_ns,submission_processing_ns,"
                   "holdback_ns,status,message\n";
+    if (odometry_fault_.kind != NativeGlobalOdometryFault::Kind::kNone) {
+      odometry_injection_.open(output / "global_odom_injection.csv");
+      if (!odometry_injection_)
+        throw std::runtime_error("cannot open global ODOM injection journal");
+      odometry_injection_
+          << "timestamp_ns,sequence,kind,offset_x_m,offset_y_m\n";
+    }
     seed_evidence_.open(output / "seed_application.csv");
     if (!seed_evidence_) throw std::runtime_error("cannot open seed evidence");
     seed_evidence_
@@ -236,6 +295,20 @@ class NativeMapDiagnostic {
     sample.child_frame = config_.base_frame;
     sample.pose.translation = state.position;
     sample.pose.rotation = state.orientation;
+    const Eigen::Vector2d injected_offset = GlobalOdometryOffset(stamp);
+    sample.pose.translation.head<2>() += injected_offset;
+    if (odometry_injection_.is_open() &&
+        stamp >= odometry_fault_.start_ns) {
+      odometry_injection_ << stamp << ',' << state.stamp.sequence << ','
+                          << (odometry_fault_.kind ==
+                                      NativeGlobalOdometryFault::Kind::kDrift
+                                  ? "drift"
+                                  : "step")
+                          << ',' << injected_offset.x() << ','
+                          << injected_offset.y() << '\n';
+      if (!odometry_injection_)
+        throw std::runtime_error("incomplete global ODOM injection journal");
+    }
     // Local error order is [p,v,right rotation,bg,ba]. This is the native
     // marginal, explicitly uncalibrated; no joint/cross-time claim is made.
     Eigen::Matrix<double, 6, 6> covariance;
@@ -274,6 +347,13 @@ class NativeMapDiagnostic {
     namespace loc = localization;
     namespace u = localization::unified;
     if (!matcher_) return;
+    if (map_holdout_.first && stamp >= map_holdout_.first &&
+        stamp < map_holdout_.second) {
+      matches_ << scan.stamp.sequence << ',' << stamp << ',' << receive
+               << ",0,EVALUATION_HOLDOUT,excluded_before_deskew_seed_and_match,"
+                  "0,0,0,0,0,not_submitted,evaluation_holdout,0,0,0\n";
+      return;
+    }
     u::DeskewedScan deskewed;
     const auto status = u::DeskewLidarScan(
         scan, [this](double t, u::LocalState* s) { return Lookup(t, s); },
@@ -328,6 +408,21 @@ class NativeMapDiagnostic {
     request.map_from_base_initial =
         (proposal ? *proposal : map_from_odom_) * odom_from_base;
     const auto match = matcher_->Match(request);
+    if (map_profile_.is_open()) {
+      map_profile_ << scan.stamp.sequence << ',' << match.iterations << ','
+                   << match.processing_time_ms << ','
+                   << match.map_window_build_ms << ','
+                   << match.target_voxelization_ms << ','
+                   << match.target_kdtree_build_ms << ','
+                   << match.target_normal_estimation_ms << ','
+                   << match.target_normal_neighbor_search_ms << ','
+                   << match.target_normal_fit_ms << ','
+                   << match.icp_nearest_search_ms << ','
+                   << match.icp_linearization_ms << ','
+                   << match.icp_solver_ms << '\n';
+      if (!map_profile_)
+        throw std::runtime_error("incomplete map timing profile");
+    }
     const bool full_pose =
         match.valid && match.geometry_full_rank && !match.ambiguous;
     if (proposal) {
@@ -454,6 +549,37 @@ class NativeMapDiagnostic {
       decisions_ << ',';
       Text(decisions_,
            Dependency(decision.context.provenance.gnss_map_construction));
+      decisions_ << ',' << decision.innovation.available << ',';
+      Text(decisions_, decision.innovation.unavailable_reason);
+      decisions_ << ',' << decision.innovation.observed_dimension << ',';
+      Text(decisions_, decision.innovation.prior_state_frame);
+      decisions_ << ',' << decision.innovation.prior_state_dimension << ',';
+      Text(decisions_, Flatten(decision.innovation.residual));
+      decisions_ << ',';
+      Text(decisions_, Flatten(decision.innovation.covariance));
+      decisions_ << ',' << std::setprecision(17) << decision.innovation.nis
+                 << ',';
+      Eigen::Matrix<double, 1, 7> prior_pose;
+      prior_pose << decision.innovation.prior_pose.translation.x(),
+          decision.innovation.prior_pose.translation.y(),
+          decision.innovation.prior_pose.translation.z(),
+          decision.innovation.prior_pose.rotation.x(),
+          decision.innovation.prior_pose.rotation.y(),
+          decision.innovation.prior_pose.rotation.z(),
+          decision.innovation.prior_pose.rotation.w();
+      Text(decisions_, Flatten(prior_pose));
+      decisions_ << ',';
+      Text(decisions_, Flatten(decision.innovation.prior_covariance));
+      decisions_ << ',' << decision.innovation.gate_threshold << ',';
+      Text(decisions_, decision.innovation.residual_basis);
+      decisions_ << ',';
+      Text(decisions_, decision.innovation.covariance_model);
+      decisions_ << ',' << decision.innovation.covariance_decomposition_available << ',';
+      Text(decisions_, Flatten(decision.innovation.prior_contribution));
+      decisions_ << ',';
+      Text(decisions_, Flatten(decision.innovation.observation_contribution));
+      decisions_ << ',';
+      Text(decisions_, Flatten(decision.innovation.local_contribution));
       decisions_ << '\n';
     }
   }
@@ -484,6 +610,11 @@ class NativeMapDiagnostic {
     decisions_.flush();
     seed_evidence_.flush();
     admission_.flush();
+    if (odometry_injection_.is_open()) {
+      odometry_injection_.flush();
+      if (!odometry_injection_)
+        throw std::runtime_error("incomplete global ODOM injection journal");
+    }
     if (horizontal_.is_open()) {
       horizontal_.flush();
       if (!horizontal_)
@@ -501,6 +632,16 @@ class NativeMapDiagnostic {
   bool initialized() const { return alignment_initialized_; }
 
  private:
+  Eigen::Vector2d GlobalOdometryOffset(int64_t stamp) const {
+    if (odometry_fault_.kind == NativeGlobalOdometryFault::Kind::kNone ||
+        stamp < odometry_fault_.start_ns)
+      return Eigen::Vector2d::Zero();
+    if (odometry_fault_.kind == NativeGlobalOdometryFault::Kind::kStep)
+      return odometry_fault_.value;
+    return odometry_fault_.value *
+           (static_cast<double>(stamp - odometry_fault_.start_ns) / 1e9);
+  }
+
   std::optional<Eigen::Isometry3d> RecoveryProposal(
       const localization::unified::LocalState& state, uint64_t sequence,
       int64_t stamp, const localization::map::ScanToMapRequest& request) {
@@ -764,6 +905,9 @@ class NativeMapDiagnostic {
   int64_t last_odom_stamp_ = 0;
   int64_t seed_reference_ns_ = 0, seed_maximum_offset_ns_ = 0;
   std::ofstream matches_, global_, decisions_, seed_evidence_, horizontal_;
+  std::ofstream odometry_injection_;
+  std::ofstream map_profile_;
+  NativeGlobalOdometryFault odometry_fault_;
   std::unique_ptr<NativeCausalMapSearch> causal_search_;
   std::ofstream tracking_journal_;
   std::optional<int64_t> hypothesis_stamp_;
@@ -772,6 +916,7 @@ class NativeMapDiagnostic {
   int64_t holdback_ns_ = 0;
   int64_t last_processing_receive_ = 0;
   bool async_recovery_ = false;
+  std::pair<int64_t, int64_t> map_holdout_;
   localization::unified::LocalState recovery_state_;
   uint64_t recovery_sequence_ = 0;
   int64_t recovery_stamp_ = 0;

@@ -16,7 +16,8 @@ class ContinuousOutput {
   void Reset(const LocalState& internal);
   Result Advance(const LocalState& previous_internal,
                  const LocalState& internal,
-                 const Matrix15d& error_transition, double dt);
+                 const Matrix15d& error_transition, double dt,
+                 const Matrix15d* process_covariance = nullptr);
   const LocalState& state() const { return state_; }
   bool active() const { return active_; }
   bool correction_budget_exceeded() const {

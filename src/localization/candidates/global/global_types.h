@@ -42,8 +42,10 @@ struct GlobalConfig {
   // local covariance. Cannot enable the qualified graph or trusted output.
   bool diagnostic_only = false;
   bool enable_diagnostic_horizontal_bootstrap = false;
+  bool enable_heading_bootstrap = false;
   bool motion_error_model_qualified = false;
   bool graph_allow_uncalibrated_inputs = false;
+  bool graph_retain_on_full_pose_staleness = false;
   double graph_solve_budget_ms = 50.0;
   double graph_robust_threshold = 2.5;
   uint32_t graph_max_states = 1000;
@@ -54,7 +56,7 @@ struct GlobalConfig {
 };
 
 struct GlobalObservation {
-  enum class Kind { POSE, POSITION, PROJECTED_POSE, HORIZONTAL_POSITION };
+  enum class Kind { POSE, POSITION, PROJECTED_POSE, HORIZONTAL_POSITION, HEADING };
   Kind kind = Kind::POSE;
   Stamp stamp;
   // Exact source times, when supplied. Stamp remains the legacy double-second
@@ -74,6 +76,9 @@ struct GlobalObservation {
   Matrix6d covariance = Matrix6d::Zero();
   // POSITION measures this body-fixed point, not an invented base orientation.
   Eigen::Vector3d point_in_base = Eigen::Vector3d::Zero();
+  double heading_rad = 0.0;
+  double heading_variance = 0.0;
+  Eigen::Vector3d direction_in_base = Eigen::Vector3d::UnitX();
   // Rows act on [translation_map (m), left rotation_map (rad)].
   Eigen::MatrixXd projection;
   Eigen::MatrixXd projected_covariance;

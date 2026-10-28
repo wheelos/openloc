@@ -6,6 +6,9 @@
 
 #include "openloc/localization/global/diagnostic_alignment.h"
 
+#include <cmath>
+
+#include "Eigen/Cholesky"
 #include "gtest/gtest.h"
 
 namespace openloc {
@@ -72,6 +75,60 @@ void Bootstrap(DiagnosticGlobalAlignment* owner) {
       EXPECT_TRUE(status.ok()) << status.message();
     }
   }
+}
+
+TEST(DiagnosticAlignmentTest, QueuedHeadingAndPositionAcquireOnlyHorizontalState) {
+  auto config = Config();
+  config.enable_heading_bootstrap = true;
+  DiagnosticGlobalAlignment owner;
+  EXPECT_EQ(StatusCode::kInvalidArgument, owner.Configure(config).code());
+  config.assume_gravity_aligned_odom = true;
+  ASSERT_TRUE(owner.Configure(config).ok());
+  GlobalHeadingObservation heading;
+  heading.context = Context(0, "heading");
+  heading.heading_rad = 0.35;
+  heading.variance_rad2 = 0.0001;
+  heading.covariance_source = "receiver-heading";
+  EXPECT_EQ(StatusCode::kPending, owner.SubmitHeadingObservation(heading).code());
+  ASSERT_TRUE(owner.AddOdometry(Odom(0), Matrix6d::Identity() * 0.01).ok());
+  GlobalHorizontalObservation position;
+  position.context = Context(0, "position");
+  position.position = Eigen::Vector2d(100.0, 20.0);
+  position.covariance = Eigen::Matrix2d::Identity() * 0.01;
+  position.covariance_source = "receiver-position";
+  ASSERT_TRUE(owner.SubmitHorizontalObservation(position).ok());
+  DiagnosticAlignmentResult result;
+  ASSERT_TRUE(owner.GetResult(&result).ok());
+  ASSERT_TRUE(result.horizontal_estimate);
+  EXPECT_TRUE(result.horizontal_estimate->map_base_xy.isApprox(position.position));
+  EXPECT_NEAR(0.35, result.horizontal_estimate->map_from_odom_xy_yaw.z(), 1e-10);
+  EXPECT_FALSE(result.estimate);
+  EXPECT_FALSE(result.full_pose_evidence_fresh);
+  EXPECT_TRUE(result.horizontal_evidence_fresh);
+  EXPECT_EQ(1u, result.decisions.back().correction_id);
+  ASSERT_TRUE(owner.AddOdometry(Odom(1, 2), Matrix6d::Identity() * 0.01).ok());
+  ASSERT_TRUE(owner.GetResult(&result).ok());
+  EXPECT_FALSE(result.horizontal_estimate);
+}
+
+TEST(DiagnosticAlignmentTest, HeadingCorrectsBasinWithoutRenewingFullPose) {
+  DiagnosticGlobalAlignment owner;
+  ASSERT_TRUE(owner.Configure(Config()).ok());
+  Bootstrap(&owner);
+  GlobalHeadingObservation heading;
+  heading.context = Context(2, "heading");
+  heading.heading_rad = 0.03;
+  heading.variance_rad2 = 0.0001;
+  heading.covariance_source = "receiver-heading";
+  ASSERT_TRUE(owner.SubmitHeadingObservation(heading).ok());
+  DiagnosticAlignmentResult result;
+  ASSERT_TRUE(owner.GetResult(&result).ok());
+  ASSERT_TRUE(result.estimate);
+  EXPECT_EQ(2u, result.estimate->correction_id);
+  EXPECT_GT(result.estimate->map_from_base.rotation.toRotationMatrix()(1, 0), 0.0);
+  ASSERT_TRUE(result.last_full_pose_time);
+  EXPECT_EQ(Odom(2).timestamp.nanoseconds, result.last_full_pose_time->nanoseconds);
+  EXPECT_TRUE(result.decisions.back().alignment_updated);
 }
 
 TEST(DiagnosticAlignmentTest, InitializesFromMapEvidenceNotAnOraclePrior) {
@@ -483,7 +540,18 @@ TEST(DiagnosticAlignmentTest, LateSourceCannotRewriteCommittedFrontier) {
   ASSERT_TRUE(owner.AddOdometry(Odom(5), Matrix6d::Identity() * 0.01).ok());
   auto current = Map(5);
   current.context.source = "current-map";
+  current.map_from_base.translation.y() += 0.05;
   ASSERT_TRUE(owner.SubmitMapObservation(current).ok());
+  std::vector<GlobalObservationDecision> decisions;
+  ASSERT_TRUE(owner.GetDecisions(&decisions).ok());
+  ASSERT_TRUE(decisions.back().innovation.available);
+  EXPECT_EQ("map_from_odom", decisions.back().innovation.prior_state_frame);
+  EXPECT_NEAR(
+      decisions.back().innovation.nis,
+      decisions.back().innovation.residual.dot(
+          decisions.back().innovation.covariance.ldlt().solve(
+              decisions.back().innovation.residual)),
+      1e-8);
   auto late = Map(3);
   late.context.source = "delayed-map";
   late.context.receive_time = Odom(5).timestamp;

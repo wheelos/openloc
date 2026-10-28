@@ -69,6 +69,49 @@ struct GlobalPositionObservation {
   std::string covariance_source;
 };
 
+// Azimuth atan2(map Y, map X) of a calibrated body-fixed antenna baseline.
+// Not an INS attitude or a second antenna position. Receiver status, baseline
+// length, uncertainty and dwell admission belong to the caller.
+struct GlobalHeadingObservation {
+  GlobalObservationContext context;
+  double heading_rad = 0.0;
+  double variance_rad2 = 0.0;
+  Eigen::Vector3d direction_in_base = Eigen::Vector3d::UnitX();
+  std::string covariance_source;
+};
+
+struct GlobalHorizontalEstimate {
+  Eigen::Vector3d map_from_odom_xy_yaw = Eigen::Vector3d::Zero();
+  Eigen::Vector2d map_base_xy = Eigen::Vector2d::Zero();
+  // Diagnostic covariance at odom_reference_xy; not a qualified joint bound.
+  Eigen::Vector2d odom_reference_xy = Eigen::Vector2d::Zero();
+  Eigen::Matrix3d covariance = Eigen::Matrix3d::Zero();
+  Timestamp last_observation_time;
+  uint64_t correction_id = 0;
+};
+
+struct ObservationInnovation {
+  bool available = false;
+  std::string unavailable_reason;
+  std::string prior_state_frame;
+  uint32_t observed_dimension = 0;
+  uint32_t prior_state_dimension = 0;
+  Eigen::VectorXd residual;
+  Eigen::MatrixXd covariance;
+  double nis = 0.0;
+  // The actual admission threshold, not a calibration or trust declaration.
+  double gate_threshold = 0.0;
+  std::string residual_basis;
+  std::string covariance_model;
+  bool covariance_decomposition_available = false;
+  Eigen::MatrixXd prior_contribution;
+  Eigen::MatrixXd observation_contribution;
+  Eigen::MatrixXd local_contribution;
+  Pose prior_pose;
+  Eigen::Matrix<double, 6, 6> prior_covariance =
+      Eigen::Matrix<double, 6, 6>::Zero();
+};
+
 struct GlobalObservationDecision {
   GlobalObservationContext context;
   Status status;
@@ -77,6 +120,7 @@ struct GlobalObservationDecision {
   // An OK status can mean retained, unanchored position evidence, not a change.
   bool alignment_updated = false;
   std::string covariance_source;
+  ObservationInnovation innovation;
 };
 
 }  // namespace localization

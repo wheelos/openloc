@@ -145,6 +145,17 @@ def summarize_capability(path):
 
 def summarize_host_timing(path):
     records = rows(path) if path.exists() else []
+    clock_path = path.with_name("replay_clock.csv")
+    rate = 1
+    if clock_path.exists():
+        declaration = rows(clock_path)
+        if (len(declaration) != 1 or declaration[0]["arrival_rate"] not in ("1", "2", "5") or
+                declaration[0]["scope"] !=
+                "wall_schedule_only_original_sensor_timestamps_preserved"):
+            raise ValueError("invalid replay clock declaration")
+        rate = int(declaration[0]["arrival_rate"])
+        if records and declaration[0]["first_receive_ns"] != records[0]["receive_ns"]:
+            raise ValueError("replay clock origin changed")
     valid = [r for r in records if r["valid"] == "1"]
     previous = None
     lateness = []
@@ -158,8 +169,8 @@ def summarize_host_timing(path):
                 values["timestamp_ns"] <= previous["timestamp_ns"] or
                 values["receive_ns"] < previous["receive_ns"] or
                 values["emitted_steady_ns"] < previous["emitted_steady_ns"] or
-                values["target_steady_ns"] - previous["target_steady_ns"] !=
-                values["receive_ns"] - previous["receive_ns"]):
+                values["target_steady_ns"] - int(records[0]["target_steady_ns"]) !=
+                (values["receive_ns"] - int(records[0]["receive_ns"])) // rate):
             raise ValueError("paced host chronology changed")
         if row["valid"] == "1":
             lateness.append(values["emitted_steady_ns"] - values["target_steady_ns"])
@@ -171,6 +182,8 @@ def summarize_host_timing(path):
     gaps = sum(value > 10_000_000 for value in intervals)
     return {
         "journal_present": path.exists(), "emitted_rows": len(records),
+        "arrival_rate": rate,
+        "clock_scope": "wall schedule only; source timestamps unchanged",
         "initialized_emissions": len(valid),
         "deadline_ns": 10_000_000,
         "initialized_deadline_misses": misses,

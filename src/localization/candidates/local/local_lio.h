@@ -67,7 +67,8 @@ class LocalLio {
   // rejected corrections do not change the supplied state.
   Result Observe(const LidarScan& scan, const StateLookup& lookup,
                  LocalState* state,
-                 const LioIterationObserver& observer = {});
+                 const LioIterationObserver& observer = {},
+                 Matrix15d* tracking_gain_covariance = nullptr);
   void Reset(const Epoch& epoch);
   const Eigen::MatrixXd& observed_pose_basis() const {
     return observed_pose_basis_;
@@ -82,18 +83,11 @@ class LocalLio {
       std::map<uint64_t, LocalState>* anchors = nullptr) const;
 
  private:
-  struct StoredScan {
-    Epoch epoch;
-    uint64_t sequence = 0;
-    std::vector<Eigen::Vector3d> points;
-    LocalState anchor;
-    double anchor_variance = 0.0;
-  };
-
   struct Plane {
     Eigen::Vector3d point = Eigen::Vector3d::Zero();
     Eigen::Vector3d normal = Eigen::Vector3d::Zero();
     double variance = 0.0;
+    double geometry_variance = 0.0;
   };
 
   struct VoxelKey {
@@ -109,13 +103,25 @@ class LocalLio {
     std::size_t operator()(const VoxelKey& key) const;
   };
 
+  struct StoredScan {
+    Epoch epoch;
+    uint64_t sequence = 0;
+    std::vector<Eigen::Vector3d> points;
+    // Frozen points and the owning configuration never change before retirement.
+    std::vector<VoxelKey> voxel_keys;
+    LocalState anchor;
+    double anchor_variance = 0.0;
+  };
+
   VoxelKey Key(const Eigen::Vector3d& point) const;
   void Rebuild();
   Result BuildUpdate(const DeskewedScan& scan, const LocalState& state,
-                     LioUpdate* update) const;
+                     LioUpdate* update, bool tracking_gain = false) const;
   Result ApplyUpdate(const LioUpdate& update, const LocalState& prior,
                      LocalState* state,
-                     Eigen::MatrixXd* applied_gain = nullptr) const;
+                     Eigen::MatrixXd* applied_gain = nullptr,
+                     const Matrix15d* tracking_prior = nullptr,
+                     Matrix15d* tracking_posterior = nullptr) const;
   void Insert(const DeskewedScan& scan, const LocalState& state);
 
   LocalConfig config_;

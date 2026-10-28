@@ -1,15 +1,89 @@
-# Openloc LiDAR Odometry + GNSS Roadmap
+# OpenLoc Indoor/Outdoor Localization Roadmap
 
-This roadmap tracks a focused target: continuous LiDAR/IMU ODOM with
-GNSS-aided global alignment. A prior point-cloud map is not required for the
-ODOM/GNSS sub-baseline. The current two-capture target additionally requires
-normal-operation scan-to-map/GNSS/ODOM fusion; that target is not yet complete.
-A map-assisted localization proposal is linked from the documentation index.
+This roadmap tracks the product target updated 2026-10-27: indoor/outdoor
+continuous LiDAR/IMU ODOM with one global owner able to fuse ODOM motion, GNSS,
+map observations and optional known-marker observations. Local ODOM remains
+independent of global corrections. Existing raw-native map/GNSS evidence is
+diagnostic; target-graph real-data acceptance and indoor/outdoor transition
+qualification remain incomplete.
 Functional principles remain in
 [`principles.md`](principles.md), and the target contracts are in
 [`architecture.md`](architecture.md).
 
+Until independent truth and pre-approved product budgets are available, the
+no-ground-truth evaluation ceiling is L3. Existing evaluation tools now
+recompute NIS and analyze whitening/correlation, source accounting, fault
+response, same-factor batch and semi-synthetic NEES, with known failure
+boundaries preserved. A complete raw factor ledger, calibrated covariance,
+successful real-record FixedLag and independent physical reference remain
+unqualified. The staged evaluator plan and evidence wording are
+maintained in the
+[global integration plan](../../../ad_agents/context/modules/localization/knowledge/openloc-global-integration-plan.md).
+
 ## Current implementation and evidence
+
+### 2026-10-28: diagnostic baseline prepared for submission
+
+The [package baseline snapshot](baseline-20261028.md) is the current compact
+entry for product goals, algorithm/diagnostic/evaluation ownership, 14 synthetic
+scenario contracts and their incomplete field correspondence. Commit
+preparation checks cover 12 C++ test targets (356 cases), three built
+evaluation/replay binaries and 56 Python cases; no lint was run.
+Detailed sections below retain their original scope and historical counts.
+
+This baseline includes the numerical graph repair, marker adapter, innovation/
+evaluation tools and behavior-preserving map/CSV/LIO optimizations. Local LIO
+compute gains do not establish end-to-end gains: latest 1x CPU/deadline results
+worsened and increased map cost is unresolved. Real native FixedLag admission,
+marker/continuous indoor-outdoor field coverage, calibrated accuracy and
+production runtime/consumer acceptance remain open. Preparing a baseline does
+not mark these gates complete or create a release.
+
+### 2026-10-28: nonlinear fixed-lag failure repaired
+
+The graph now preserves the original marginalized Gaussian chart explicitly
+while permitting active nonlinear constraints to be relinearized within the
+retained window. Full Bayes-tree delta updates repair a separate no-eviction
+wildfire truncation failure. No lag, iteration, solve budget, source/trust gate
+or exact-feasibility tolerance was relaxed.
+
+Matched 8-node/5 s and 12-node/60 s runs each complete 640/640 trials; the former
+previously failed 40/40 audited trials and the latter 2/640. Correctly modeled
+independent/AR/shared-bias errors show no detected mean-NEES inconsistency under
+these synthetic assumptions; deliberately unmodeled correlation remains
+inconsistent. This is not real covariance qualification. Turning/shared-error
+and original failure-seed regressions cover the repair. The
+[current source/runtime-pinned report](../.agents/notes/goal_graph_20261028_v1/validation/index.html)
+also distinguishes the 13 functional source scenarios from remaining real
+native-model admission, marker field and deployment qualification gaps.
+Older failures below are historical evidence, not the current solver status.
+
+### Indoor/outdoor scenario framework
+
+The [delivery plan and validation list](../../../ad_agents/context/modules/localization/knowledge/openloc-indoor-outdoor-delivery-plan.md)
+separate algorithm state ownership, decision/health diagnostics and offline
+evaluation. `BuildMarkerObservation` now converts associated known-marker
+poses and calibrated transforms through full joint covariance propagation
+into the existing global observation entry. A marker detector and actual
+marker observations are not implemented or validated by this adapter.
+
+The explicit default-off `retain_graph_on_full_pose_staleness` policy addresses
+the graph being destroyed when full-pose evidence expires despite ongoing
+partial constraints. It retains updates but not full-pose freshness or trust;
+default behavior, observation gates and explicit recovery remain unchanged.
+
+The actual public graph now completes 13 synthetic observation-boundary
+scenarios: indoor map/marker without GNSS, complementary and joint degradation,
+intermittent markers, source transitions/loss/reentry, faults, delayed map and
+an explicitly unanchored GNSS-only cold start. The
+[frozen report](../.agents/notes/indoor_outdoor_scenarios_20261027_v5/index.html)
+contains 312 state rows, 474 terminal observations and 367 recomputed NIS.
+Synthetic exact geometry is not raw-sensor or statistical-consistency evidence.
+The preceding 2026-10-27 180 s raw local/combined replays preserve 1,702/1,800 local scans,
+407 map + 126 GNSS corrections and exact local isolation, still using the
+diagnostic owner and explicit local gain mode. Real native graph-model
+gaps, global reentry jumps, field marker/indoor-outdoor and runtime/consumer
+acceptance are not closed.
 
 ### Native target-graph Cyber functional boundary
 
@@ -2058,7 +2132,7 @@ Next order:
 
 #### 2026-10-19 implementation progress
 
-The [global integration plan](../../../wheelos-service/context/modules/localization/knowledge/openloc-global-integration-plan.md)
+The [global integration plan](../../../ad_agents/context/modules/localization/knowledge/openloc-global-integration-plan.md)
 is now in staged implementation, not complete. The GNSS quality gate returns
 typed accepted/waiting/rejected/invalid decisions, validates its own policy,
 and preserves policy/history on invalid configuration. Engine policy validation
@@ -3476,7 +3550,7 @@ prewarming) measured 58.02 ms P95 / 71.73 ms max, with convergence reduced
 from 145/196 to 136/196. No configuration met both provisional latency goals;
 none is promoted to a production default. Full metrics, per-frame outputs, and
 hash-pinned provenance are in the
-[map-assisted validation plan](../../../wheelos-service/context/modules/localization/knowledge/map-assisted-localization-validation-plan.md)
+[map-assisted validation plan](../../../ad_agents/context/modules/localization/knowledge/map-assisted-localization-validation-plan.md)
 and ignored replay archive
 `/home/wfh/01code/map-infra/offline_map/results/20261008141912/scan_to_map_icp_followup_a17c39bf/`.
 

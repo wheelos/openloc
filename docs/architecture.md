@@ -1,39 +1,44 @@
-# Openloc LiDAR Odometry + GNSS Architecture
+# OpenLoc Indoor/Outdoor Localization Architecture
 
-This document defines the current G100/Mid-360 target: continuous local
-LiDAR-inertial odometry with GNSS aiding. A prior point-cloud map is not a
-runtime dependency. This is a target architecture, not a claim that the
-components are fully integrated or field-qualified; see
+The product target is continuous local LiDAR/IMU odometry with one global
+alignment owner that can fuse ODOM motion, GNSS, map observations and optional
+known-marker observations across indoor, outdoor and transition segments.
+Source availability may change by environment; loss of global references must
+not interrupt or re-anchor local ODOM. This is a target architecture, not a
+claim that all source adapters are integrated or field-qualified; see
 [`roadmap.md`](roadmap.md).
 
 ## Goal and boundary
 
 L1 estimates continuous relative motion in a local `odom` frame from LiDAR
-and IMU. A separate global-alignment estimator uses quality-qualified GNSS
-positions in a declared local ENU frame to estimate `T_enu_odom`. The global
-output is formed as:
+and IMU. A separate global-alignment estimator composes qualified or explicitly
+diagnostic GNSS, map and optional known-marker observations with that ODOM
+motion to estimate `T_map_odom`. The global output is formed as:
 
 ```text
-T_enu_body = T_enu_odom * T_odom_body
+T_map_body = T_map_odom * T_odom_body
 ```
 
-GNSS may correct the global alignment, but never initializes, corrects, resets,
-or re-anchors the L1 `odom` state. During GNSS outages, ODOM remains available
-and the global uncertainty grows. On GNSS recovery, measurements are gated
-before they can correct global alignment. Do not claim globally accurate
-position when the GNSS source, quality, timing, antenna lever arm, or datum is
-unknown.
+No global source may initialize, correct, reset, or re-anchor the L1 `odom`
+state. Outdoors, GNSS can provide horizontal global reference when its datum,
+quality, time and antenna lever arm are valid. Indoors or during GNSS loss,
+qualified map or known-marker observations may anchor/recover the global
+alignment; without an available global observation, continuous ODOM remains
+the usable relative output while global status degrades. Map, marker and GNSS
+observations share one selected global owner; they are not fused by averaging
+independent backend outputs. Source dependency and uncertainty must be
+represented or left explicitly diagnostic.
 
-No prior-map matching, map tiles, map descriptors, map relocalization, or
-map-to-ENU anchor is required for this target. The local ENU origin and
-coordinate conversion must still be explicit and versioned. This scope does
-not include online map building or map-based correction.
+Map matching and markers are optional global aids, not prerequisites for local
+ODOM or for an outdoor GNSS-only operating mode. A map/marker reference and
+its transform to the selected global frame must be explicit and versioned;
+unknown marker identity/pose or an unverified map-to-GNSS transform cannot
+bootstrap a trusted global pose. Online map building is outside this scope.
 
-Map-assisted scan-to-map localization is a separate optional extension; it
-does not change the no-prior-map requirement of this baseline or local-ODOM
-ownership. Its architecture, dataset limitations, and staged implementation
-plan are maintained in the
-[map-assisted localization plan](../../../wheelos-service/context/modules/localization/knowledge/map-assisted-localization-validation-plan.md).
+Map-assisted scan-to-map localization is one optional global observation path;
+it never changes local-ODOM ownership. Its architecture, dataset limitations,
+and staged implementation plan are maintained in the
+[map-assisted localization plan](../../../ad_agents/context/modules/localization/knowledge/map-assisted-localization-validation-plan.md).
 
 ## Runtime layers and ownership
 
@@ -51,6 +56,26 @@ for explicitly selected replay/ablation comparisons; they are not compatibility
 wrappers around the graph or runtime fallbacks. Graph and diagnostic callers
 use the same canonical observation value types without legacy aliases.
 
+The current fast integration baseline is still explicitly diagnostic:
+`DiagnosticGlobalAlignment` has real-data map/GNSS replay evidence, while
+`FixedLagGlobalAlignment` is the target graph and has functional software
+regressions but not yet equivalent multi-capture real-data acceptance. A known
+marker is now adapted by `BuildMarkerObservation` as a global map-pose
+observation with surveyed identity, explicit time/frames, extrinsics and
+18D joint input covariance. It composes
+`T_map_marker * inverse(T_sensor_marker) * inverse(T_base_sensor)` and retains
+ambiguity for owner rejection. Detection/association and real marker
+calibration remain host responsibilities; repeated survey/extrinsic errors
+are shared across observations, not qualified independent noise.
+
+The framework has three responsibilities: algorithms own local/global state;
+diagnostics expose decisions, innovation, health and freshness without owning
+a replacement estimate; offline evaluation selects scenarios and assertions,
+checks evidence and produces reports. The
+[delivery plan](../../../ad_agents/context/modules/localization/knowledge/openloc-indoor-outdoor-delivery-plan.md)
+defines the executable indoor/outdoor scene list and the remaining real-data
+and deployment gates. Synthetic functional scenes do not qualify frontends.
+
 `FixedLagGlobalAlignment` is a PIMPL value-type entry over the existing
 `GlobalAlignment` fixed-lag backend. Its `GraphOdometrySample` supplies the
 full 15D covariance in the local error convention, and `GraphMotionConnection`
@@ -62,6 +87,23 @@ the backend builds its conditional error chain and constrained relative-pose
 coupling. It does not add an independent ODOM Gaussian edge on top.
 A positive joint covariance or a single cross-covariance does not establish
 the required conditional/Markov model: that model must be qualified externally.
+
+Fixed-lag marginalization preserves a Gaussian prior in its original reference
+chart. If frozen separator linearizations stall active nonlinear hard
+constraints, the retained window is relinearized using that same prior's
+`A`, `b` and noise, with explicit Pose3 chart derivatives. Eliminated factors
+are not reconstructed or counted again. This bounded relinearization remains
+subject to the existing iteration, feasibility and publication budgets;
+complete Bayes-tree delta updates avoid wildfire-truncated feasibility checks.
+Evaluation records the retained relinearization count. This solves a numerical
+failure boundary, not the native front-end's statistical qualification.
+
+`retain_graph_on_full_pose_staleness` is an explicit default-off lifecycle
+policy: an established graph may keep accepting partial constraints after its
+full-pose evidence expires. Its full-pose freshness and trust still degrade;
+partial updates cannot renew the lease. Explicit recovery, invalid/missing
+motion and epoch changes still revoke the graph. This does not make GNSS XY
+alone a complete SE(3) cold-start anchor or qualify joint directional coverage.
 
 Calibration is a separate admission axis: the explicit, default-off
 `allow_uncalibrated_inputs` mode permits uncalibrated covariance and diagnostic
@@ -747,21 +789,22 @@ The output carries:
 - `T_enu_body` and covariance when global alignment is valid;
 - GNSS fix type/quality/age, accepted/rejected status and reason;
 - GNSS-to-body lever-arm/calibration identity and ENU-origin identity;
+- per-source map/marker identity, reference, admission and correction status;
 - measurement age and end-to-end latency.
 
 Consumers use ODOM for continuous relative motion. Consumers of ENU position
-must check global validity, GNSS quality, covariance, and reference identity.
-GNSS outages make the global estimate less certain; they do not invalidate a
-healthy L1 ODOM estimate.
+must check global validity, active source quality, covariance, and reference
+identity. Loss of GNSS/map/marker support degrades global validity; it does not
+invalidate a healthy L1 ODOM estimate.
 
 ## Package and runtime ownership
 
 Openloc owns middleware-neutral value contracts, estimator algorithms, and
-health policy. Host/runtime adapters own sensor and GNSS protocol decoding,
+health policy. Host/runtime adapters own sensor, GNSS, map and marker decoding,
 clock synchronization, calibration delivery, process lifecycle, transport,
 and output publication. The online library has no dependency on Apollo/Cyber
-or ROS messages. There is no map loader or prior-map runtime path in this
-target.
+or ROS messages. A general map/marker database service is outside this
+package's owner boundary.
 
 ## Evidence boundary
 
