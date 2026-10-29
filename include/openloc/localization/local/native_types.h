@@ -132,6 +132,11 @@ struct LocalState {
   // True only when the local uncertainty model has been calibrated for use.
   bool uncertainty_qualified = false;
   bool valid = false;
+  // Optional numerical representation of this SAME marginal, P = L L^T.
+  // It is not a sufficient temporal basis or an uncertainty qualification.
+  // covariance is its rounded dense view; consumers requiring a dense SPD
+  // inverse must still check that their representation can resolve it.
+  std::optional<Matrix15d> covariance_square_root;
 };
 
 struct SourceSampleId {

@@ -12,6 +12,7 @@ import unittest
 from unittest.mock import patch
 
 from prepare_native_lio import imu_values, scan_decision, scan_values
+from run_native_map_diagnostic import diagnostic_mean_policy
 from native_lio_report import (
     imu_trace_svg, initialization_svg, runtime_identity, summarize, summarize_capability,
     summarize_imu_trace,
@@ -83,6 +84,26 @@ class RawContractTest(unittest.TestCase):
 
 
 class NativeReportTest(unittest.TestCase):
+    def test_mean_policy_is_explicit_and_never_promotes_trust(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            self.assertEqual(diagnostic_mean_policy(root), "covariance_intersection")
+            write_csv(root / "global_mean_policy.csv",
+                      "mode,covariance,trust_ceiling",
+                      [["fixed_half_residual", "unknown_correlation_bound",
+                        "diagnostic"]])
+            self.assertEqual(diagnostic_mean_policy(root), "fixed_half_residual")
+            write_csv(root / "global_mean_policy.csv",
+                      "mode,covariance,trust_ceiling",
+                      [["fixed_half_residual", "qualified", "trusted"]])
+            with self.assertRaisesRegex(ValueError, "invalid diagnostic mean policy"):
+                diagnostic_mean_policy(root)
+            (root / "global_mean_policy.csv").unlink()
+            write_csv(root / "global_decisions.csv", "covariance_model",
+                      [["diagnostic_fixed_gain_full_pose_bound"]])
+            with self.assertRaisesRegex(ValueError, "disagrees with innovations"):
+                diagnostic_mean_policy(root)
+
     def test_timer_distinguishes_held_pose_from_new_measurement_and_stale(self):
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
             journal = Path(temporary) / "timer.csv"
@@ -321,6 +342,22 @@ class NativeReportTest(unittest.TestCase):
 class NativeReplayTest(unittest.TestCase):
     binary = None
 
+    def test_fixed_gain_requires_explicit_owner_and_unique_option(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            for flags, message in (
+                (["--diagnostic-fixed-gain"], "requires a global owner"),
+                (["--diagnostic-fixed-gain", "--diagnostic-fixed-gain"],
+                 "unknown or duplicate"),
+            ):
+                with self.subTest(flags=flags):
+                    completed = subprocess.run(
+                        [str(self.binary), str(root), str(root / "output"),
+                         *flags], capture_output=True, text=True)
+                    self.assertNotEqual(completed.returncode, 0)
+                    self.assertIn(message, completed.stderr)
+                    self.assertFalse((root / "output").exists())
+
     def test_local_profiling_rejects_duplicate_option(self):
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
             root = Path(temporary)
@@ -532,6 +569,7 @@ class NativeReplayTest(unittest.TestCase):
                              sum(r["reason"] == "NONE" for r in decisions))
             self.assertLess(summary["total_position_correction_path_m"], 1e-10)
             self.assertFalse((root / "output/imu_trace.csv").exists())
+            self.assertFalse((root / "output/local_covariance.csv").exists())
             tracking = subprocess.run(
                 [str(self.binary), str(root), str(root / "tracking"),
                  "--diagnostic-lidar-tracking-gain"],
@@ -601,6 +639,34 @@ class NativeReplayTest(unittest.TestCase):
             with (root / "traced/imu_trace.csv").open() as stream:
                 trace = list(csv.DictReader(stream))
             self.assertTrue(trace)
+            with (root / "traced/local_covariance.csv").open() as stream:
+                covariance_trace = list(csv.DictReader(stream))
+            self.assertEqual([row["sequence"] for row in trace],
+                             [row["sequence"] for row in covariance_trace])
+            last = covariance_trace[-1]
+            matrices = {}
+            for name in ("internal_before", "internal_after", "output_before",
+                         "output_after", "transition", "process_noise"):
+                values = list(map(float, last[name].split(";")))
+                self.assertEqual(len(values), 225)
+                matrices[name] = [values[i:i + 15] for i in range(0, 225, 15)]
+            transition = matrices["transition"]
+            for before, after in (("internal_before", "internal_after"),
+                                  ("output_before", "output_after")):
+                for axis in range(15):
+                    expected = sum(
+                        transition[axis][i] * matrices[before][i][j] *
+                        transition[axis][j]
+                        for i in range(15) for j in range(15))
+                    expected += matrices["process_noise"][axis][axis]
+                    if before == "output_before" and axis < 9:
+                        correction = list(map(float, last[
+                            ("translation_correction", "velocity_correction",
+                             "rotation_correction")[axis // 3]].split(";")))
+                        expected += (float(last["correction_variance_scale"]) *
+                                     correction[axis % 3] ** 2)
+                    self.assertAlmostEqual(expected, matrices[after][axis][axis],
+                                           places=10)
             self.assertAlmostEqual(float(trace[-1]["force_z"]), 9.80665)
             self.assertAlmostEqual(float(trace[-1]["accel_bias_z"]), 0, places=12)
             accounted = summarize_imu_trace(trace, corrections)

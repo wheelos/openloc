@@ -92,6 +92,56 @@ def compare_replays(actual, reference, filenames):
     return result
 
 
+def scenario_correspondence(events):
+    """Nominate shared mechanisms, never pass a field scene from source counts."""
+    maps = [e for e in events if e["source"] == MAP_SOURCE and
+            e["outcome"] == "committed"]
+    gnss = [e for e in events if e["source"] == GNSS_SOURCE]
+    fixes = [e for e in gnss if e["outcome"] == "committed"]
+    quality = [e for e in gnss if e["outcome"] == "gate_not_accepted" and
+               e["reason"] in ("carrier_solution_not_fixed", "hdop_exceeds_limit")]
+    stamps = sorted(e["measurement_ns"] for e in maps)
+    gaps = [(a, b) for a, b in zip(stamps, stamps[1:]) if b - a > 2_000_000_000]
+    supported_gaps = [
+        {"begin_ns": a, "end_ns": b, "gnss_commits": sum(
+            a < e["measurement_ns"] < b for e in fixes)}
+        for a, b in gaps
+        if any(a < e["measurement_ns"] < b for e in fixes)
+    ]
+    mechanisms = {
+        "S01": bool(maps and not gnss),
+        "S03": bool(maps and fixes),
+        "S05": bool(maps and quality),
+        "S08": bool(supported_gaps),
+        "S12": any(e["outcome"] == "retained_without_correction" for e in gnss),
+        "S15": bool(supported_gaps),
+    }
+    return {
+        "status": "mechanism_correspondence_only_not_field_acceptance",
+        "cases": {
+            f"S{number:02}": ("partial" if mechanisms.get(f"S{number:02}", False)
+                             else "not_observed_in_this_arm")
+            for number in range(1, 16)
+        },
+        "evidence": {
+            "map_commits": len(maps), "gnss_commits": len(fixes),
+            "gnss_quality_rejections": len(quality),
+            "sparse_map_intervals_with_gnss_commits": supported_gaps,
+            "sparse_map_gap_definition_ns": 2_000_000_000,
+            "gap_scope": "between actual map commits only; excludes startup/tail; "
+                         "not a measured freshness policy or synthetic timing match",
+        },
+        "limits": [
+            "DiagnosticGlobalAlignment is not the synthetic FixedLag owner",
+            "disabled or absent sources do not establish indoor/outdoor scene labels",
+            "source counts do not prove observability, recovery, accuracy or matching parameters",
+            "map matcher failures are not projected factors with known unobserved directions",
+            "quality/stability front-end gates are separate from graph source qualification",
+            "unobserved cases are uncovered, not functional failures",
+        ],
+    }
+
+
 def audit_replay(replay, report):
     """Audit the diagnostic runner's actual event boundary, not graph factors."""
     if (report["schema"] != "openloc.native-map-diagnostic-report.v1" or
@@ -264,6 +314,7 @@ def audit_replay(replay, report):
                 "status": "not_run", "reason": "requires actual consumer subscription"},
         },
         "sources": sources, "events": ledger,
+        "scenario_correspondence": scenario_correspondence(ledger),
         "queue_residence_ns": distribution(queue_ns),
         "committed_corrections": revision,
         "scope": "Diagnostic source events; not a complete graph-factor ledger. "

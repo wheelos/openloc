@@ -16,6 +16,12 @@ namespace unified {
 
 using Matrix6x15d = Eigen::Matrix<double, 6, 15>;
 
+bool ValidLocalCovariance(const LocalState& state);
+Result AdvanceCovarianceSquareRoot(const LocalState& previous,
+                                   const Matrix15d& transition,
+                                   const Eigen::MatrixXd& additive_root,
+                                   LocalState* next);
+
 Eigen::Matrix3d RightRotationJacobian(const Eigen::Vector3d& rotation);
 Eigen::Matrix3d InverseRightRotationJacobian(const Eigen::Vector3d& rotation);
 

@@ -14,6 +14,7 @@
 
 #include "Eigen/Cholesky"
 #include "Eigen/Eigenvalues"
+#include "Eigen/QR"
 
 namespace openloc {
 namespace localization {
@@ -33,6 +34,63 @@ bool ValidEndpoint(const LocalState& state) {
 }
 
 }  // namespace
+
+bool ValidLocalCovariance(const LocalState& state) {
+  if (!state.covariance.allFinite() ||
+      !state.covariance.isApprox(state.covariance.transpose(), 1e-9))
+    return false;
+  if (!state.covariance_square_root)
+    return Eigen::LLT<Matrix15d>(state.covariance).info() == Eigen::Success;
+  const auto& root = *state.covariance_square_root;
+  if (!root.allFinite()) return false;
+  Matrix15d projected = root * root.transpose();
+  projected = (0.5 * (projected + projected.transpose())).eval();
+  if (!(projected.array() == state.covariance.array()).all()) return false;
+  Matrix15d normalized = root;
+  for (int row = 0; row < 15; ++row) {
+    const double scale = root.row(row).norm();
+    if (!std::isfinite(scale) || scale == 0) return false;
+    normalized.row(row) /= scale;
+  }
+  return Eigen::ColPivHouseholderQR<Matrix15d>(normalized).rank() == 15;
+}
+
+Result AdvanceCovarianceSquareRoot(const LocalState& previous,
+                                   const Matrix15d& transition,
+                                   const Eigen::MatrixXd& additive_root,
+                                   LocalState* next) {
+  if (!next || !transition.allFinite() || !additive_root.allFinite() ||
+      additive_root.rows() != 15 || !ValidLocalCovariance(previous))
+    return {Reason::INVALID_INPUT, "Invalid square-root covariance input"};
+  Matrix15d root;
+  if (previous.covariance_square_root) {
+    root = *previous.covariance_square_root;
+  } else {
+    root = Eigen::LLT<Matrix15d>(previous.covariance).matrixL();
+  }
+  root = (transition * root).eval();
+  if (!additive_root.isZero(0)) {
+    Eigen::MatrixXd joined(15, 15 + additive_root.cols());
+    joined.leftCols<15>() = root;
+    joined.rightCols(additive_root.cols()) = additive_root;
+    const Eigen::HouseholderQR<Eigen::MatrixXd> qr(joined.transpose());
+    root = qr.matrixQR()
+               .topRows<15>()
+               .template triangularView<Eigen::Upper>()
+               .transpose();
+  }
+  LocalState candidate = *next;
+  candidate.covariance_square_root = root;
+  candidate.covariance = root * root.transpose();
+  candidate.covariance =
+      (0.5 * (candidate.covariance + candidate.covariance.transpose())).eval();
+  if (!ValidLocalCovariance(candidate))
+    return {Reason::INVALID_INPUT,
+            "Square-root covariance lost finite resolved rank"};
+  next->covariance = candidate.covariance;
+  next->covariance_square_root = std::move(candidate.covariance_square_root);
+  return {};
+}
 
 Eigen::Matrix3d RightRotationJacobian(const Eigen::Vector3d& rotation) {
   const double squared = rotation.squaredNorm();

@@ -28,6 +28,49 @@ std::vector<SourceSampleId> Sources() {
   return {{"imu", 1}, {"imu", 2}};
 }
 
+TEST(LocalMotionTest, SquareRootRetainsRankAndRejectsStaleOrInvalidFactors) {
+  auto state = Endpoint(1, 1);
+  Matrix15d transition = Matrix15d::Identity();
+  transition(0, 3) = 0.3;
+  transition(3, 6) = -0.2;
+  transition(6, 9) = 0.1;
+  Eigen::Matrix<double, 15, 2> driving = Eigen::Matrix<double, 15, 2>::Zero();
+  driving(3, 0) = 0.02;
+  driving(6, 0) = -0.01;
+  driving(9, 1) = 0.004;
+  for (int step = 0; step < 20; ++step) {
+    const Matrix15d expected =
+        transition * state.covariance * transition.transpose() +
+        driving * driving.transpose();
+    auto next = state;
+    ASSERT_TRUE(
+        AdvanceCovarianceSquareRoot(state, transition, driving, &next).ok());
+    ASSERT_TRUE(next.covariance_square_root);
+    EXPECT_TRUE(next.covariance.isApprox(expected, 1e-13));
+    EXPECT_TRUE(ValidLocalCovariance(next));
+    state = next;
+  }
+  auto stale = state;
+  stale.covariance(0, 0) += 1;
+  EXPECT_FALSE(ValidLocalCovariance(stale));
+  auto singular = state;
+  singular.covariance_square_root->row(0).setZero();
+  singular.covariance = *singular.covariance_square_root *
+                        singular.covariance_square_root->transpose();
+  EXPECT_FALSE(ValidLocalCovariance(singular));
+  auto nonfinite = state;
+  (*nonfinite.covariance_square_root)(0, 0) =
+      std::numeric_limits<double>::quiet_NaN();
+  EXPECT_FALSE(ValidLocalCovariance(nonfinite));
+  auto output = Endpoint(4, 4);
+  const auto original = output.covariance;
+  EXPECT_EQ(
+      Reason::INVALID_INPUT,
+      AdvanceCovarianceSquareRoot(stale, transition, driving, &output).reason);
+  EXPECT_TRUE(output.covariance.isApprox(original, 0));
+  EXPECT_FALSE(output.covariance_square_root);
+}
+
 TEST(LocalMotionTest, SharedPoseUncertaintyCancelsInsteadOfAddingMarginals) {
   const auto start = Endpoint(1.0, 1);
   auto end = Endpoint(1.01, 2);

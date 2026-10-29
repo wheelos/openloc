@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Explicit diagnostic raw-native-LIO/map/SE(3)-CI replay; optional GNSS XY.
+"""Explicit diagnostic raw-native-LIO/map/SE(3) replay; optional GNSS XY.
 
 Run in the managed container after preparing raw inputs with prepare_native_lio.
 The map seed is an explicitly supplied first-scan map-from-IMU hypothesis, not
@@ -467,8 +467,33 @@ def horizontal_summary(records):
     }
 
 
+def diagnostic_mean_policy(replay):
+    path = replay / "global_mean_policy.csv"
+    mode = "covariance_intersection"
+    if path.exists():
+        policy = rows(path)
+        if policy != [{
+            "mode": "fixed_half_residual",
+            "covariance": "unknown_correlation_bound",
+            "trust_ceiling": "diagnostic",
+        }]:
+            raise ValueError("invalid diagnostic mean policy")
+        mode = policy[0]["mode"]
+    decisions = replay / "global_decisions.csv"
+    if decisions.exists():
+        for row in rows(decisions):
+            model = row.get("covariance_model", "")
+            if ((model.startswith("diagnostic_fixed_gain_") and
+                 mode != "fixed_half_residual") or
+                (model.startswith("diagnostic_ci_") and
+                 mode != "covariance_intersection")):
+                raise ValueError("diagnostic mean policy disagrees with innovations")
+    return mode
+
+
 def report(input_dir, replay, bundle, binary, output, gnss=None, arm="map",
            execution_runtime=None):
+    mean_policy = diagnostic_mean_policy(replay)
     manifest_path = input_dir / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
     for relative, expected in manifest["files"].items():
@@ -650,6 +675,7 @@ def report(input_dir, replay, bundle, binary, output, gnss=None, arm="map",
         "map_contract": contract,
         "gnss_contract": gnss_contract,
         "source_arm": arm,
+        "diagnostic_mean_update": mean_policy,
         "seed_application": rows(replay / "seed_application.csv") if bundle else [],
         "native_metrics": native_metrics,
         "metrics": metrics,
@@ -659,7 +685,7 @@ def report(input_dir, replay, bundle, binary, output, gnss=None, arm="map",
              "coverage and tilt prior; not qualified autonomous relocalization."
              if contract and contract.get("causal_search") else
              "Functional map-seeded diagnostic, not autonomous relocalization."),
-            "One SE(3) diagnostic CI owner, not the target fixed-lag graph.",
+            f"One SE(3) diagnostic owner ({mean_policy}), not the target fixed-lag graph.",
             ("Optional GNSS XY consumed with uncalibrated explicit sigma; "
              "no receiver accuracy or heading inferred." if gnss else
              "No GNSS stream consumed; this is not a three-source replay."),
@@ -712,7 +738,7 @@ def report(input_dir, replay, bundle, binary, output, gnss=None, arm="map",
                       f"{500 - (y-ymin)*480/span:.2f}" for x, y in positions)
     (output / "index.html").write_text(
         '<!doctype html><meta charset="utf-8"><h1>Native map diagnostic</h1>'
-        '<p>SE(3) diagnostic CI; target graph unavailable; '
+        f'<p>SE(3) diagnostic ({html.escape(mean_policy)}); target graph unavailable; '
         + ('GNSS XY present; ' if gnss else 'GNSS absent; ')
         + 'no trusted global output or independent accuracy.</p>'
         '<svg viewBox="0 0 540 540" width="540" height="540">'

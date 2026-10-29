@@ -41,6 +41,7 @@ struct GlobalConfig {
   // Explicit alternative for bounded replays with declared, uncalibrated
   // local covariance. Cannot enable the qualified graph or trusted output.
   bool diagnostic_only = false;
+  bool diagnostic_fixed_gain = false;
   bool enable_diagnostic_horizontal_bootstrap = false;
   bool enable_heading_bootstrap = false;
   bool motion_error_model_qualified = false;
@@ -140,9 +141,15 @@ bool ValidGlobalObservationGeometry(const GlobalObservation& observation);
 
 Matrix6d TransformCovarianceBound(const Eigen::Isometry3d& map_base,
                                   const LocalState& local,
-                                  const Matrix6d& observation_covariance);
+                                  const Matrix6d& observation_covariance,
+                                  Matrix6d* observation_bound = nullptr,
+                                  Matrix6d* local_bound = nullptr);
 Matrix6d GlobalPoseCovarianceBound(const GlobalState& global,
                                    const LocalState& local);
+Matrix6d FixedGainCovarianceBound(const Matrix6d& prior,
+                                  const Eigen::MatrixXd& observation,
+                                  const Eigen::MatrixXd& projection,
+                                  const Eigen::MatrixXd& gain);
 
 }  // namespace unified
 }  // namespace localization

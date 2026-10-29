@@ -17,7 +17,10 @@ from native_lio_report import runtime_identity
 from prepare_native_lio import digest
 
 
-MODELS = ("independent", "ar_modeled", "ar_unmodeled", "shared_modeled", "shared_unmodeled")
+MODELS = ("independent", "ar_modeled", "ar_unmodeled", "shared_modeled", "shared_unmodeled",
+          "independent_overconfident", "independent_conservative")
+COVARIANCE_SCALES = {"independent": 1.0, "independent_overconfident": .25,
+                     "independent_conservative": 4.0}
 
 
 def save(path, value):
@@ -130,6 +133,9 @@ def summarize(output, trials):
                     for p in (alpha / 2, 1 - alpha / 2)]
         mean = sum(values) / len(values)
         modeled = model in ("independent", "ar_modeled", "shared_modeled")
+        direction = ("upper_tail_overconfidence" if mean > interval[1] else
+                     "lower_tail_conservatism" if mean < interval[0] else
+                     "inside_reference_interval")
         covered = sum(lower <= value <= upper for value in values)
         summary[model] = {
             "trials": trials, "nees": distribution(values), "nees_mean": mean,
@@ -139,8 +145,20 @@ def summarize(output, trials):
                                  "not_observed_inconsistent" if interval[0] <= mean <= interval[1]
                                  else "inconsistency_observed"),
             "declared_correct_model": modeled,
+            "mean_test_direction": direction,
+            "mean_test_caveat": "lower-tail conservatism is not automatically a functional bug; "
+                                "this is a Gaussian covariance-equality study, not bound qualification",
             "interpretation": ("only under this specified synthetic model; reality not calibrated"
-                               if modeled else "deliberately misspecified temporal/source independence"),
+                               if modeled else "deliberately misspecified observation covariance"
+                               if model in COVARIANCE_SCALES else
+                               "deliberately misspecified temporal/source independence"),
+            "covariance_scale": COVARIANCE_SCALES.get(model, 1.0),
+            "synthetic_translation_error_m": distribution([
+                math.sqrt(sum(row[0] ** 2 for row in _matrix(r["pose_error"])[:3]))
+                for r in selected]),
+            "synthetic_rotation_error_rad": distribution([
+                math.sqrt(sum(row[0] ** 2 for row in _matrix(r["pose_error"])[3:]))
+                for r in selected]),
             "single_trial_95_percent_nees_interval": [lower, upper],
             "observed_coverage": covered / len(values),
             "coverage_wilson_95_percent_interval": wilson(covered, len(values)),
@@ -165,11 +183,106 @@ def summarize(output, trials):
     return summary
 
 
+def audit_covariance_pairs(output, trials):
+    with (output / "generated.csv").open() as stream:
+        generated = list(csv.DictReader(stream))
+    with (output / "trials.csv").open() as stream:
+        records = list(csv.DictReader(stream))
+    reference = {}
+    for row in generated:
+        if row["model"] != "independent":
+            continue
+        key = (row["trial"], row["node"], row["source"])
+        if key in reference:
+            raise ValueError("duplicate covariance-study reference measurement")
+        reference[key] = row
+    expected_nodes = {int(key[1]) for key in reference}
+    expected = {(str(trial), str(node), source) for trial in range(trials)
+                for node in range(len(expected_nodes))
+                for source in ("synthetic-map", "synthetic-gnss")}
+    if len(expected_nodes) < 4 or set(reference) != expected:
+        raise ValueError("incomplete covariance-study reference schedule")
+    for model, scale in COVARIANCE_SCALES.items():
+        selected = [r for r in generated if r["model"] == model]
+        if (len(selected) != len(reference) or
+                {(r["trial"], r["node"], r["source"]) for r in selected} != expected):
+            raise ValueError("incomplete covariance-study paired schedule")
+        for row in selected:
+            base = reference[(row["trial"], row["node"], row["source"])]
+            if row["measurement_error"] != base["measurement_error"]:
+                raise ValueError("covariance-study changed actual sampled error")
+            covariance, nominal = (_matrix(r["declared_covariance"]) for r in (row, base))
+            dimension = 2 if row["source"] == "synthetic-gnss" else 6
+            if (len(covariance) != dimension or len(nominal) != dimension or
+                    any(len(r) != dimension for r in covariance + nominal) or
+                    any(not math.isclose(covariance[i][j], scale * nominal[i][j],
+                                         rel_tol=1e-12, abs_tol=1e-15)
+                        for i in range(dimension) for j in range(dimension))):
+                raise ValueError("covariance-study declared scale mismatch")
+    by_trial = {(row["model"], int(row["trial"])): row for row in records}
+    paired = {}
+    for model in COVARIANCE_SCALES:
+        differences = []
+        for trial in range(trials):
+            base, row = by_trial.get(("independent", trial)), by_trial.get((model, trial))
+            if base is None or row is None:
+                raise ValueError("covariance-study cannot select away failed trials")
+            if base["seed"] != row["seed"]:
+                raise ValueError("covariance-study independent trials are not paired")
+            errors = [_matrix(value["pose_error"]) for value in (base, row)]
+            differences.append(sum(r[0] ** 2 for r in errors[1][:3]) -
+                               sum(r[0] ** 2 for r in errors[0][:3]))
+        paired[model] = distribution(differences)
+    return {
+        "status": "verified_same_sampled_errors_and_declared_scales",
+        "trials_per_scale": trials, "observation_covariance_scales": COVARIANCE_SCALES,
+        "paired_translation_squared_error_difference_m2": paired,
+        "scope": "fixed-admission synthetic backend study; not production robustness or field calibration",
+    }
+
+
+def audit_admission_schedule(output, nominal, trials, map_loss=None):
+    with nominal.open() as stream:
+        stamps = [int(row["timestamp_ns"]) for row in csv.DictReader(stream)]
+    with (output / "generated.csv").open() as stream:
+        generated = list(csv.DictReader(stream))
+    with (output / "decisions.csv").open() as stream:
+        decisions = list(csv.DictReader(stream))
+    expected, flags = set(), {}
+    for model in MODELS:
+        for trial in range(trials):
+            for node, stamp in enumerate(stamps):
+                elapsed = (stamp - stamps[0]) / 1e9
+                for source in ("synthetic-map", "synthetic-gnss"):
+                    submitted = source != "synthetic-map" or not map_loss or not (
+                        map_loss[0] <= elapsed < map_loss[1])
+                    key = (model, str(trial), str(node), source)
+                    flags[key] = str(int(submitted))
+                    if submitted and not (node == 0 and source == "synthetic-map"):
+                        expected.add(key)
+    observed_flags = {(r["model"], r["trial"], r["node"], r["source"]): r["submitted"]
+                      for r in generated}
+    actual = [(r["model"], r["trial"], r["node"], r["source"]) for r in decisions]
+    if len(generated) != len(flags) or observed_flags != flags:
+        raise ValueError("declared generated/admission schedule differs")
+    if map_loss and not any(value == "0" for value in flags.values()):
+        raise ValueError("declared map-loss schedule never triggered")
+    if len(actual) != len(expected) or set(actual) != expected:
+        raise ValueError("declared decision/admission schedule differs")
+    return {"status": "verified_declared_source_schedule", "decisions": len(actual),
+            "map_loss_seconds_half_open": map_loss,
+            "generated_but_not_submitted": sum(value == "0" for value in flags.values()),
+            "scope": "all sampled noise retained for pairing; omitted maps never reach the graph"}
+
+
 def run(args):
     if os.getuid() == 0:
         raise ValueError("run in the mapped-user managed container")
     if args.output.exists() or not 1 <= args.trials <= 10000:
         raise ValueError("output must be new and trials in 1..10000")
+    if args.map_loss and not (0 < args.map_loss[0] < args.map_loss[1] and
+                             all(math.isfinite(value) for value in args.map_loss)):
+        raise ValueError("map loss must follow the anchor and have positive duration")
     args.output.mkdir(parents=True)
     with args.odometry.open() as stream:
         odometry = [row for row in csv.DictReader(stream) if row["valid"] == "1"]
@@ -199,17 +312,22 @@ def run(args):
         "trials_per_model": args.trials, "seed_start": args.seed,
         "split": "development nominal sequence; frozen validation seeds, not tuned to pass",
         "models": list(MODELS),
+        "map_loss_seconds_half_open": args.map_loss,
         "generator": {
             "nominal": "real replay trajectory treated as fictional truth; not physical truth",
             "local_error": "correction error [p_odom,v_odom,right_att_body,bg,ba]; "
                            "p0 sigma .02m, attitude0 .002rad; independent random-walk "
                            "increments .005m/sqrt(s), .0005rad/sqrt(s)",
-            "observations": "full map and GNSS XY each node; independent noise sigma .02m, "
+            "observations": "map and GNSS XY sampled each node; maps in declared loss interval "
+                            "are journaled but not submitted; independent noise sigma .02m, "
                             "map rotation .002rad, no antenna lever",
             "ar": "stationary 3D sigma .04m, rho .85 per selected node; shared by both sources",
             "shared": "one 3D sigma .04m constant bias shared across time and map/GNSS",
             "modeled": "hidden 3D joint state, exact cross-covariance, conditional factors",
             "unmodeled": "same marginal variance but false source/temporal independence",
+            "covariance_misspecification": "independent sampled errors unchanged; "
+                                          "declared map/GNSS covariance multiplied by .25/1/4; "
+                                          "local error covariance unchanged",
         },
         "solver": {"lag_s": args.lag_seconds, "batch": "GaussNewton on all archived committed factors; "
                    "no timestamps/eviction in full covariance elimination",
@@ -231,6 +349,8 @@ def run(args):
     save(args.output / "protocol.json", manifest)
     command = [str(args.binary), str(nominal), str(args.output / "replay"),
                str(args.trials), str(args.seed), str(args.lag_seconds)]
+    if args.map_loss:
+        command.extend(str(value) for value in args.map_loss)
     save(args.output / "command.json", command)
     with (args.output / "execution.log").open("w") as log:
         subprocess.run(command, check=True, stdout=log, stderr=subprocess.STDOUT)
@@ -238,7 +358,11 @@ def run(args):
             digest(package / relative) != expected for relative, expected in source.items()):
         raise ValueError("source/runtime changed during evaluation")
     result = summarize(args.output / "replay", args.trials)
+    pairs = audit_covariance_pairs(args.output / "replay", args.trials)
+    schedule = audit_admission_schedule(args.output / "replay", nominal, args.trials, args.map_loss)
     save(args.output / "summary.json", result)
+    save(args.output / "covariance_pairs.json", pairs)
+    save(args.output / "admission_schedule.json", schedule)
     body = []
     for model, report in result.items():
         body.append(f"<h2>{model}</h2><pre>{html.escape(json.dumps(report, indent=2))}</pre>")
@@ -263,6 +387,8 @@ def main():
     parser.add_argument("--seed", type=int, default=270021)
     parser.add_argument("--nodes", type=int, default=12)
     parser.add_argument("--lag-seconds", type=float, default=5.0)
+    parser.add_argument("--map-loss", type=float, nargs=2, metavar=("BEGIN_S", "END_S"),
+                        help="omit only map submissions during this source-relative interval")
     run(parser.parse_args())
 
 

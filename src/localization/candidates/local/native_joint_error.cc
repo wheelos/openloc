@@ -158,8 +158,41 @@ Eigen::MatrixXd NativeJointError::Get(const std::string& key) const {
   return found == memory_.end() ? Eigen::MatrixXd() : found->second;
 }
 
+Result NativeJointError::CheckAdditionalCapacity(std::size_t rows,
+                                                 std::size_t drivers) const {
+  if (!active_) return status_;
+  std::size_t stored_rows = 0;
+  for (const auto& item : memory_) stored_rows += item.second.rows();
+  const std::size_t maximum = config_.native_joint_max_memory_rows;
+  const auto exceeds = [maximum](std::size_t stored, std::size_t added) {
+    return stored > maximum || added > maximum - stored;
+  };
+  std::size_t pinned_rows = 0;
+  for (const auto& fork : forks_)
+    if (!fork.second.expired()) {
+      if (exceeds(pinned_rows, drivers)) {
+        pinned_rows = maximum + 1;
+        break;
+      }
+      pinned_rows += drivers;
+    }
+  if (!exceeds(stored_rows, rows) &&
+      !exceeds(stored_rows + rows, pinned_rows) &&
+      !exceeds(static_cast<std::size_t>(dimension_), drivers))
+    return {};
+  std::ostringstream detail;
+  detail << "Native joint batch capacity exceeded before allocation; no "
+            "dependency dropped; stored_rows="
+         << stored_rows << "; additional_rows=" << rows
+         << "; driver_dimension=" << dimension_
+         << "; additional_drivers=" << drivers
+         << "; pinned_driver_rows=" << pinned_rows
+         << "; maximum_rows=" << maximum;
+  return {Reason::CORRELATION_UNQUALIFIED, detail.str()};
+}
+
 void NativeJointError::Set(const std::string& key,
-                          const Eigen::MatrixXd& loading) {
+                           const Eigen::MatrixXd& loading) {
   if (!active_) return;
   if (loading.cols() != dimension_ || loading.rows() == 0 ||
       !loading.allFinite()) {
@@ -171,8 +204,30 @@ void NativeJointError::Set(const std::string& key,
   for (const auto& item : memory_)
     if (item.first != key) rows += item.second.rows();
   if (rows > config_.native_joint_max_memory_rows) {
-    Fail({Reason::CORRELATION_UNQUALIFIED,
-          "Native joint physical-memory capacity exceeded; no dependency dropped"});
+    Eigen::Index stored_rows = 0;
+    std::map<std::string, std::pair<std::size_t, Eigen::Index>> groups;
+    for (const auto& item : memory_) {
+      stored_rows += item.second.rows();
+      auto& group = groups[item.first.substr(0, item.first.find(':'))];
+      ++group.first;
+      group.second += item.second.rows();
+    }
+    const auto previous = memory_.find(key);
+    std::ostringstream detail;
+    detail << "Native joint physical-memory capacity exceeded; no dependency "
+              "dropped"
+           << "; key=" << key << "; stored_rows=" << stored_rows
+           << "; incoming_rows=" << loading.rows() << "; replaced_rows="
+           << (previous == memory_.end() ? 0 : previous->second.rows())
+           << "; required_rows=" << rows
+           << "; maximum_rows=" << config_.native_joint_max_memory_rows
+           << "; driver_dimension=" << dimension_
+           << "; snapshots=" << history_.size()
+           << "; entries=" << memory_.size() << "; groups=";
+    for (const auto& group : groups)
+      detail << group.first << ':' << group.second.first << '/'
+             << group.second.second << ',';
+    Fail({Reason::CORRELATION_UNQUALIFIED, detail.str()});
     return;
   }
   memory_[key] = loading;
@@ -440,6 +495,7 @@ void NativeJointError::Publish(
   Compact();
   if (!active_) return;
   LocalState modeled = state;
+  modeled.covariance_square_root.reset();
   const Eigen::MatrixXd output = Get("output").topRows(15);
   modeled.covariance = output * output.transpose();
   modeled.covariance =

@@ -38,6 +38,9 @@ struct DiagnosticAlignmentConfig {
   // Allows a qualified-by-caller baseline azimuth plus XY/XYZ to acquire a
   // separate diagnostic horizontal result without motion or a full pose.
   bool enable_heading_bootstrap = false;
+  // Explicit conservative comparison: fixed mean gain instead of CI gain.
+  // Unqualified covariance bounds and the trust ceiling remain diagnostic.
+  bool use_fixed_gain_update = false;
 };
 
 struct DiagnosticHorizontalEstimate {

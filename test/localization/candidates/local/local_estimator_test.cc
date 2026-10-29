@@ -53,6 +53,11 @@ class LocalEstimatorTestAccess {
                             Matrix15d* transition) {
     return estimator->UpdateWheel(wheel, imu, state, transition);
   }
+  static Result UpdateZeroVelocity(LocalEstimator* estimator,
+                                   const ImuSample& imu, LocalState* state,
+                                   Matrix15d* transition) {
+    return estimator->UpdateZeroVelocity(imu, state, transition);
+  }
 };
 
 namespace {
@@ -1372,6 +1377,202 @@ TEST(LocalEstimatorPropagationTest,
       EXPECT_LT((numerical - loading.col(column)).cwiseAbs().maxCoeff(), 1e-8)
           << "raw endpoint=" << endpoint << " column=" << column;
     }
+  }
+}
+
+TEST(LocalEstimatorPropagationTest,
+     UnobservedGyroBiasHasCubicPositionErrorWithDeclaredNoise) {
+  auto config = TestConfig();
+  config.accel_noise = 0.1;
+  config.gyro_noise = 0.01;
+  config.accel_bias_noise = 0.001;
+  config.gyro_bias_noise = 0.0001;
+  LocalEstimator estimator(config);
+  LocalState state;
+  constexpr double position_variance = 1e-12;
+  constexpr double velocity_variance = 0.0025;
+  constexpr double attitude_variance = 0.0004;
+  constexpr double bias_variance = 1e-4;
+  constexpr double accel_bias_variance = 0.01;
+  constexpr double dt = 0.005;
+  const std::array<double, 5> variances{position_variance, velocity_variance,
+                                        attitude_variance, bias_variance,
+                                        accel_bias_variance};
+  for (int block = 0; block < 5; ++block) {
+    state.covariance.diagonal().segment<3>(3 * block).setConstant(
+        variances[block]);
+  }
+  auto start = MakeImu(1, 1);
+  Matrix15d transition = Matrix15d::Identity();
+  for (int step = 1; step <= 12000; ++step) {
+    const auto end = MakeImu(1 + step * dt, step + 1);
+    const auto result = LocalEstimatorTestAccess::Propagate(
+        estimator, start, end, &state, &transition);
+    ASSERT_TRUE(result.ok()) << "step=" << step << " " << result.message;
+    start = end;
+    if (step != 200 && step != 2000 && step != 12000) continue;
+    const double t = step * dt;
+    const double position_from_bias = config.gravity * t * t * t / 6;
+    const double expected =
+        bias_variance * position_from_bias * position_from_bias +
+        position_variance + velocity_variance * t * t +
+        attitude_variance * std::pow(config.gravity * t * t / 2, 2) +
+        accel_bias_variance * std::pow(t * t / 2, 2) +
+        std::pow(config.accel_noise, 2) * std::pow(t, 3) / 3 +
+        std::pow(config.gravity * config.gyro_noise, 2) * std::pow(t, 5) / 20 +
+        std::pow(config.accel_bias_noise, 2) * std::pow(t, 5) / 20 +
+        std::pow(config.gravity * config.gyro_bias_noise, 2) * std::pow(t, 7) /
+            252;
+    // Second-order per-step Phi omits the cubic term by relative dt^2/t^2.
+    EXPECT_NEAR(transition(0, 10), -position_from_bias,
+                position_from_bias * 2 * dt * dt / (t * t));
+    EXPECT_NEAR(state.covariance(0, 0), expected,
+                1e-10 + expected * 4 * dt * dt / (t * t));
+    EXPECT_TRUE(state.position.isZero());
+    EXPECT_TRUE(state.velocity.isZero());
+    EXPECT_TRUE(state.orientation.isApprox(Eigen::Quaterniond::Identity()));
+  }
+}
+
+TEST(LocalEstimatorPropagationTest,
+     ZeroProcessNoiseRetainsPositiveCovarianceOverLongPropagation) {
+  auto config = TestConfig();
+  config.accel_noise = 0;
+  config.gyro_noise = 0;
+  config.accel_bias_noise = 0;
+  config.gyro_bias_noise = 0;
+  LocalEstimator estimator(config);
+  for (const std::array<double, 5>& variances :
+       {std::array<double, 5>{1e-12, 1e-12, 1e-12, 1e-4, 1e-12},
+        std::array<double, 5>{1e-12, 0.0025, 0.0004, 1e-4, 0.01}}) {
+    LocalState state;
+    for (int block = 0; block < 5; ++block)
+      state.covariance.diagonal().segment<3>(3 * block).setConstant(
+          variances[block]);
+    const Matrix15d seed = state.covariance;
+    auto start = MakeImu(1, 1);
+    Matrix15d transition = Matrix15d::Identity();
+    constexpr double dt = 0.005;
+    for (int step = 1; step <= 12000; ++step) {
+      const auto end = MakeImu(1 + step * dt, step + 1);
+      const auto result = LocalEstimatorTestAccess::Propagate(
+          estimator, start, end, &state, &transition);
+      ASSERT_TRUE(result.ok()) << "velocity_variance=" << variances[1]
+                               << " step=" << step << " " << result.message;
+      start = end;
+      if (step != 200 && step != 2000 && step != 12000) continue;
+      const double t = step * dt;
+      Eigen::Matrix3d gravity_cross;
+      gravity_cross << 0, config.gravity, 0, -config.gravity, 0, 0, 0, 0, 0;
+      Matrix15d known = Matrix15d::Identity();
+      known.block<3, 3>(0, 3) = Eigen::Matrix3d::Identity() * t;
+      known.block<3, 3>(0, 6) = gravity_cross * (t * t / 2);
+      known.block<3, 3>(0, 9) =
+          -gravity_cross * ((t * t * t - t * dt * dt) / 6);
+      known.block<3, 3>(0, 12) = -Eigen::Matrix3d::Identity() * (t * t / 2);
+      known.block<3, 3>(3, 6) = gravity_cross * t;
+      known.block<3, 3>(3, 9) = -gravity_cross * (t * t / 2);
+      known.block<3, 3>(3, 12) = -Eigen::Matrix3d::Identity() * t;
+      known.block<3, 3>(6, 9) = -Eigen::Matrix3d::Identity() * t;
+      const Matrix15d expected = known * seed * known.transpose();
+      EXPECT_TRUE(state.covariance.isApprox(expected, 1e-10));
+      ASSERT_TRUE(state.covariance_square_root);
+      EXPECT_TRUE(state.covariance_square_root->col(0).isApprox(
+          Eigen::Matrix<double, 15, 1>::Unit(0) * std::sqrt(variances[0]), 0));
+      EXPECT_TRUE(state.position.isZero());
+      EXPECT_TRUE(state.velocity.isZero());
+      EXPECT_TRUE(state.orientation.isApprox(Eigen::Quaterniond::Identity()));
+    }
+  }
+}
+
+TEST(LocalEstimatorPropagationTest,
+     ZeroNoisePublicOwnerKeepsIntegrityWithoutInventingPrecision) {
+  auto config = TestConfig();
+  config.allow_imu_only_initialization = true;
+  config.accel_noise = 0;
+  config.gyro_noise = 0;
+  config.accel_bias_noise = 0;
+  config.gyro_bias_noise = 0;
+  LocalEstimator estimator(config);
+  for (uint64_t sequence = 1; sequence <= 12007; ++sequence) {
+    const auto sample = MakeImu(1 + 0.005 * (sequence - 1), sequence);
+    const auto result = estimator.AddImu(sample);
+    ASSERT_TRUE(result.ok() ||
+                result.reason == Reason::WAITING_FOR_STATIONARY ||
+                result.reason == Reason::WHEEL_STALE)
+        << sequence << " " << result.message;
+  }
+  ASSERT_TRUE(estimator.state().valid);
+  EXPECT_TRUE(estimator.EvaluateIntegrity(estimator.state().stamp.time).ok());
+  EXPECT_TRUE(estimator.state().covariance_square_root);
+  EXPECT_FALSE(estimator.state().uncertainty_qualified);
+  EXPECT_FALSE(estimator.Evaluate(estimator.state().stamp.time).ok());
+  EXPECT_TRUE(estimator.state().position.isZero());
+  EXPECT_TRUE(estimator.state().velocity.isZero());
+}
+
+TEST(LocalEstimatorPropagationTest,
+     FactorSurvivesWheelAndZeroVelocityCorrections) {
+  for (const bool zero_velocity : {false, true}) {
+    LocalEstimator dense(TestConfig()), factored(TestConfig());
+    LocalState before;
+    before.covariance.setIdentity();
+    before.velocity = Eigen::Vector3d(0.1, 0.02, 0.01);
+    auto expected = before;
+    auto actual = before;
+    actual.covariance_square_root = Matrix15d::Identity();
+    Matrix15d first = Matrix15d::Identity(), second = first;
+    const auto imu = MakeImu(1, 1);
+    if (zero_velocity) {
+      ASSERT_TRUE(LocalEstimatorTestAccess::UpdateZeroVelocity(
+                      &dense, imu, &expected, &first)
+                      .ok());
+      ASSERT_TRUE(LocalEstimatorTestAccess::UpdateZeroVelocity(&factored, imu,
+                                                               &actual, &second)
+                      .ok());
+    } else {
+      const auto wheel = MakeWheel(1, 1, 0.11);
+      ASSERT_TRUE(LocalEstimatorTestAccess::UpdateWheel(&dense, wheel, imu,
+                                                        &expected, &first)
+                      .ok());
+      ASSERT_TRUE(LocalEstimatorTestAccess::UpdateWheel(&factored, wheel, imu,
+                                                        &actual, &second)
+                      .ok());
+    }
+    ASSERT_TRUE(actual.covariance_square_root);
+    EXPECT_TRUE(ValidLocalCovariance(actual));
+    EXPECT_TRUE(actual.covariance.isApprox(expected.covariance, 1e-12));
+    EXPECT_TRUE(actual.velocity.isApprox(expected.velocity, 1e-12));
+    EXPECT_TRUE(actual.position.isZero());
+    EXPECT_TRUE(actual.orientation.isApprox(Eigen::Quaterniond::Identity()));
+  }
+}
+
+TEST(LocalEstimatorPropagationTest,
+     FactoredPropagationRetainsTheDeclaredNonzeroProcessNoise) {
+  LocalEstimator estimator(TestConfig());
+  LocalState dense, factored;
+  dense.covariance.setIdentity();
+  factored = dense;
+  factored.covariance_square_root = Matrix15d::Identity();
+  auto start = MakeImu(1, 1);
+  start.angular_velocity = Eigen::Vector3d(0.01, -0.02, 0.03);
+  for (int step = 1; step <= 100; ++step) {
+    auto end = MakeImu(1 + step * 0.005, step + 1);
+    end.angular_velocity = start.angular_velocity;
+    Matrix15d first = Matrix15d::Identity(), second = first;
+    ASSERT_TRUE(LocalEstimatorTestAccess::Propagate(estimator, start, end,
+                                                    &dense, &first)
+                    .ok());
+    ASSERT_TRUE(LocalEstimatorTestAccess::Propagate(estimator, start, end,
+                                                    &factored, &second)
+                    .ok());
+    ASSERT_TRUE(factored.covariance_square_root);
+    EXPECT_TRUE(factored.covariance.isApprox(dense.covariance, 1e-12));
+    EXPECT_TRUE(factored.position.isApprox(dense.position, 1e-12));
+    EXPECT_TRUE(factored.orientation.isApprox(dense.orientation, 1e-12));
+    start = end;
   }
 }
 

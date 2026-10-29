@@ -82,8 +82,14 @@ loc::GraphOdometrySample Odometry(int node) {
 }
 
 loc::Pose Truth(int node) {
-  auto pose = Odometry(node).odometry.pose;
-  pose.translation += Eigen::Vector3d(100, 20, 1);
+  loc::Pose pose;
+  const Eigen::Quaterniond map_from_odom(
+      Eigen::AngleAxisd(.4, Eigen::Vector3d::UnitZ()));
+  pose.translation =
+      Eigen::Vector3d(100, 20, 1) +
+      map_from_odom * Eigen::Vector3d(.5 * node, .1 * std::sin(.2 * node), 0);
+  pose.rotation = map_from_odom * Eigen::Quaterniond(Eigen::AngleAxisd(
+                                      .03 * node, Eigen::Vector3d::UnitZ()));
   return pose;
 }
 
@@ -164,8 +170,29 @@ loc::GlobalMapObservation Marker(int node, bool ambiguous) {
   return result;
 }
 
-void Run(const std::string& scenario, const std::filesystem::path& output) {
-  Require(std::filesystem::create_directory(output), "scenario output must be new");
+int LossEnd(const std::string& scenario) {
+  if (scenario == "joint_loss_short") return 9;
+  if (scenario == "joint_loss_equal") return 12;
+  if (scenario == "joint_loss_long") return 36;
+  return 18;
+}
+
+bool WindowLoss(const std::string& scenario) {
+  return scenario == "joint_loss_short" || scenario == "joint_loss_equal" ||
+         scenario == "joint_loss_long";
+}
+
+int MapLossEnd(const std::string& scenario) {
+  if (scenario == "map_loss_30s") return 66;
+  if (scenario == "map_loss_60s") return 126;
+  if (scenario == "map_loss_120s") return 246;
+  return 0;
+}
+
+void Run(const std::string& scenario, const std::filesystem::path& output,
+         const std::vector<std::vector<std::string>>& field_profile) {
+  Require(std::filesystem::create_directory(output),
+          "scenario output must be new");
   std::ofstream events(output / "decisions.csv"), states(output / "states.csv");
   events << std::setprecision(17)
          << "node,decision_id,source,measurement_ns,receive_ns,status,reason,expected,"
@@ -173,19 +200,29 @@ void Run(const std::string& scenario, const std::filesystem::path& output) {
             "residual,covariance,nis,gate\n";
   states << std::setprecision(17)
          << "node,timestamp_ns,pose_available,full_pose_fresh,odom_fresh,trust,"
-            "diagnostic_only,assessment,correction_id,x,y,z,truth_x,truth_y,truth_z,"
-            "error_m,alignment_covariance_trace,submitted,rejected,updates,retained,"
-            "input_unchanged,update_ms\n";
+            "diagnostic_only,assessment,correction_id,x,y,z,truth_x,truth_y,"
+            "truth_z,"
+            "error_m,alignment_covariance_trace,submitted,rejected,updates,"
+            "retained,"
+            "input_unchanged,update_ms,qx,qy,qz,qw,truth_qx,truth_qy,truth_qz,"
+            "truth_qw,rotation_error_rad,alignment_covariance,"
+            "absolute_update_translation_m,absolute_update_rotation_rad\n";
   loc::FixedLagGlobalAlignment owner;
   Require(owner.Configure(Config()));
   loc::GraphOdometrySample previous;
   uint64_t written = 0;
-  for (int node = 0; node < kNodes; ++node) {
+  const bool burst = scenario == "gnss_outlier_burst" ||
+                     scenario == "gnss_outlier_burst_omitted";
+  const int map_loss_end = MapLossEnd(scenario);
+  const int nodes = map_loss_end                             ? map_loss_end + 12
+                    : scenario == "joint_loss_long" || burst ? 48
+                                                             : kNodes;
+  for (int node = 0; node < nodes; ++node) {
     const auto started = std::chrono::steady_clock::now();
     auto sample = Odometry(node);
-    if (scenario == "joint_loss_local_drift_reentry") {
+    if (scenario == "joint_loss_local_drift_reentry" || WindowLoss(scenario)) {
       sample.odometry.pose.translation.x() +=
-          .02 * std::max(0, std::min(node - 5, 12));
+          .02 * std::max(0, std::min(node - 5, LossEnd(scenario) - 6));
     }
     const auto original = sample.odometry.pose;
     loc::GraphMotionConnection connection;
@@ -200,6 +237,8 @@ void Run(const std::string& scenario, const std::filesystem::path& output) {
                             {"imu", sample.sequence}};
     }
     Require(owner.AddOdometry(sample, node ? &connection : nullptr));
+    loc::FixedLagAlignmentResult before_observations;
+    Require(owner.GetResult(sample.receive_time, &before_observations));
     const auto record = [&](const loc::Status& status, const std::string& expected) {
       std::vector<loc::GraphObservationDecision> decisions;
       Require(owner.GetDecisions(&decisions));
@@ -252,15 +291,25 @@ void Run(const std::string& scenario, const std::filesystem::path& output) {
       marker = node % 3 == 0;
     }
     if (scenario == "gnss_only_after_anchor" && node >= 6) full_map = false;
+    if (map_loss_end && node >= 6 && node < map_loss_end) full_map = false;
+    if (scenario == "field_sparse_map_gnss") {
+      full_map = field_profile[node][1] == "1";
+      gnss = field_profile[node][2] == "1";
+    }
     if (scenario == "outdoor_indoor_outdoor") {
       marker = node >= 6 && node < 12;
       if (node >= 6 && node < 12) gnss = false;
       if (node >= 12 && node < 18) { full_map = false; projected = true; }
     }
     if ((scenario == "joint_loss_reentry" ||
-         scenario == "joint_loss_local_drift_reentry") &&
-        node >= 6 && node < 18) {
+         scenario == "joint_loss_local_drift_reentry" ||
+         WindowLoss(scenario)) &&
+        node >= 6 && node < LossEnd(scenario)) {
       full_map = false; gnss = false;
+    }
+    if (burst && node >= 6 && node < 36) {
+      bad_gnss = scenario == "gnss_outlier_burst";
+      gnss = bad_gnss;
     }
     if (scenario == "fault_rejection") {
       bad_gnss = node == 10;
@@ -312,7 +361,8 @@ void Run(const std::string& scenario, const std::filesystem::path& output) {
       updates += source.alignment_updates;
       retained += source.retained;
     }
-    const auto truth = Truth(node).translation;
+    const auto true_pose = Truth(node);
+    const auto& truth = true_pose.translation;
     const double error = result.estimate ?
         (result.estimate->map_from_base.translation - truth).norm() : 0;
     states << node << ',' << result.timestamp.nanoseconds << ',' << result.estimate.has_value()
@@ -328,10 +378,40 @@ void Run(const std::string& scenario, const std::filesystem::path& output) {
     if (result.estimate) states << error;
     states << ',';
     if (result.estimate) states << result.estimate->alignment_covariance.trace();
-    states << ',' << result.submitted_observations << ',' << result.rejected_observations
-           << ',' << updates << ',' << retained << ',' << unchanged << ','
+    states << ',' << result.submitted_observations << ','
+           << result.rejected_observations << ',' << updates << ',' << retained
+           << ',' << unchanged << ','
            << std::chrono::duration<double, std::milli>(
-                  std::chrono::steady_clock::now() - started).count() << '\n';
+                  std::chrono::steady_clock::now() - started)
+                  .count()
+           << ',';
+    if (result.estimate) {
+      const auto& rotation = result.estimate->map_from_base.rotation;
+      states << rotation.x() << ',' << rotation.y() << ',' << rotation.z()
+             << ',' << rotation.w();
+    } else {
+      states << ",,,";
+    }
+    const auto& true_rotation = true_pose.rotation;
+    states << ',' << true_rotation.x() << ',' << true_rotation.y() << ','
+           << true_rotation.z() << ',' << true_rotation.w() << ',';
+    if (result.estimate)
+      states << Eigen::AngleAxisd(true_rotation.conjugate() *
+                                  result.estimate->map_from_base.rotation)
+                    .angle();
+    states << ',';
+    if (result.estimate) Matrix(states, result.estimate->alignment_covariance);
+    states << ',';
+    if (result.estimate && before_observations.estimate) {
+      const auto& before = before_observations.estimate->map_from_base;
+      const auto& after = result.estimate->map_from_base;
+      states << (after.translation - before.translation).norm() << ','
+             << Eigen::AngleAxisd(before.rotation.conjugate() * after.rotation)
+                    .angle();
+    } else {
+      states << ',';
+    }
+    states << '\n';
     states.flush();
     previous = sample;
   }
@@ -341,17 +421,47 @@ void Run(const std::string& scenario, const std::filesystem::path& output) {
 
 int main(int argc, char** argv) {
   try {
-    if (argc != 2) throw std::runtime_error("usage: localization_scenarios NEW_OUTPUT");
+    if (argc != 2 && argc != 3)
+      throw std::runtime_error(
+          "usage: localization_scenarios NEW_OUTPUT [FIELD_PROFILE]");
+    const auto field_profile = csv::ReadRows(
+        argc == 3 ? argv[2]
+                  : "test/integration/map/testdata/field_sparse_map_gnss.csv",
+        "node,map_available,gnss_available", 3);
+    Require(field_profile.size() == kNodes, "field profile requires 24 nodes");
+    for (int node = 0; node < kNodes; ++node) {
+      const auto& row = field_profile[node];
+      Require(row[0] == std::to_string(node) &&
+                  (row[1] == "0" || row[1] == "1") &&
+                  (row[2] == "0" || row[2] == "1"),
+              "invalid field availability profile");
+    }
     const std::filesystem::path output(argv[1]);
     Require(std::filesystem::create_directory(output), "output must be new");
-    for (const auto* scenario : {
-             "indoor_map_no_gnss", "indoor_marker_no_map_gnss",
-             "outdoor_gnss_map", "map_degenerate_gnss_available",
-             "gnss_degraded_map_available", "indoor_corridor_marker",
-             "joint_degradation_marker", "gnss_only_after_anchor", "outdoor_indoor_outdoor",
-             "joint_loss_reentry", "joint_loss_local_drift_reentry", "fault_rejection",
-             "gnss_only_cold_start", "delayed_map"}) {
-      Run(scenario, output / scenario);
+    for (const auto* scenario : {"indoor_map_no_gnss",
+                                 "indoor_marker_no_map_gnss",
+                                 "outdoor_gnss_map",
+                                 "map_degenerate_gnss_available",
+                                 "gnss_degraded_map_available",
+                                 "indoor_corridor_marker",
+                                 "joint_degradation_marker",
+                                 "gnss_only_after_anchor",
+                                 "outdoor_indoor_outdoor",
+                                 "joint_loss_reentry",
+                                 "joint_loss_local_drift_reentry",
+                                 "fault_rejection",
+                                 "gnss_only_cold_start",
+                                 "delayed_map",
+                                 "field_sparse_map_gnss",
+                                 "joint_loss_short",
+                                 "joint_loss_equal",
+                                 "joint_loss_long",
+                                 "gnss_outlier_burst",
+                                 "gnss_outlier_burst_omitted",
+                                 "map_loss_30s",
+                                 "map_loss_60s",
+                                 "map_loss_120s"}) {
+      Run(scenario, output / scenario, field_profile);
       std::cout << scenario << " completed\n";
     }
     return 0;

@@ -51,7 +51,9 @@ u::GlobalObservation Observation(const u::LocalState& local,
   result.pose = truth;
   result.covariance = u::Matrix6d::Identity() * 0.0004;
   result.covariance.bottomRightCorner<3, 3>() *= 0.01;
-  const bool correlated = model != "independent";
+  const bool correlated = model == "ar_modeled" || model == "ar_unmodeled" ||
+                          model == "shared_modeled" ||
+                          model == "shared_unmodeled";
   const bool modeled = model == "ar_modeled" || model == "shared_modeled";
   if (correlated) {
     result.pose.translation() += error.tail<3>();
@@ -78,21 +80,35 @@ u::GlobalObservation Observation(const u::LocalState& local,
         .setIdentity();
     result.local_error_cross_covariance *= 0.0016;
   }
+  if (model == "independent_overconfident") result.covariance *= .25;
+  if (model == "independent_conservative") result.covariance *= 4;
   return result;
 }
 
-void Run(const std::filesystem::path& input, const std::filesystem::path& output,
-         uint64_t trials, uint64_t seed, double lag_seconds) {
+void Run(const std::filesystem::path& input,
+         const std::filesystem::path& output, uint64_t trials, uint64_t seed,
+         double lag_seconds, double map_loss_begin = 0,
+         double map_loss_end = 0) {
   const auto nominal = csv::ReadRows(
       input.string(), "timestamp_ns,px,py,pz,qx,qy,qz,qw", 8);
   if (nominal.size() < 4 || nominal.size() > 64 || trials == 0 || trials > 10000)
     throw std::runtime_error("evaluation requires 4..64 nodes and 1..10000 trials");
+  if (!std::isfinite(map_loss_begin) || !std::isfinite(map_loss_end) ||
+      map_loss_begin < 0 || map_loss_end < 0 ||
+      ((map_loss_begin != 0 || map_loss_end != 0) &&
+       (map_loss_begin <= 0 || map_loss_end <= map_loss_begin)))
+    throw std::runtime_error(
+        "map loss must follow the anchor and have positive duration");
   if (!std::filesystem::create_directory(output))
     throw std::runtime_error("output must be new");
   std::ofstream results(output / "trials.csv");
   std::ofstream decisions(output / "decisions.csv");
   std::ofstream factors(output / "factors.csv");
   std::ofstream failures(output / "failures.csv");
+  std::ofstream generated(output / "generated.csv");
+  generated << std::setprecision(17)
+            << "model,trial,node,source,measurement_error,declared_covariance,"
+               "submitted\n";
   results << std::setprecision(17)
           << "model,trial,seed,cutoff_ns,nodes,retained_nodes,archived_factors,"
              "accepted,rejected,nees,pose_error,covariance,"
@@ -108,8 +124,10 @@ void Run(const std::filesystem::path& input, const std::filesystem::path& output
           << "model,trial,cutoff_ns,scope,factor_index,type,keys,residual,error,"
              "weight,weight_time\n";
   failures << "model,trial,seed,node,stage,reason\n";
-  for (const std::string model : {"independent", "ar_modeled", "ar_unmodeled",
-                                   "shared_modeled", "shared_unmodeled"}) {
+  for (const std::string model :
+       {"independent", "ar_modeled", "ar_unmodeled", "shared_modeled",
+        "shared_unmodeled", "independent_overconfident",
+        "independent_conservative"}) {
     for (uint64_t trial = 0; trial < trials; ++trial) {
       std::size_t active_node = 0;
       std::string stage = "initialization";
@@ -141,6 +159,9 @@ void Run(const std::filesystem::path& input, const std::filesystem::path& output
         const auto& row = nominal[node];
         const int64_t stamp = csv::Time(row[0]);
         const double elapsed = (stamp - csv::Time(nominal.front()[0])) * 1e-9;
+        const bool map_available =
+            !(map_loss_end > 0 && elapsed >= map_loss_begin &&
+              elapsed < map_loss_end);
         if (node) {
           const double dt = (stamp - csv::Time(nominal[node - 1][0])) * 1e-9;
           if (dt <= 0) throw std::runtime_error("non-increasing nominal timestamps");
@@ -181,11 +202,31 @@ void Run(const std::filesystem::path& input, const std::filesystem::path& output
           joint.output_jacobian = Eigen::MatrixXd::Zero(15, 18);
           joint.output_jacobian.leftCols<15>().setIdentity();
         }
+        const auto observation = [&](bool horizontal) {
+          auto value =
+              Observation(local, truth, error, model, horizontal, &random);
+          Eigen::Matrix<double, 6, 1> noise;
+          noise.head<3>() = value.pose.translation() - truth.translation();
+          noise.tail<3>() = u::LogRotation(Eigen::Quaterniond(
+              value.pose.linear() * truth.linear().transpose()));
+          generated << model << ',' << trial << ',' << node << ','
+                    << value.source << ',';
+          if (horizontal)
+            Matrix(generated, noise.head<2>());
+          else
+            Matrix(generated, noise);
+          generated << ',';
+          if (horizontal)
+            Matrix(generated, value.covariance.topLeftCorner<2, 2>());
+          else
+            Matrix(generated, value.covariance);
+          generated << ',' << (horizontal || map_available) << '\n';
+          return value;
+        };
         u::Result status;
         if (!node) {
           stage = "anchor";
-          status = graph.Initialize(local, Observation(
-              local, truth, error, model, false, &random));
+          status = graph.Initialize(local, observation(false));
           Require(status);
           ++accepted;
         } else {
@@ -203,14 +244,15 @@ void Run(const std::filesystem::path& input, const std::filesystem::path& output
         }
         for (const bool horizontal : {false, true}) {
           if (!node && !horizontal) continue;
-          const auto observation = Observation(local, truth, error, model, horizontal, &random);
+          const auto measured = observation(horizontal);
+          if (!horizontal && !map_available) continue;
           stage = horizontal ? "gnss" : "map";
           openloc::localization::ObservationInnovation innovation;
-          status = graph.Observe(observation, &innovation);
+          status = graph.Observe(measured, &innovation);
           accepted += status.ok();
           rejected += !status.ok();
           decisions << model << ',' << trial << ',' << node << ','
-                    << observation.source << ',' << stamp << ',' << stamp << ','
+                    << measured.source << ',' << stamp << ',' << stamp << ','
                     << static_cast<int>(status.reason) << ',';
           csv::Text(decisions, status.message);
           decisions << ',' << innovation.available << ',';
@@ -280,16 +322,20 @@ void Run(const std::filesystem::path& input, const std::filesystem::path& output
       }
     }
   }
-  if (!results || !decisions || !factors || !failures)
+  if (!results || !decisions || !factors || !failures || !generated)
     throw std::runtime_error("incomplete evaluation output");
 }
 }  // namespace
 
 int main(int argc, char** argv) {
   try {
-    if (argc != 6)
-      throw std::runtime_error("usage: fixed_lag_evaluation NOMINAL NEW_OUTPUT TRIALS SEED LAG_S");
-    Run(argv[1], argv[2], csv::Time(argv[3]), csv::Time(argv[4]), csv::Number(argv[5]));
+    if (argc != 6 && argc != 8)
+      throw std::runtime_error(
+          "usage: fixed_lag_evaluation NOMINAL NEW_OUTPUT TRIALS SEED LAG_S "
+          "[MAP_LOSS_BEGIN_S MAP_LOSS_END_S]");
+    Run(argv[1], argv[2], csv::Time(argv[3]), csv::Time(argv[4]),
+        csv::Number(argv[5]), argc == 8 ? csv::Number(argv[6]) : 0,
+        argc == 8 ? csv::Number(argv[7]) : 0);
     return 0;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

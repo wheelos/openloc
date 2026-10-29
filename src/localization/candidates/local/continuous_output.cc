@@ -203,12 +203,27 @@ Result ContinuousOutput::Advance(const LocalState& previous_internal,
       scale * nominal.rotation_correction.cwiseProduct(nominal.rotation_correction);
   next.covariance =
       (0.5 * (next.covariance + next.covariance.transpose())).eval();
+  if (state_.covariance_square_root || process_noise.isZero(0)) {
+    Eigen::Matrix<double, 15, 30> additive_root;
+    additive_root.leftCols<15>() =
+        noise_spectrum.eigenvectors() * eigenvalues.cwiseSqrt().asDiagonal();
+    additive_root.rightCols<15>().setZero();
+    additive_root.block<3, 3>(0, 15) =
+        std::sqrt(scale) * nominal.translation_correction.asDiagonal();
+    additive_root.block<3, 3>(3, 18) =
+        std::sqrt(scale) * nominal.velocity_correction.asDiagonal();
+    additive_root.block<3, 3>(6, 21) =
+        std::sqrt(scale) * nominal.rotation_correction.asDiagonal();
+    const auto modeled = AdvanceCovarianceSquareRoot(state_, error_transition,
+                                                     additive_root, &next);
+    if (!modeled.ok()) return modeled;
+  }
   if (!next.position.allFinite() ||
       !next.velocity.allFinite() || !next.orientation.coeffs().allFinite()) {
     return {Reason::INVALID_INPUT,
             "Continuous output update is nonfinite"};
   }
-  if (Eigen::LLT<Matrix15d>(next.covariance).info() != Eigen::Success) {
+  if (!ValidLocalCovariance(next)) {
     return {Reason::INVALID_INPUT,
             "Continuous output covariance is not SPD"};
   }

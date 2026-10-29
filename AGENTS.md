@@ -20,7 +20,9 @@
 
 - Start with factor availability, observed directions and failure/recovery
   scenarios; derive a test matrix before tuning. Keep algorithms, diagnostics
-  and offline evaluation separate.
+  and offline evaluation separate. Judge remaining information by observable
+  directions, not by the number of failed factors; distinguish local-motion
+  failure from loss of absolute references.
 - Synthetic evidence covers only the declared models, injected faults and
   tested parameter values/ranges, not all environments or real sensor accuracy.
   Report uncovered combinations and never-triggered conditions explicitly.
@@ -29,7 +31,9 @@
   Distinguish matched, partial, missing and contradictory evidence.
 - A field mismatch is not automatically bad data. Separate data defects,
   violated/model-unsupported assumptions, implementation defects and unresolved
-  causes; attribute only with causal evidence.
+  causes; attribute only with causal evidence. Compare the same backend,
+  configuration and admission boundary before calling field and synthetic
+  results contradictory. Missing scene evidence is uncovered, not failed.
 - Losing two or all absolute factors can normally reduce global accuracy or
   availability. Accept degradation when it follows the declared contract:
   no invented information/trust, valid local ODOM remains isolated/continuous,

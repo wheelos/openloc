@@ -7,6 +7,8 @@
 
 #include "gtest/gtest.h"
 
+#include "candidates/local/local_motion.h"
+
 namespace openloc {
 namespace localization {
 namespace unified {
@@ -68,6 +70,39 @@ TEST(ContinuousOutputTest, AnalyticNoiseAvoidsCancellationOfLargeMarginals) {
   EXPECT_DOUBLE_EQ(1.005, analytic.state().stamp.time);
 }
 
+TEST(ContinuousOutputTest, ZeroNoiseKeepsFactorThroughContinuousPublication) {
+  auto previous = State(1, 0);
+  previous.covariance *= 1e-4;
+  previous.covariance.diagonal().head<3>().setConstant(1e-12);
+  ContinuousOutput output(LinearizationConfig());
+  output.Reset(previous);
+  constexpr double dt = 0.005;
+  Matrix15d dynamics = Matrix15d::Zero();
+  dynamics.block<3, 3>(0, 3).setIdentity();
+  dynamics(3, 7) = 10;
+  dynamics(4, 6) = -10;
+  dynamics.block<3, 3>(3, 12) = -Eigen::Matrix3d::Identity();
+  dynamics.block<3, 3>(6, 9) = -Eigen::Matrix3d::Identity();
+  const Matrix15d transition = Matrix15d::Identity() + dynamics * dt +
+                               dynamics * dynamics * (dt * dt / 2);
+  const Matrix15d zero = Matrix15d::Zero();
+  for (int step = 1; step <= 12000; ++step) {
+    auto current = previous;
+    current.stamp = {1 + dt * step, 1 + dt * step,
+                     static_cast<uint64_t>(step + 1), "clock"};
+    ASSERT_TRUE(
+        AdvanceCovarianceSquareRoot(previous, transition, zero, &current).ok());
+    ASSERT_TRUE(output.Advance(previous, current, transition, dt, &zero).ok())
+        << step;
+    previous = current;
+  }
+  ASSERT_TRUE(output.state().covariance_square_root);
+  EXPECT_TRUE(ValidLocalCovariance(output.state()));
+  EXPECT_TRUE(output.state().covariance.isApprox(previous.covariance, 1e-12));
+  EXPECT_TRUE(output.state().position.isZero());
+  EXPECT_TRUE(output.state().velocity.isZero());
+}
+
 TEST(ContinuousOutputTest, JointErrorMapRetainsEndpointAndCorrectionMemory) {
   auto config = LinearizationConfig();
   ContinuousOutput output(config);
@@ -113,6 +148,28 @@ TEST(ContinuousOutputTest, JointErrorMapRetainsEndpointAndCorrectionMemory) {
   EXPECT_NEAR(common[15], 0, 1e-8);
   EXPECT_TRUE(output.state().position.isApprox(nominal.position, 0));
   EXPECT_TRUE(output.state().covariance.isApprox(nominal.covariance, 0));
+}
+
+TEST(ContinuousOutputTest, CovarianceSeparatesPropagationNoiseAndCorrection) {
+  const auto config = LinearizationConfig();
+  ContinuousOutput output(config);
+  output.Reset(State(1, 0));
+  auto previous = State(1, 0.1);
+  auto current = State(1.1, 0.1);
+  previous.orientation = current.orientation =
+      ExpRotation(Eigen::Vector3d(0, 0, 0.02));
+  Matrix15d transition = Matrix15d::Identity();
+  transition.block<3, 3>(0, 3).diagonal().setConstant(0.1);
+  const Matrix15d noise = Matrix15d::Identity() * 0.002;
+  ASSERT_TRUE(output.Advance(previous, current, transition, 0.1, &noise).ok());
+  const auto& covariance = output.state().covariance;
+  // The actual correction is 0.05 m, 0.5 m/s and 0.02 rad.
+  EXPECT_NEAR(covariance(0, 0), 1.01 + 0.002 + 2 * 0.05 * 0.05, 1e-12);
+  EXPECT_NEAR(covariance(3, 3), 1 + 0.002 + 2 * 0.5 * 0.5, 1e-12);
+  EXPECT_NEAR(covariance(8, 8), 1 + 0.002 + 2 * 0.02 * 0.02, 1e-12);
+  EXPECT_NEAR(covariance(0, 3), 0.1, 1e-12);
+  EXPECT_NEAR(covariance(1, 1), 1.01 + 0.002, 1e-12);
+  EXPECT_NEAR(covariance(6, 6), 1 + 0.002, 1e-12);
 }
 
 TEST(ContinuousOutputTest, LimitedMemoryUsesTheActualLimiterDerivative) {

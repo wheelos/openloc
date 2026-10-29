@@ -455,6 +455,7 @@ cc_binary(
         "test/integration/localization_scenarios.cc",
         "test/integration/map/replay_csv.h",
     ],
+    data = ["test/integration/map/testdata/field_sparse_map_gnss.csv"],
     deps = [
         ":fixed_lag_global_alignment",
         ":marker_observation",

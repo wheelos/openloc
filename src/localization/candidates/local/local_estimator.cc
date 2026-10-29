@@ -101,8 +101,7 @@ bool FiniteState(const LocalState& state) {
       !state.covariance.isApprox(state.covariance.transpose(), 1e-9)) {
     return false;
   }
-  Eigen::LLT<Matrix15d> factor(state.covariance);
-  return factor.info() == Eigen::Success;
+  return ValidLocalCovariance(state);
 }
 
 Matrix15d DiscretizeProcessNoise(const Matrix15d& continuous_noise, double dt,
@@ -736,6 +735,23 @@ Result LocalEstimator::Propagate(const ImuSample& start, const ImuSample& end,
       transition * state->covariance * transition.transpose() + discrete_noise;
   next.covariance =
       (0.5 * (next.covariance + next.covariance.transpose())).eval();
+  if (state->covariance_square_root || discrete_noise.isZero(0)) {
+    Matrix15d continuous_root = Matrix15d::Zero();
+    continuous_root.block<3, 3>(3, 3) = body_to_local * config_.accel_noise;
+    continuous_root.block<3, 3>(6, 6).diagonal().setConstant(
+        config_.gyro_noise);
+    continuous_root.block<3, 3>(9, 9).diagonal().setConstant(
+        config_.gyro_bias_noise);
+    continuous_root.block<3, 3>(12, 12).diagonal().setConstant(
+        config_.accel_bias_noise);
+    Eigen::Matrix<double, 15, 45> additive_root;
+    additive_root << continuous_root, 2 * half_transition * continuous_root,
+        transition * continuous_root;
+    additive_root *= std::sqrt(dt / 6);
+    const auto modeled =
+        AdvanceCovarianceSquareRoot(*state, transition, additive_root, &next);
+    if (!modeled.ok()) return modeled;
+  }
   if (!FiniteState(next)) {
     return {Reason::INVALID_INPUT, "IMU propagation is not finite SPD"};
   }
@@ -890,6 +906,13 @@ Result LocalEstimator::UpdateWheel(const WheelSample& sample,
                     gain * measurement_noise * gain.transpose();
   next.covariance =
       (0.5 * (next.covariance + next.covariance.transpose())).eval();
+  if (state->covariance_square_root) {
+    const auto modeled = AdvanceCovarianceSquareRoot(
+        *state, residual,
+        gain * measurement_noise.llt().matrixL().toDenseMatrix(), &next);
+    if (!modeled.ok())
+      return Reject(modeled.reason, modeled.message, &wheel_health_);
+  }
   if (!FiniteState(next)) {
     return Reject(Reason::INVALID_INPUT, "Wheel update is not finite SPD",
                   &wheel_health_);
@@ -999,6 +1022,13 @@ Result LocalEstimator::UpdateZeroVelocity(const ImuSample& imu,
                     gain * measurement_noise * gain.transpose();
   next.covariance =
       (0.5 * (next.covariance + next.covariance.transpose())).eval();
+  if (state->covariance_square_root) {
+    const auto modeled = AdvanceCovarianceSquareRoot(
+        *state, residual,
+        gain * measurement_noise.llt().matrixL().toDenseMatrix(), &next);
+    if (!modeled.ok())
+      return Reject(modeled.reason, modeled.message, &zupt_health_);
+  }
   if (!FiniteState(next)) {
     return Reject(Reason::INVALID_INPUT,
                   "Zero-velocity update is not finite SPD", &zupt_health_);
@@ -1253,6 +1283,7 @@ Result LocalEstimator::LookupInternal(
       (1.0 - alpha) * lower.angular_velocity + alpha * endpoint.angular_velocity;
   interpolated.covariance =
       (1.0 - alpha) * lower.covariance + alpha * endpoint.covariance;
+  interpolated.covariance_square_root.reset();
   interpolated.covariance_model_valid =
       lower.covariance_model_valid && endpoint.covariance_model_valid;
   if (error_map) {

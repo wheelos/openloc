@@ -6,8 +6,10 @@
 
 #include "candidates/global/global_alignment.h"
 
-#include "Eigen/Cholesky"
 #include "gtest/gtest.h"
+
+#include "Eigen/Cholesky"
+#include "Eigen/Eigenvalues"
 
 namespace openloc {
 namespace localization {
@@ -20,6 +22,50 @@ GlobalConfig Policy() {
   config.map_version = "v1";
   config.calibration_id = "calibration";
   return config;
+}
+
+TEST(GlobalAlignmentTest, FixedGainBoundRetainsArbitrarySharedCorrelation) {
+  Matrix6d prior_root = Matrix6d::Identity();
+  prior_root(0, 5) = 990;
+  prior_root(0, 0) = 100;
+  Eigen::Matrix<double, 2, 6> h = Eigen::Matrix<double, 2, 6>::Zero();
+  h.leftCols<2>().setIdentity();
+  h(0, 5) = -3;
+  const Eigen::Matrix<double, 2, 2> rotation =
+      Eigen::Rotation2Dd(0.7).toRotationMatrix();
+  Eigen::Matrix<double, 6, 2> gain = Eigen::Matrix<double, 6, 2>::Zero();
+  gain.topRows<2>() = 0.5 * rotation;
+  const Matrix6d retained = Matrix6d::Identity() - gain * h;
+  for (const double sign : {-1.0, 0.0, 1.0}) {
+    Eigen::Matrix<double, 2, 6> observed_root = sign * h * prior_root;
+    observed_root(0, 2) += 2;
+    observed_root(1, 3) -= 3;
+    const Matrix6d bound = FixedGainCovarianceBound(
+        prior_root * prior_root.transpose(),
+        observed_root * observed_root.transpose(), h, gain);
+    const Eigen::Matrix<double, 6, 6> actual_root =
+        retained * prior_root + gain * observed_root;
+    const Matrix6d difference = bound - actual_root * actual_root.transpose();
+    const Eigen::Matrix<double, 6, 6> gap_root =
+        retained * prior_root - gain * observed_root;
+    EXPECT_TRUE(difference.isApprox(gap_root * gap_root.transpose(), 1e-12));
+    Eigen::SelfAdjointEigenSolver<Matrix6d> spectrum(difference);
+    ASSERT_EQ(Eigen::Success, spectrum.info());
+    EXPECT_GE(spectrum.eigenvalues().minCoeff(),
+              -1e-12 * difference.cwiseAbs().maxCoeff());
+  }
+}
+
+TEST(GlobalAlignmentTest, FixedGainCannotEnableQualifiedOrGraphOwner) {
+  auto config = Policy();
+  config.diagnostic_fixed_gain = true;
+  EXPECT_EQ(Reason::CONFIG_INVALID,
+            GlobalAlignment(config).ValidateConfig().reason);
+  config.diagnostic_only = true;
+  EXPECT_TRUE(GlobalAlignment(config).ValidateConfig().ok());
+  config.enable_fixed_lag_graph = true;
+  EXPECT_EQ(Reason::CONFIG_INVALID,
+            GlobalAlignment(config).ValidateConfig().reason);
 }
 
 LocalState Local(double time, uint64_t sequence) {
@@ -59,6 +105,45 @@ void Initialize(GlobalAlignment* alignment) {
     } else {
       EXPECT_TRUE(result.ok()) << result.message;
     }
+  }
+}
+
+TEST(GlobalAlignmentTest, FixedGainHeadingAndProjectionStayInObservedSubspace) {
+  for (const auto kind : {GlobalObservation::Kind::HEADING,
+                          GlobalObservation::Kind::PROJECTED_POSE}) {
+    auto config = Policy();
+    config.diagnostic_only = true;
+    config.diagnostic_fixed_gain = true;
+    GlobalAlignment alignment(config);
+    Initialize(&alignment);
+    auto local = Local(10.04, 4);
+    local.position.setZero();
+    ASSERT_TRUE(alignment.AddLocal(local).ok());
+    const auto before = alignment.state();
+    auto observation = Observation(local);
+    observation.kind = kind;
+    observation.source = "partial";
+    observation.direction_in_base = Eigen::Vector3d::UnitX();
+    observation.heading_rad = 0.02;
+    observation.heading_variance = 0.01;
+    observation.pose.linear() =
+        ExpRotation(Eigen::Vector3d(0, 0, 0.02)).toRotationMatrix();
+    observation.projection = Eigen::Matrix<double, 1, 6>::Zero();
+    observation.projection(0, 5) = 1;
+    observation.projected_covariance =
+        Eigen::Matrix<double, 1, 1>::Constant(0.01);
+    ObservationInnovation innovation;
+    const auto result = alignment.Observe(observation, &innovation);
+    ASSERT_TRUE(result.ok()) << result.message;
+    EXPECT_TRUE(alignment.state().map_to_odom.translation().isApprox(
+        before.map_to_odom.translation(), 1e-12));
+    EXPECT_NEAR(
+        0.01,
+        LogRotation(Eigen::Quaterniond(alignment.state().map_to_odom.linear()))
+            .z(),
+        1e-12);
+    EXPECT_EQ(before.last_full_observation,
+              alignment.state().last_full_observation);
   }
 }
 
@@ -503,6 +588,28 @@ TEST(GlobalAlignmentTest, CorrelationBoundsDoNotClaimIndependentPrecision) {
       TransformCovarianceBound(Pose(local), local, Matrix6d::Identity() * 0.01);
   EXPECT_GE(covariance(0, 0), 2.0 * (0.01 + 0.0001));
   EXPECT_TRUE(ValidCovariance(covariance));
+}
+
+TEST(GlobalAlignmentTest, AlignmentBoundRetainsLeverArmVarianceAndCorrelation) {
+  for (const double distance : {0.0, 10.0, 100.0, 1000.0}) {
+    SCOPED_TRACE(distance);
+    auto local = Local(10.0, 1);
+    local.position = Eigen::Vector3d(distance, 0, 0);
+    const Matrix6d observation = Matrix6d::Identity() * 0.001;
+    Matrix6d observation_bound, local_bound;
+    const auto bound = TransformCovarianceBound(
+        Pose(local), local, observation, &observation_bound, &local_bound);
+    EXPECT_TRUE(bound.isApprox(observation_bound + local_bound, 1e-12));
+    EXPECT_TRUE(observation_bound.isApprox(10 * local_bound, 1e-12));
+    const double variance = 2 * (0.001 + 0.0001);
+    EXPECT_NEAR(variance, bound(0, 0), 1e-10);
+    EXPECT_NEAR(variance * (1 + distance * distance), bound(1, 1), 1e-8);
+    EXPECT_NEAR(variance * (1 + distance * distance), bound(2, 2), 1e-8);
+    EXPECT_NEAR(-variance * distance, bound(1, 5), 1e-10);
+    EXPECT_NEAR(variance * distance, bound(2, 4), 1e-10);
+    EXPECT_NEAR(variance, bound(5, 5), 1e-10);
+    EXPECT_TRUE(ValidCovariance(bound));
+  }
 }
 
 TEST(GlobalAlignmentTest, UnanchoredPositionIsEvidenceNotFullAlignment) {

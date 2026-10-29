@@ -9,6 +9,7 @@ import unittest
 
 from evaluate_native_fusion import (
     GNSS_SOURCE, MAP_SOURCE, audit_replay, compare_replays, main, render,
+    scenario_correspondence,
 )
 from prepare_native_lio import digest
 
@@ -87,6 +88,32 @@ class ReplayEvaluationTest(unittest.TestCase):
         self.assertEqual("not_run", result["checks"]["default_consumer_rejection"]["status"])
         self.assertIsNone(result["events"][0]["robust_weight"])
         self.assertIn("no-ground-truth", render(result))
+        correspondence = result["scenario_correspondence"]
+        self.assertEqual("partial", correspondence["cases"]["S12"])
+        self.assertEqual("not_observed_in_this_arm", correspondence["cases"]["S03"])
+        self.assertEqual(0, correspondence["evidence"]["gnss_commits"])
+
+    def test_field_mapping_requires_actual_commits_and_quality_not_stability_wait(self):
+        events = [
+            {"source": MAP_SOURCE, "outcome": "committed", "reason": "",
+             "measurement_ns": stamp}
+            for stamp in (1, 4_000_000_001)
+        ] + [
+            {"source": GNSS_SOURCE, "outcome": "committed", "reason": "",
+             "measurement_ns": 2_000_000_001},
+            {"source": GNSS_SOURCE, "outcome": "gate_not_accepted",
+             "reason": "fixed_solution_not_stable", "measurement_ns": 2},
+        ]
+        result = scenario_correspondence(events)
+        self.assertEqual("partial", result["cases"]["S03"])
+        self.assertEqual("partial", result["cases"]["S15"])
+        self.assertEqual("not_observed_in_this_arm", result["cases"]["S05"])
+        events[-1]["reason"] = "carrier_solution_not_fixed"
+        self.assertEqual("partial", scenario_correspondence(events)["cases"]["S05"])
+        events[2]["outcome"] = "retained_without_correction"
+        result = scenario_correspondence(events)
+        self.assertEqual("not_observed_in_this_arm", result["cases"]["S15"])
+        self.assertEqual("not_observed_in_this_arm", result["cases"]["S03"])
 
     def test_original_event_identity_not_sequence_alone(self):
         self.gnss[1].update(sequence="1")

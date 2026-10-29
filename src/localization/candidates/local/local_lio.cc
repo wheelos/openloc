@@ -443,9 +443,15 @@ Result LocalLio::ApplyUpdate(const LioUpdate& update, const LocalState& prior,
                                 total.cwiseProduct(total);
   next.covariance =
       (0.5 * (next.covariance + next.covariance.transpose())).eval();
+  if (prior.covariance_square_root) {
+    const auto modeled = AdvanceCovarianceSquareRoot(
+        prior, Matrix15d::Identity(),
+        std::sqrt(config_.lidar_correction_variance_scale) * total.asDiagonal(),
+        &next);
+    if (!modeled.ok()) return modeled;
+  }
   if (!next.position.allFinite() || !next.velocity.allFinite() ||
-      !next.orientation.coeffs().allFinite() ||
-      Eigen::LLT<Matrix15d>(next.covariance).info() != Eigen::Success) {
+      !next.orientation.coeffs().allFinite() || !ValidLocalCovariance(next)) {
     return {Reason::INVALID_INPUT, "LiDAR update is not finite SPD"};
   }
   if (tracking_posterior) {

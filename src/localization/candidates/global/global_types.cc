@@ -69,7 +69,9 @@ bool ValidGlobalObservationGeometry(const GlobalObservation& observation) {
 
 Matrix6d TransformCovarianceBound(const Eigen::Isometry3d& map_base,
                                   const LocalState& local,
-                                  const Matrix6d& observation_covariance) {
+                                  const Matrix6d& observation_covariance,
+                                  Matrix6d* observation_bound,
+                                  Matrix6d* local_bound) {
   const Eigen::Matrix3d rotation =
       map_base.linear() * local.orientation.toRotationMatrix().transpose();
   Matrix6d observation_jacobian = Matrix6d::Identity();
@@ -79,6 +81,12 @@ Matrix6d TransformCovarianceBound(const Eigen::Isometry3d& map_base,
   local_jacobian.topRightCorner<3, 3>() =
       -rotation * Skew(local.position) * local.orientation.toRotationMatrix();
   local_jacobian.bottomRightCorner<3, 3>() = -map_base.linear();
+  if (observation_bound)
+    *observation_bound = 2.0 * observation_jacobian * observation_covariance *
+                         observation_jacobian.transpose();
+  if (local_bound)
+    *local_bound = 2.0 * local_jacobian * PoseCovariance(local) *
+                   local_jacobian.transpose();
   // 2(Pa + Pb) bounds unknown cross-correlation; independence is not assumed.
   return 2.0 *
          (observation_jacobian * observation_covariance *
@@ -99,6 +107,17 @@ Matrix6d GlobalPoseCovarianceBound(const GlobalState& global,
          (alignment_jacobian * global.covariance *
               alignment_jacobian.transpose() +
           local_jacobian * PoseCovariance(local) * local_jacobian.transpose());
+}
+
+Matrix6d FixedGainCovarianceBound(const Matrix6d& prior,
+                                  const Eigen::MatrixXd& observation,
+                                  const Eigen::MatrixXd& projection,
+                                  const Eigen::MatrixXd& gain) {
+  const Matrix6d retained = Matrix6d::Identity() - gain * projection;
+  // For arbitrary shared errors, Cov(a+b) <= 2 Cov(a) + 2 Cov(b).
+  const Matrix6d bound = 2 * (retained * prior * retained.transpose() +
+                              gain * observation * gain.transpose());
+  return (0.5 * (bound + bound.transpose())).eval();
 }
 
 }  // namespace unified

@@ -90,6 +90,7 @@ class DiagnosticGlobalAlignment::Impl {
     policy.local_timeout = Seconds(config.maximum_odometry_age_ns);
     policy.global_timeout = Seconds(config.maximum_full_pose_age_ns);
     policy.diagnostic_only = true;
+    policy.diagnostic_fixed_gain = config.use_fixed_gain_update;
     policy.enable_diagnostic_horizontal_bootstrap =
         config.enable_horizontal_bootstrap;
     policy.enable_heading_bootstrap = config.enable_heading_bootstrap;

@@ -1068,6 +1068,43 @@ TEST(FixedLagAlignmentTest, FullPoseFreshnessDoesNotFollowPartialUpdates) {
   EXPECT_FALSE(result.assessment.ok());
 }
 
+TEST(FixedLagAlignmentTest, FullPoseLeaseUsesExactIntegerNanoseconds) {
+  for (const int64_t shift : {2'480'000'000LL, 1'790'000'000'000'000'000LL}) {
+    auto config = Config();
+    config.allow_uncalibrated_inputs = true;
+    config.retain_graph_on_full_pose_staleness = true;
+    FixedLagGlobalAlignment owner;
+    ASSERT_TRUE(owner.Configure(config).ok());
+    for (int node = 0; node < 3; ++node) {
+      auto local = Odom(node);
+      local.odometry.timestamp.nanoseconds += shift;
+      local.receive_time = local.odometry.timestamp;
+      auto motion = Connection(node);
+      motion.start_time.nanoseconds += shift;
+      motion.end_time.nanoseconds += shift;
+      ASSERT_TRUE(owner.AddOdometry(local, node ? &motion : nullptr).ok());
+      auto map = Map(node);
+      map.context.measurement_time.nanoseconds += shift;
+      map.context.receive_time = map.context.measurement_time;
+      const auto status = owner.SubmitMapObservation(map, Qualification());
+      if (node == 2) {
+        ASSERT_TRUE(status.ok()) << status.message();
+      }
+    }
+    for (const int64_t offset : {-1LL, 0LL, 1LL}) {
+      const Timestamp evaluation{Odom(2).odometry.timestamp.nanoseconds +
+                                     shift + config.maximum_full_pose_age_ns +
+                                     offset,
+                                 config.clock_domain};
+      FixedLagAlignmentResult result;
+      ASSERT_TRUE(owner.GetResult(evaluation, &result).ok());
+      ASSERT_TRUE(result.estimate);
+      EXPECT_EQ(offset <= 0, result.full_pose_evidence_fresh)
+          << "shift=" << shift << " offset=" << offset;
+    }
+  }
+}
+
 TEST(FixedLagAlignmentTest, RetainedPartialGraphNeverRenewsFullPoseTrust) {
   for (const bool retain : {false, true}) {
     auto config = Config();
@@ -1122,6 +1159,163 @@ TEST(FixedLagAlignmentTest, RetainedPartialGraphNeverRenewsFullPoseTrust) {
       ASSERT_TRUE(owner.GetResult(Odom(12).odometry.timestamp, &result).ok());
       EXPECT_FALSE(result.estimate);
     }
+  }
+}
+
+TEST(FixedLagAlignmentTest, LongHorizontalOnlyBoundTracksDeclaredLocalNoise) {
+  for (const int seconds : {30, 60, 120}) {
+    SCOPED_TRACE(seconds);
+    auto config = Config();
+    config.retain_graph_on_full_pose_staleness = true;
+    FixedLagGlobalAlignment owner;
+    ASSERT_TRUE(owner.Configure(config).ok());
+    const auto sample_at = [](int index) {
+      auto sample = Odom(index);
+      sample.odometry.timestamp.nanoseconds = kStart + index * 1'000'000'000LL;
+      sample.receive_time = sample.odometry.timestamp;
+      sample.odometry.pose.translation.setZero();
+      return sample;
+    };
+    FixedLagAlignmentResult result;
+    Eigen::Matrix<double, 6, 6> anchor_covariance;
+    for (int index = 0; index <= seconds + 3; ++index) {
+      const auto sample = sample_at(index);
+      auto motion = Connection(index);
+      if (index) {
+        motion.start_time = sample_at(index - 1).odometry.timestamp;
+        motion.end_time = sample.odometry.timestamp;
+      }
+      ASSERT_TRUE(owner.AddOdometry(sample, index ? &motion : nullptr).ok());
+      if (index < 3 || index == seconds + 3) {
+        auto map = Map(index);
+        map.context.measurement_time = sample.odometry.timestamp;
+        map.context.receive_time = sample.receive_time;
+        map.map_from_base.translation = {100, 20, 0};
+        const auto status = owner.SubmitMapObservation(map, Qualification());
+        if (index < 2) {
+          EXPECT_EQ(StatusCode::kRejectedMeasurement, status.code());
+          continue;
+        }
+        ASSERT_TRUE(status.ok()) << status.message();
+      } else {
+        GlobalHorizontalObservation fix;
+        fix.context = Context(index, "gnss");
+        fix.context.measurement_time = sample.odometry.timestamp;
+        fix.context.receive_time = sample.receive_time;
+        fix.position = {100, 20};
+        fix.covariance = Eigen::Matrix2d::Identity() * .01;
+        fix.covariance_source = "synthetic-independent-xy";
+        const auto status =
+            owner.SubmitHorizontalObservation(fix, Qualification());
+        ASSERT_TRUE(status.ok())
+            << "index=" << index << " " << status.message();
+      }
+      ASSERT_TRUE(owner.GetResult(sample.receive_time, &result).ok());
+      ASSERT_TRUE(result.estimate);
+      const auto& covariance = result.estimate->alignment_covariance;
+      ASSERT_EQ(Eigen::Success, covariance.llt().info());
+      EXPECT_NEAR(0,
+                  (result.estimate->map_from_base.translation -
+                   Eigen::Vector3d(100, 20, 0))
+                      .norm(),
+                  1e-8);
+      EXPECT_TRUE(sample.odometry.pose.translation.isZero());
+      if (index == 2) {
+        anchor_covariance = covariance;
+      } else if (index <= seconds + 2) {
+        // XY observes none of z/rotation here. The exposed alignment bound is
+        // 2(P_pose + P_local), with .001/node in each term, not an exact
+        // marginal.
+        const Eigen::Matrix4d expected =
+            anchor_covariance.bottomRightCorner<4, 4>() +
+            Eigen::Matrix4d::Identity() * (.004 * (index - 2));
+        EXPECT_TRUE(
+            (covariance.bottomRightCorner<4, 4>().isApprox(expected, 1e-8)));
+        EXPECT_EQ(index <= 4, result.full_pose_evidence_fresh);
+        if (index > 4) {
+          EXPECT_EQ(LocalizationTrustLevel::kUntrusted, result.trust_level);
+        }
+      } else {
+        EXPECT_TRUE(result.full_pose_evidence_fresh);
+      }
+    }
+    std::vector<GraphObservationDecision> decisions;
+    ASSERT_TRUE(owner.GetDecisions(&decisions).ok());
+    EXPECT_EQ(static_cast<std::size_t>(seconds + 4), decisions.size());
+    EXPECT_TRUE(decisions.back().observation.alignment_updated);
+  }
+}
+
+TEST(FixedLagAlignmentTest,
+     AcceptedHorizontalBiasDoesNotPreventFullPoseReturn) {
+  auto config = Config();
+  config.retain_graph_on_full_pose_staleness = true;
+  FixedLagGlobalAlignment owner;
+  ASSERT_TRUE(owner.Configure(config).ok());
+  FixedLagAlignmentResult result;
+  double biased_error = 0;
+  double first_return_error = 0;
+  for (int index = 0; index <= 128; ++index) {
+    auto sample = Odom(index);
+    sample.odometry.timestamp.nanoseconds = kStart + index * 1'000'000'000LL;
+    sample.receive_time = sample.odometry.timestamp;
+    auto motion = Connection(index);
+    motion.start_time.nanoseconds =
+        sample.odometry.timestamp.nanoseconds - 1'000'000'000LL;
+    motion.end_time = sample.odometry.timestamp;
+    const auto original = sample.odometry.pose.translation;
+    ASSERT_TRUE(owner.AddOdometry(sample, index ? &motion : nullptr).ok());
+    auto map = Map(index);
+    map.context.measurement_time = sample.odometry.timestamp;
+    map.context.receive_time = sample.receive_time;
+    Status status;
+    if (index < 3 || index >= 123) {
+      status = owner.SubmitMapObservation(map, Qualification());
+    } else {
+      GlobalHorizontalObservation fix;
+      fix.context = map.context;
+      fix.context.source = "biased-gnss";
+      fix.position =
+          map.map_from_base.translation.head<2>() + Eigen::Vector2d(.1, 0);
+      fix.covariance = Eigen::Matrix2d::Identity() * .01;
+      fix.covariance_source = "synthetic-xy-with-undeclared-bias";
+      status = owner.SubmitHorizontalObservation(fix, Qualification());
+    }
+    if (index < 2) {
+      EXPECT_EQ(StatusCode::kRejectedMeasurement, status.code());
+      continue;
+    }
+    ASSERT_TRUE(status.ok()) << index << " " << status.message();
+    ASSERT_TRUE(owner.GetResult(sample.receive_time, &result).ok());
+    ASSERT_TRUE(result.estimate);
+    const double error = (result.estimate->map_from_base.translation -
+                          map.map_from_base.translation)
+                             .norm();
+    EXPECT_TRUE(sample.odometry.pose.translation == original);
+    ASSERT_EQ(Eigen::Success,
+              result.estimate->alignment_covariance.llt().info());
+    if (index >= 3 && index < 123) {
+      EXPECT_LE(error, .1 + 1e-8);
+      EXPECT_EQ(index <= 4, result.full_pose_evidence_fresh);
+      biased_error = error;
+    } else if (index >= 123) {
+      EXPECT_TRUE(result.full_pose_evidence_fresh);
+      EXPECT_LT(error, biased_error);
+      if (index == 123) first_return_error = error;
+      if (index == 128) {
+        EXPECT_LT(error, first_return_error);
+      }
+    }
+  }
+  EXPECT_GT(biased_error, .05);
+  std::vector<GraphObservationDecision> decisions;
+  ASSERT_TRUE(owner.GetDecisions(&decisions).ok());
+  for (const auto& decision : decisions) {
+    if (decision.observation.context.source != "biased-gnss") continue;
+    EXPECT_TRUE(decision.observation.alignment_updated);
+    EXPECT_TRUE(decision.observation.innovation.available);
+    EXPECT_LT(decision.observation.innovation.nis,
+              decision.observation.innovation.gate_threshold);
   }
 }
 

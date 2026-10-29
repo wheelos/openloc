@@ -60,15 +60,16 @@ class NativeMapDiagnostic {
                       bool level_odom_gnss_bootstrap = false,
                       NativeGlobalOdometryFault odometry_fault = {},
                       std::pair<int64_t, int64_t> map_holdout = {},
-                      bool profile_map_timing = false)
+                      bool profile_map_timing = false,
+                      bool fixed_gain_update = false)
       : matches_(output / "map.csv"),
         global_(output / "global.csv"),
         decisions_(output / "global_decisions.csv"),
-      odometry_fault_(std::move(odometry_fault)),
-      admission_(output / "global_admission.csv"),
-      holdback_ns_(holdback_ns),
-      async_recovery_(async_recovery),
-      map_holdout_(map_holdout) {
+        odometry_fault_(std::move(odometry_fault)),
+        admission_(output / "global_admission.csv"),
+        holdback_ns_(holdback_ns),
+        async_recovery_(async_recovery),
+        map_holdout_(map_holdout) {
     namespace loc = localization;
     if (level_odom_gnss_bootstrap && gnss_bundle.empty())
       throw std::runtime_error("horizontal bootstrap requires GNSS input");
@@ -150,6 +151,7 @@ class NativeMapDiagnostic {
     config_.base_frame = {row[6]};
     config_.enable_horizontal_bootstrap = level_odom_gnss_bootstrap;
     config_.assume_gravity_aligned_odom = level_odom_gnss_bootstrap;
+    config_.use_fixed_gain_update = fixed_gain_update;
     Require(owner_.Configure(config_));
     if (level_odom_gnss_bootstrap) {
       horizontal_.open(output / "horizontal.csv");

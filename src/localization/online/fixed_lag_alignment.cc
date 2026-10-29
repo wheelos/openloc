@@ -211,6 +211,7 @@ class FixedLagGlobalAlignment::Impl {
         retained->stamp.sequence == local.stamp.sequence) {
       if (!latest_ || latest_->epoch != odometry.epoch) {
         exact_times_.clear();
+        last_full_pose_time_.reset();
       }
       latest_ = odometry;
       exact_times_[local.stamp.time] = odometry.timestamp.nanoseconds;
@@ -244,6 +245,11 @@ class FixedLagGlobalAlignment::Impl {
       innovation.unavailable_reason = status.message();
     }
     const bool updated = status.ok() && owner_->state().correction_id != before;
+    if (updated && observation.kind == u::GlobalObservation::Kind::POSE &&
+        owner_->state().last_full_observation == observation.stamp.time) {
+      last_full_pose_time_ = std::make_pair(
+          observation.stamp.time, context.measurement_time.nanoseconds);
+    }
     GlobalObservationDecision decision{
         context,      status,
         ++submitted_, owner_->state().correction_id,
@@ -409,10 +415,11 @@ class FixedLagGlobalAlignment::Impl {
         evaluation_time.nanoseconds - latest_->timestamp.nanoseconds <=
         config_.maximum_odometry_age_ns;
     output.full_pose_evidence_fresh =
-        state.last_full_observation > 0.0 &&
-        Seconds(evaluation_time.nanoseconds) >= state.last_full_observation &&
-        Seconds(evaluation_time.nanoseconds) - state.last_full_observation <=
-            Seconds(config_.maximum_full_pose_age_ns);
+        last_full_pose_time_ &&
+        state.last_full_observation == last_full_pose_time_->first &&
+        evaluation_time.nanoseconds >= last_full_pose_time_->second &&
+        evaluation_time.nanoseconds - last_full_pose_time_->second <=
+            config_.maximum_full_pose_age_ns;
     output.last_full_pose_time_seconds = state.last_full_observation;
     output.decisions_dropped = submitted_ - decisions_.size();
     output.submitted_observations = submitted_;
@@ -480,6 +487,7 @@ class FixedLagGlobalAlignment::Impl {
   FixedLagAlignmentConfig config_;
   std::unique_ptr<u::GlobalAlignment> owner_;
   std::optional<OdometrySample> latest_;
+  std::optional<std::pair<double, int64_t>> last_full_pose_time_;
   std::map<double, int64_t> exact_times_;
   std::deque<GraphObservationDecision> decisions_;
   std::map<std::string, GraphSourceStatistics> sources_;

@@ -31,6 +31,7 @@ class NativeJointError {
                           const Eigen::Matrix<double, 21, 21>& covariance);
   void RejectInitialization(const Result& result);
   Eigen::MatrixXd Get(const std::string& key) const;
+  Result CheckAdditionalCapacity(std::size_t rows, std::size_t drivers) const;
   void Set(const std::string& key, const Eigen::MatrixXd& loading);
   void Drop(const std::string& key);
   void Retain(const std::vector<std::string>& keys);

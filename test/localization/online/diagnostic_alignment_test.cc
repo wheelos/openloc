@@ -151,22 +151,27 @@ TEST(DiagnosticAlignmentTest, InitializesFromMapEvidenceNotAnOraclePrior) {
 }
 
 TEST(DiagnosticAlignmentTest, PositionEvidenceDoesNotInventAnAlignment) {
-  DiagnosticGlobalAlignment owner;
-  ASSERT_TRUE(owner.Configure(Config()).ok());
-  ASSERT_TRUE(owner.AddOdometry(Odom(0), Matrix6d::Identity()).ok());
-  GlobalHorizontalObservation fix;
-  fix.context = Context(0, "gnss");
-  fix.position = Eigen::Vector2d(100.0, 20.0);
-  fix.covariance = Eigen::Matrix2d::Identity();
-  fix.covariance_source = "assumed-position-noise";
-  ASSERT_TRUE(owner.SubmitHorizontalObservation(fix).ok());
-  DiagnosticAlignmentResult result;
-  ASSERT_TRUE(owner.GetResult(&result).ok());
-  EXPECT_FALSE(result.estimate.has_value());
-  ASSERT_EQ(1u, result.decisions.size());
-  EXPECT_TRUE(result.decisions.back().status.ok());
-  EXPECT_FALSE(result.decisions.back().alignment_updated);
-  EXPECT_EQ(0u, result.decisions.back().correction_id);
+  for (const bool fixed_gain : {false, true}) {
+    SCOPED_TRACE(fixed_gain);
+    DiagnosticGlobalAlignment owner;
+    auto config = Config();
+    config.use_fixed_gain_update = fixed_gain;
+    ASSERT_TRUE(owner.Configure(config).ok());
+    ASSERT_TRUE(owner.AddOdometry(Odom(0), Matrix6d::Identity()).ok());
+    GlobalHorizontalObservation fix;
+    fix.context = Context(0, "gnss");
+    fix.position = Eigen::Vector2d(100.0, 20.0);
+    fix.covariance = Eigen::Matrix2d::Identity();
+    fix.covariance_source = "assumed-position-noise";
+    ASSERT_TRUE(owner.SubmitHorizontalObservation(fix).ok());
+    DiagnosticAlignmentResult result;
+    ASSERT_TRUE(owner.GetResult(&result).ok());
+    EXPECT_FALSE(result.estimate.has_value());
+    ASSERT_EQ(1u, result.decisions.size());
+    EXPECT_TRUE(result.decisions.back().status.ok());
+    EXPECT_FALSE(result.decisions.back().alignment_updated);
+    EXPECT_EQ(0u, result.decisions.back().correction_id);
+  }
 }
 
 GlobalHorizontalObservation HorizontalFix(int index, const OdometrySample& odom) {
@@ -488,82 +493,277 @@ TEST(DiagnosticAlignmentTest, ContradictionAndAmbiguityDoNotBypassRecovery) {
 }
 
 TEST(DiagnosticAlignmentTest, PartialEvidenceAndOutagesDoNotRenewFullPoseAge) {
-  DiagnosticGlobalAlignment owner;
-  const auto config = Config();
-  ASSERT_TRUE(owner.Configure(config).ok());
-  Bootstrap(&owner);
-  ASSERT_TRUE(owner.AddOdometry(Odom(3), Matrix6d::Identity() * 0.01).ok());
-  GlobalHorizontalObservation fix;
-  fix.context = Context(3, "gnss");
-  fix.position = Eigen::Vector2d(103.0, 20.0);
-  fix.covariance = Eigen::Matrix2d::Identity() * 0.1;
-  fix.covariance_source = "synthetic-diagnostic";
-  ASSERT_TRUE(owner.SubmitHorizontalObservation(fix).ok());
+  for (const bool fixed_gain : {false, true}) {
+    SCOPED_TRACE(fixed_gain);
+    DiagnosticGlobalAlignment owner;
+    auto config = Config();
+    config.use_fixed_gain_update = fixed_gain;
+    ASSERT_TRUE(owner.Configure(config).ok());
+    Bootstrap(&owner);
+    ASSERT_TRUE(owner.AddOdometry(Odom(3), Matrix6d::Identity() * 0.01).ok());
+    GlobalHorizontalObservation fix;
+    fix.context = Context(3, "gnss");
+    fix.position = Eigen::Vector2d(103.0, 20.0);
+    fix.covariance = Eigen::Matrix2d::Identity() * 0.1;
+    fix.covariance_source = "synthetic-diagnostic";
+    ASSERT_TRUE(owner.SubmitHorizontalObservation(fix).ok());
 
-  DiagnosticAlignmentResult result;
-  auto now = Odom(2).timestamp;
-  now.nanoseconds += config.maximum_full_pose_age_ns;
-  ASSERT_TRUE(owner.GetResult(now, &result).ok());
-  ASSERT_TRUE(result.last_full_pose_time.has_value());
-  EXPECT_EQ(Odom(2).timestamp.nanoseconds,
-            result.last_full_pose_time->nanoseconds);
-  EXPECT_TRUE(result.full_pose_evidence_fresh);
-  EXPECT_FALSE(result.odometry_fresh);
-  EXPECT_EQ(Odom(3).timestamp.nanoseconds, result.timestamp.nanoseconds);
-  EXPECT_EQ(now.nanoseconds, result.evaluation_time.nanoseconds);
-  ++now.nanoseconds;
-  ASSERT_TRUE(owner.GetResult(now, &result).ok());
-  EXPECT_FALSE(result.full_pose_evidence_fresh);
-  ASSERT_TRUE(result.estimate.has_value());
-  EXPECT_EQ(2u, result.estimate->correction_id);
+    DiagnosticAlignmentResult result;
+    auto now = Odom(2).timestamp;
+    now.nanoseconds += config.maximum_full_pose_age_ns;
+    ASSERT_TRUE(owner.GetResult(now, &result).ok());
+    ASSERT_TRUE(result.last_full_pose_time.has_value());
+    EXPECT_EQ(Odom(2).timestamp.nanoseconds,
+              result.last_full_pose_time->nanoseconds);
+    EXPECT_TRUE(result.full_pose_evidence_fresh);
+    EXPECT_FALSE(result.odometry_fresh);
+    EXPECT_EQ(Odom(3).timestamp.nanoseconds, result.timestamp.nanoseconds);
+    EXPECT_EQ(now.nanoseconds, result.evaluation_time.nanoseconds);
+    ++now.nanoseconds;
+    ASSERT_TRUE(owner.GetResult(now, &result).ok());
+    EXPECT_FALSE(result.full_pose_evidence_fresh);
+    ASSERT_TRUE(result.estimate.has_value());
+    EXPECT_EQ(2u, result.estimate->correction_id);
 
-  now = Odom(3).timestamp;
-  now.nanoseconds += config.maximum_odometry_age_ns;
-  ASSERT_TRUE(owner.GetResult(now, &result).ok());
-  EXPECT_TRUE(result.odometry_fresh);
-  ++now.nanoseconds;
-  ASSERT_TRUE(owner.GetResult(now, &result).ok());
-  EXPECT_FALSE(result.odometry_fresh);
+    now = Odom(3).timestamp;
+    now.nanoseconds += config.maximum_odometry_age_ns;
+    ASSERT_TRUE(owner.GetResult(now, &result).ok());
+    EXPECT_TRUE(result.odometry_fresh);
+    ++now.nanoseconds;
+    ASSERT_TRUE(owner.GetResult(now, &result).ok());
+    EXPECT_FALSE(result.odometry_fresh);
 
-  EXPECT_EQ(StatusCode::kInvalidTimestamp,
-            owner.GetResult(Odom(2).timestamp, &result).code());
-  now.clock_domain = ClockDomain::kSensorMonotonic;
-  EXPECT_EQ(StatusCode::kClockDomainMismatch,
-            owner.GetResult(now, &result).code());
-  EXPECT_FALSE(result.odometry_fresh);
+    EXPECT_EQ(StatusCode::kInvalidTimestamp,
+              owner.GetResult(Odom(2).timestamp, &result).code());
+    now.clock_domain = ClockDomain::kSensorMonotonic;
+    EXPECT_EQ(StatusCode::kClockDomainMismatch,
+              owner.GetResult(now, &result).code());
+    EXPECT_FALSE(result.odometry_fresh);
+  }
 }
 
 TEST(DiagnosticAlignmentTest, LateSourceCannotRewriteCommittedFrontier) {
+  for (const bool fixed_gain : {false, true}) {
+    SCOPED_TRACE(fixed_gain);
+    DiagnosticGlobalAlignment owner;
+    auto config = Config();
+    config.use_fixed_gain_update = fixed_gain;
+    ASSERT_TRUE(owner.Configure(config).ok());
+    Bootstrap(&owner);
+    ASSERT_TRUE(owner.AddOdometry(Odom(5), Matrix6d::Identity() * 0.01).ok());
+    auto current = Map(5);
+    current.context.source = "current-map";
+    current.map_from_base.translation.y() += 0.05;
+    ASSERT_TRUE(owner.SubmitMapObservation(current).ok());
+    std::vector<GlobalObservationDecision> decisions;
+    ASSERT_TRUE(owner.GetDecisions(&decisions).ok());
+    ASSERT_TRUE(decisions.back().innovation.available);
+    EXPECT_EQ("map_from_odom", decisions.back().innovation.prior_state_frame);
+    EXPECT_NEAR(decisions.back().innovation.nis,
+                decisions.back().innovation.residual.dot(
+                    decisions.back().innovation.covariance.ldlt().solve(
+                        decisions.back().innovation.residual)),
+                1e-8);
+    const auto& innovation = decisions.back().innovation;
+    ASSERT_TRUE(innovation.covariance_decomposition_available);
+    EXPECT_TRUE(innovation.covariance.isApprox(
+        innovation.prior_contribution + innovation.observation_contribution +
+            innovation.local_contribution,
+        1e-12));
+    EXPECT_TRUE(innovation.prior_contribution.isApprox(
+        2 * innovation.prior_covariance, 1e-12));
+    auto late = Map(3);
+    late.context.source = "delayed-map";
+    late.context.receive_time = Odom(5).timestamp;
+    EXPECT_EQ(StatusCode::kOutOfOrderTimestamp,
+              owner.SubmitMapObservation(late).code());
+    DiagnosticAlignmentResult result;
+    ASSERT_TRUE(owner.GetResult(&result).ok());
+    ASSERT_TRUE(result.estimate.has_value());
+    EXPECT_EQ(2u, result.estimate->correction_id);
+    EXPECT_FALSE(result.decisions.back().alignment_updated);
+    EXPECT_EQ(late.context.measurement_time.nanoseconds,
+              result.decisions.back().context.measurement_time.nanoseconds);
+  }
+}
+
+TEST(DiagnosticAlignmentTest, CorrelatedBoundsCanAmplifySmallRotationResidual) {
   DiagnosticGlobalAlignment owner;
   ASSERT_TRUE(owner.Configure(Config()).ok());
-  Bootstrap(&owner);
-  ASSERT_TRUE(owner.AddOdometry(Odom(5), Matrix6d::Identity() * 0.01).ok());
-  auto current = Map(5);
-  current.context.source = "current-map";
-  current.map_from_base.translation.y() += 0.05;
-  ASSERT_TRUE(owner.SubmitMapObservation(current).ok());
-  std::vector<GlobalObservationDecision> decisions;
-  ASSERT_TRUE(owner.GetDecisions(&decisions).ok());
-  ASSERT_TRUE(decisions.back().innovation.available);
-  EXPECT_EQ("map_from_odom", decisions.back().innovation.prior_state_frame);
-  EXPECT_NEAR(
-      decisions.back().innovation.nis,
-      decisions.back().innovation.residual.dot(
-          decisions.back().innovation.covariance.ldlt().solve(
-              decisions.back().innovation.residual)),
-      1e-8);
-  auto late = Map(3);
-  late.context.source = "delayed-map";
-  late.context.receive_time = Odom(5).timestamp;
-  EXPECT_EQ(StatusCode::kOutOfOrderTimestamp,
-            owner.SubmitMapObservation(late).code());
+  Matrix6d prior = Matrix6d::Identity();
+  prior(0, 0) = 1e6;
+  prior(0, 5) = prior(5, 0) = 990;
+  ASSERT_TRUE(prior.llt().info() == Eigen::Success);
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_TRUE(owner.AddOdometry(Odom(i), Matrix6d::Identity() * 0.01).ok());
+    auto observation = Map(i);
+    observation.covariance = prior;
+    const auto status = owner.SubmitMapObservation(observation);
+    if (i == 2) {
+      ASSERT_TRUE(status.ok()) << status.message();
+    } else {
+      EXPECT_EQ(StatusCode::kRejectedMeasurement, status.code());
+    }
+  }
+  const auto odom = Odom(3);
+  ASSERT_TRUE(owner.AddOdometry(odom, Matrix6d::Identity() * 0.01).ok());
+  auto observation = Map(3);
+  observation.covariance = prior;
+  observation.covariance(0, 5) = observation.covariance(5, 0) = -990;
+  observation.map_from_base.rotation =
+      Eigen::AngleAxisd(0.02, Eigen::Vector3d::UnitZ());
+  observation.map_from_base.translation =
+      Eigen::Vector3d(100, 20, 0) +
+      observation.map_from_base.rotation * odom.pose.translation;
+  ASSERT_TRUE(observation.covariance.llt().info() == Eigen::Success);
+  ASSERT_TRUE(owner.SubmitMapObservation(observation).ok());
   DiagnosticAlignmentResult result;
   ASSERT_TRUE(owner.GetResult(&result).ok());
-  ASSERT_TRUE(result.estimate.has_value());
-  EXPECT_EQ(2u, result.estimate->correction_id);
-  EXPECT_FALSE(result.decisions.back().alignment_updated);
-  EXPECT_EQ(late.context.measurement_time.nanoseconds,
-            result.decisions.back().context.measurement_time.nanoseconds);
+  ASSERT_TRUE(result.estimate);
+  const auto& decision = result.decisions.back();
+  ASSERT_TRUE(decision.alignment_updated);
+  ASSERT_TRUE(decision.innovation.available);
+  const auto& innovation = decision.innovation;
+  const Eigen::VectorXd expected =
+      2 * innovation.prior_covariance *
+      innovation.covariance.ldlt().solve(innovation.residual);
+  const Eigen::Vector3d translation =
+      result.estimate->map_from_odom.translation -
+      innovation.prior_pose.translation;
+  EXPECT_TRUE(translation.isApprox(expected.head<3>(), 1e-8));
+  EXPECT_GT(translation.norm(), 5);
+  EXPECT_LT(innovation.residual.head<3>().norm(), 1e-8);
+  EXPECT_LT(innovation.nis, innovation.gate_threshold);
+  EXPECT_TRUE(result.full_pose_evidence_fresh);
+}
+
+TEST(DiagnosticAlignmentTest, CorrelationOnlyControlSeparatesPoseFromGain) {
+  for (const double cross : {0.0, -990.0, 990.0}) {
+    SCOPED_TRACE(cross);
+    DiagnosticGlobalAlignment owner;
+    ASSERT_TRUE(owner.Configure(Config()).ok());
+    Matrix6d covariance = Matrix6d::Identity();
+    covariance(0, 0) = 1e6;
+    covariance(0, 5) = covariance(5, 0) = cross;
+    ASSERT_EQ(Eigen::Success, covariance.llt().info());
+    for (int i = 0; i < 4; ++i) {
+      auto odom = Odom(i);
+      odom.pose.translation.setZero();
+      ASSERT_TRUE(owner.AddOdometry(odom, Matrix6d::Identity() * 0.01).ok());
+      auto observation = Map(i);
+      observation.map_from_base.translation = Eigen::Vector3d(100, 20, 0);
+      observation.covariance = covariance;
+      if (i == 3) {
+        observation.covariance(0, 5) = observation.covariance(5, 0) = -cross;
+        observation.map_from_base.rotation =
+            Eigen::AngleAxisd(0.02, Eigen::Vector3d::UnitZ());
+      }
+      const auto status = owner.SubmitMapObservation(observation);
+      if (i < 2) {
+        EXPECT_EQ(StatusCode::kRejectedMeasurement, status.code());
+      } else {
+        ASSERT_TRUE(status.ok()) << status.message();
+      }
+    }
+    DiagnosticAlignmentResult result;
+    ASSERT_TRUE(owner.GetResult(&result).ok());
+    ASSERT_TRUE(result.estimate);
+    const auto& innovation = result.decisions.back().innovation;
+    ASSERT_TRUE(result.decisions.back().alignment_updated);
+    ASSERT_TRUE(innovation.available);
+    EXPECT_NEAR(0, innovation.residual.head<3>().norm(), 1e-10);
+    EXPECT_NEAR(0.02, innovation.residual[5], 1e-10);
+    EXPECT_NEAR(0, innovation.covariance(0, 5), 1e-8);
+    const Eigen::Vector3d translation =
+        result.estimate->map_from_odom.translation -
+        innovation.prior_pose.translation;
+    const double expected = 2 * innovation.prior_covariance(0, 5) * 0.02 /
+                            innovation.covariance(5, 5);
+    EXPECT_NEAR(expected, translation.x(), 1e-8);
+    EXPECT_NEAR(0, translation.tail<2>().norm(), 1e-8);
+    if (cross == 0) {
+      EXPECT_NEAR(0, translation.norm(), 1e-8);
+    } else {
+      EXPECT_GT(cross * translation.x(), 0);
+      EXPECT_GT(std::abs(translation.x()), 5);
+    }
+  }
+}
+
+TEST(DiagnosticAlignmentTest, FixedGainDoesNotConvertRotationIntoTranslation) {
+  for (const double cross : {-990.0, 0.0, 990.0}) {
+    SCOPED_TRACE(cross);
+    auto config = Config();
+    config.use_fixed_gain_update = true;
+    DiagnosticGlobalAlignment owner;
+    ASSERT_TRUE(owner.Configure(config).ok());
+    Matrix6d covariance = Matrix6d::Identity();
+    covariance(0, 0) = 1e6;
+    covariance(0, 5) = covariance(5, 0) = cross;
+    for (int i = 0; i < 4; ++i) {
+      auto odom = Odom(i);
+      odom.pose.translation.setZero();
+      ASSERT_TRUE(owner.AddOdometry(odom, Matrix6d::Identity() * 0.01).ok());
+      auto observation = Map(i);
+      observation.map_from_base.translation = Eigen::Vector3d(100, 20, 0);
+      observation.covariance = covariance;
+      if (i == 3) {
+        observation.covariance(0, 5) = observation.covariance(5, 0) = -cross;
+        observation.map_from_base.rotation =
+            Eigen::AngleAxisd(0.02, Eigen::Vector3d::UnitZ());
+      }
+      const auto status = owner.SubmitMapObservation(observation);
+      if (i >= 2) ASSERT_TRUE(status.ok()) << status.message();
+    }
+    DiagnosticAlignmentResult result;
+    ASSERT_TRUE(owner.GetResult(&result).ok());
+    ASSERT_TRUE(result.estimate);
+    const auto& innovation = result.decisions.back().innovation;
+    EXPECT_EQ("diagnostic_fixed_gain_full_pose_bound",
+              innovation.covariance_model);
+    EXPECT_TRUE(result.estimate->map_from_odom.translation.isApprox(
+        innovation.prior_pose.translation, 1e-12));
+    EXPECT_NEAR(
+        0.01,
+        Eigen::AngleAxisd(result.estimate->map_from_odom.rotation).angle(),
+        1e-12);
+    EXPECT_TRUE(result.estimate->alignment_covariance.isApprox(
+        0.25 * innovation.covariance, 1e-12));
+  }
+}
+
+TEST(DiagnosticAlignmentTest, FixedGainXyDoesNotInventRotationOrRefreshPose) {
+  auto config = Config();
+  config.use_fixed_gain_update = true;
+  DiagnosticGlobalAlignment owner;
+  ASSERT_TRUE(owner.Configure(config).ok());
+  Bootstrap(&owner);
+  DiagnosticAlignmentResult before;
+  ASSERT_TRUE(owner.GetResult(&before).ok());
+  const auto odom = Odom(3);
+  ASSERT_TRUE(owner.AddOdometry(odom, Matrix6d::Identity() * 0.01).ok());
+  GlobalHorizontalObservation fix;
+  fix.context = Context(3, "gnss");
+  fix.position = Eigen::Vector2d(103.2, 19.6);
+  fix.covariance = Eigen::Matrix2d::Identity() * 0.01;
+  fix.covariance_source = "constructed-xy";
+  ASSERT_TRUE(owner.SubmitHorizontalObservation(fix).ok());
+  DiagnosticAlignmentResult after;
+  ASSERT_TRUE(owner.GetResult(&after).ok());
+  ASSERT_TRUE(after.estimate);
+  const auto& innovation = after.decisions.back().innovation;
+  EXPECT_EQ("diagnostic_fixed_gain_partial_bound", innovation.covariance_model);
+  EXPECT_TRUE((after.estimate->map_from_odom.translation -
+               before.estimate->map_from_odom.translation)
+                  .head<2>()
+                  .isApprox(0.5 * innovation.residual, 1e-12));
+  EXPECT_EQ(before.estimate->map_from_odom.translation.z(),
+            after.estimate->map_from_odom.translation.z());
+  EXPECT_TRUE(after.estimate->map_from_odom.rotation.isApprox(
+      before.estimate->map_from_odom.rotation, 1e-12));
+  ASSERT_TRUE(after.last_full_pose_time);
+  EXPECT_EQ(before.last_full_pose_time->nanoseconds,
+            after.last_full_pose_time->nanoseconds);
 }
 
 TEST(DiagnosticAlignmentTest, RetainsProvenanceForQueuedAndRejectedEvidence) {

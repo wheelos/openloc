@@ -94,13 +94,22 @@ Result LocalEstimator::PrepareJointLidar(
   result = lio_.GeometryErrorMap(planes);
   if (!result.ok() && result.reason != Reason::GEOMETRY_UNAVAILABLE)
     return result;
+  // SyncJointMemory retires the previous scan's temporary prior/raw/deskew
+  // keys. All points below retain independent 3D noise until this batch is
+  // consumed.
+  const auto capacity = joint_error_.CheckAdditionalCapacity(
+      18 + 3 * deskew->points.size(), 3 * deskew->points.size());
+  if (!capacity.ok())
+    return {capacity.reason, capacity.message + "; lidar_points=" +
+                                 std::to_string(deskew->points.size())};
   joint_error_.Set("lidar_prior", joint_error_.Get("internal"));
   for (std::size_t index = 0; index < deskew->points.size(); ++index) {
     joint_error_.Independent(
-        "raw_point", Eigen::Matrix3d::Identity() *
-                         (config_.lidar_point_noise_std *
-                          config_.lidar_point_noise_std),
-        "lidar:" + std::to_string(scan.stamp.sequence) + ":" + std::to_string(index));
+        "raw_point",
+        Eigen::Matrix3d::Identity() *
+            (config_.lidar_point_noise_std * config_.lidar_point_noise_std),
+        "lidar:" + std::to_string(scan.stamp.sequence) + ":" +
+            std::to_string(index));
     if (!joint_error_.active()) return joint_error_.status();
     const auto& point = deskew->points[index];
     Eigen::MatrixXd loading = point.raw_point * joint_error_.Get("raw_point");

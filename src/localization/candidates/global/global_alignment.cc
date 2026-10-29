@@ -12,8 +12,9 @@
 
 #include "Eigen/Cholesky"
 #include "Eigen/LU"
-#include "candidates/global/fixed_lag_graph.h"
+#include "Eigen/QR"
 #include "alignment_recovery.h"
+#include "candidates/global/fixed_lag_graph.h"
 
 namespace openloc {
 namespace localization {
@@ -42,6 +43,10 @@ GlobalAlignment::GlobalAlignment(const GlobalConfig& config)
 GlobalAlignment::~GlobalAlignment() = default;
 
 Result GlobalAlignment::ValidateConfig() const {
+  if (config_.diagnostic_fixed_gain &&
+      (!config_.diagnostic_only || config_.enable_fixed_lag_graph))
+    return {Reason::CONFIG_INVALID,
+            "Fixed mean gain requires the explicit diagnostic owner"};
   if (config_.graph_allow_uncalibrated_inputs && !config_.enable_fixed_lag_graph)
     return {Reason::CONFIG_INVALID,
             "Uncalibrated modeled inputs require the fixed-lag graph owner"};
@@ -355,6 +360,7 @@ Result GlobalAlignment::Lookup(double time, LocalState* local) const {
   // Adjacent states are correlated. This is a conservative interpolation bound.
   local->covariance =
       2.0 * ((1.0 - weight) * before.covariance + weight * upper->covariance);
+  local->covariance_square_root.reset();
   return {};
 }
 
@@ -523,8 +529,11 @@ Result GlobalAlignment::Observe(const GlobalObservation& observation,
     return ObservePartial(observation, local, &source, diagnostics);
   }
   const Eigen::Isometry3d measured = observation.pose * Pose(local).inverse();
+  Matrix6d observation_bound, local_bound;
   const Matrix6d covariance =
-      TransformCovarianceBound(observation.pose, local, observation.covariance);
+      TransformCovarianceBound(observation.pose, local, observation.covariance,
+                               diagnostics ? &observation_bound : nullptr,
+                               diagnostics ? &local_bound : nullptr);
   if (!ValidCovariance(covariance)) {
     return Reject(Reason::INVALID_INPUT, "invalid alignment covariance",
                   &source);
@@ -609,7 +618,14 @@ Result GlobalAlignment::Observe(const GlobalObservation& observation,
       diagnostics->nis = distance;
       diagnostics->gate_threshold = config_.innovation_gate;
       diagnostics->residual_basis = "map.translation_m.left_rotation_rad.v1";
-      diagnostics->covariance_model = "diagnostic_ci_full_pose_bound";
+      diagnostics->covariance_model =
+          config_.diagnostic_fixed_gain
+              ? "diagnostic_fixed_gain_full_pose_bound"
+              : "diagnostic_ci_full_pose_bound";
+      diagnostics->covariance_decomposition_available = true;
+      diagnostics->prior_contribution = 2.0 * state_.covariance;
+      diagnostics->observation_contribution = 2.0 * observation_bound;
+      diagnostics->local_contribution = 2.0 * local_bound;
       diagnostics->prior_pose.translation = state_.map_to_odom.translation();
       diagnostics->prior_pose.rotation =
           Eigen::Quaterniond(state_.map_to_odom.linear()).normalized();
@@ -619,17 +635,28 @@ Result GlobalAlignment::Observe(const GlobalObservation& observation,
       return Reject(Reason::INNOVATION_REJECTED, "global innovation rejected",
                     &source);
     }
-    const Matrix6d previous_information =
-        state_.covariance.ldlt().solve(Matrix6d::Identity());
-    const Matrix6d measured_information =
-        covariance.ldlt().solve(Matrix6d::Identity());
-    // Fixed-weight covariance intersection prevents correlated double counting.
-    const Matrix6d fused =
-        (0.5 * previous_information + 0.5 * measured_information)
-            .ldlt()
-            .solve(Matrix6d::Identity());
-    const Eigen::Matrix<double, 6, 1> correction =
-        fused * (0.5 * measured_information) * innovation;
+    Matrix6d fused;
+    Eigen::Matrix<double, 6, 1> correction;
+    if (config_.diagnostic_fixed_gain) {
+      correction = 0.5 * innovation;
+      fused = FixedGainCovarianceBound(state_.covariance, covariance,
+                                       Matrix6d::Identity(),
+                                       0.5 * Matrix6d::Identity());
+    } else {
+      const Matrix6d previous_information =
+          state_.covariance.ldlt().solve(Matrix6d::Identity());
+      const Matrix6d measured_information =
+          covariance.ldlt().solve(Matrix6d::Identity());
+      // Fixed-weight covariance intersection prevents correlated double
+      // counting.
+      fused = (0.5 * previous_information + 0.5 * measured_information)
+                  .ldlt()
+                  .solve(Matrix6d::Identity());
+      correction = fused * (0.5 * measured_information) * innovation;
+    }
+    if (!ValidCovariance(fused) || !correction.allFinite())
+      return Reject(Reason::INVALID_INPUT,
+                    "full-pose update is not finite/positive", &source);
     state_.map_to_odom.translation() += correction.head<3>();
     state_.map_to_odom.linear() =
         ExpRotation(correction.tail<3>()).toRotationMatrix() *
@@ -765,7 +792,9 @@ Result GlobalAlignment::ObservePartial(const GlobalObservation& observation,
     diagnostics->covariance = innovation;
     diagnostics->nis = distance;
     diagnostics->gate_threshold = config_.innovation_gate;
-    diagnostics->covariance_model = "diagnostic_ci_partial_bound";
+    diagnostics->covariance_model = config_.diagnostic_fixed_gain
+                                        ? "diagnostic_fixed_gain_partial_bound"
+                                        : "diagnostic_ci_partial_bound";
     if (observation.kind == GlobalObservation::Kind::HORIZONTAL_POSITION)
       diagnostics->residual_basis = "map.xy_m.v1";
     else if (observation.kind == GlobalObservation::Kind::POSITION)
@@ -788,26 +817,45 @@ Result GlobalAlignment::ObservePartial(const GlobalObservation& observation,
     return Reject(Reason::INNOVATION_REJECTED,
                   "partial innovation rejected in observed subspace", source);
   }
-  // Generalized covariance intersection: unknown shared trajectory correlation.
-  // Null directions receive no information and may become less certain.
-  Matrix6d prior_information =
-      state_.covariance.ldlt().solve(Matrix6d::Identity());
-  if (config_.diagnostic_only) {
-    // Retain the conditional prior in the unmeasured subspace. Discounting
-    // all six directions on every XY fix otherwise doubles free Z variance.
-    // This conditional model is diagnostic, not a qualified joint bound.
-    const Eigen::MatrixXd measured_prior =
-        h * state_.covariance * h.transpose();
-    prior_information -= 0.5 * h.transpose() * measured_prior.ldlt().solve(h);
+  Matrix6d covariance;
+  Eigen::Matrix<double, 6, 1> correction;
+  if (config_.diagnostic_fixed_gain) {
+    Eigen::MatrixXd gain;
+    if (observation.kind == GlobalObservation::Kind::POSITION ||
+        observation.kind == GlobalObservation::Kind::HORIZONTAL_POSITION) {
+      gain = Eigen::MatrixXd::Zero(6, h.rows());
+      gain.topRows(h.rows()) =
+          0.5 * Eigen::MatrixXd::Identity(h.rows(), h.rows());
+    } else if (observation.kind == GlobalObservation::Kind::HEADING) {
+      gain = Eigen::MatrixXd::Zero(6, 1);
+      gain.bottomRows(3) =
+          0.5 * h.rightCols(3).transpose() / h.rightCols(3).squaredNorm();
+    } else {
+      gain = 0.5 * h.completeOrthogonalDecomposition().pseudoInverse();
+    }
+    correction = gain * residual;
+    covariance = FixedGainCovarianceBound(state_.covariance, noise, h, gain);
   } else {
-    prior_information *= 0.5;
+    // Generalized covariance intersection: unknown shared trajectory
+    // correlation. Null directions receive no information and may become less
+    // certain.
+    Matrix6d prior_information =
+        state_.covariance.ldlt().solve(Matrix6d::Identity());
+    if (config_.diagnostic_only) {
+      // Retain the conditional prior in the unmeasured subspace. This
+      // diagnostic conditional model is not a qualified joint bound.
+      const Eigen::MatrixXd measured_prior =
+          h * state_.covariance * h.transpose();
+      prior_information -= 0.5 * h.transpose() * measured_prior.ldlt().solve(h);
+    } else {
+      prior_information *= 0.5;
+    }
+    const Eigen::MatrixXd weighted = noise.ldlt().solve(h);
+    const Matrix6d information =
+        prior_information + 0.5 * h.transpose() * weighted;
+    covariance = information.ldlt().solve(Matrix6d::Identity());
+    correction = covariance * (0.5 * weighted.transpose()) * residual;
   }
-  const Eigen::MatrixXd weighted = noise.ldlt().solve(h);
-  const Matrix6d information =
-      prior_information + 0.5 * h.transpose() * weighted;
-  const Matrix6d covariance = information.ldlt().solve(Matrix6d::Identity());
-  const Eigen::Matrix<double, 6, 1> correction =
-      covariance * (0.5 * weighted.transpose()) * residual;
   if (!ValidCovariance(covariance) || !correction.allFinite()) {
     return Reject(Reason::INVALID_INPUT,
                   "partial update is not finite/positive", source);

@@ -3,6 +3,8 @@
 
 #include "candidates/local/native_joint_error.h"
 
+#include <limits>
+
 #include "gtest/gtest.h"
 
 namespace openloc::localization::unified {
@@ -69,6 +71,45 @@ TEST(NativeJointErrorTest, SharedSingularMemoryGrowsAndRetiresWithoutNoise) {
   EXPECT_EQ(motion.joint_cross_covariance.cols(), 15);
 }
 
+TEST(NativeJointErrorTest, ReusedPointAcrossQueryGapNeedsHiddenTemporalMemory) {
+  LocalConfig config;
+  config.enable_native_joint_error = true;
+  NativeJointError model(config);
+  auto state = Initial();
+  model.Initialize(state);
+  model.Independent("point:a", Eigen::Matrix3d::Identity());
+  model.Independent("point:b", Eigen::Matrix3d::Identity());
+  for (int step = 0; step < 3; ++step) {
+    Eigen::MatrixXd output =
+        Eigen::MatrixXd::Zero(18, model.Get("internal").cols());
+    output.topRows(15) = model.Get("internal");
+    if (step != 1) output.row(0) += model.Get("point:a").row(0);
+    if (step != 0) output.row(0) += model.Get("point:b").row(0);
+    model.Set("output", output);
+    state.stamp = {1.0 + step, 1.0 + step, uint64_t(1 + step), "unix"};
+    const std::vector<SourceSampleId> sources =
+        step == 0 ? std::vector<SourceSampleId>{{"imu", 1}}
+                  : std::vector<SourceSampleId>{{"imu", uint64_t(step)},
+                                                {"imu", uint64_t(1 + step)}};
+    model.Publish(state, sources);
+    ASSERT_TRUE(model.active()) << model.status().message;
+  }
+  MotionIncrement first, second, whole;
+  const auto first_result = model.MotionBetween(1, 2, &first);
+  const auto second_result = model.MotionBetween(2, 3, &second);
+  const auto whole_result = model.MotionBetween(1, 3, &whole);
+  ASSERT_TRUE(first_result.ok()) << first_result.message;
+  ASSERT_TRUE(second_result.ok()) << second_result.message;
+  ASSERT_TRUE(whole_result.ok()) << whole_result.message;
+  EXPECT_NEAR(2, whole.cross_covariance(0, 0), 1e-12);
+  // Exact adjacent 15D marginals alone sever the reused point across t=2.
+  const Matrix15d query_only_cross =
+      first.cross_covariance *
+      first.end_covariance.llt().solve(second.cross_covariance);
+  EXPECT_NEAR(1, query_only_cross(0, 0), 1e-12);
+  EXPECT_GT((whole.cross_covariance - query_only_cross).norm(), 0.9);
+}
+
 TEST(NativeJointErrorTest, CapacityAndInvalidDrivingNoiseDoNotFakeAState) {
   LocalConfig config;
   config.enable_native_joint_error = true;
@@ -92,6 +133,142 @@ TEST(NativeJointErrorTest, CapacityAndInvalidDrivingNoiseDoNotFakeAState) {
   model.Independent("invalid", invalid);
   EXPECT_FALSE(model.active());
   EXPECT_NE(model.status().message.find("not PSD"), std::string::npos);
+}
+
+TEST(NativeJointErrorTest, PhysicalRowsCanExhaustBeforeIndependentDimension) {
+  LocalConfig config;
+  config.enable_native_joint_error = true;
+  config.native_joint_max_dimension = 100;
+  config.native_joint_max_memory_rows = 39;
+  NativeJointError model(config);
+  auto state = Initial();
+  model.Initialize(state);
+  ASSERT_TRUE(model.active());
+  const Eigen::MatrixXd internal = model.Get("internal");
+  ASSERT_EQ(internal.cols(), 15);
+  model.Set("shared-copy", internal.topRows(6));
+  ASSERT_TRUE(model.active());
+  EXPECT_EQ(model.Get("shared-copy").cols(), 15);
+  model.Set("one-more-row", internal.topRows(1));
+  EXPECT_FALSE(model.active());
+  EXPECT_EQ(model.status().reason, Reason::CORRELATION_UNQUALIFIED);
+  EXPECT_NE(model.status().message.find("physical-memory capacity"),
+            std::string::npos);
+  EXPECT_NE(model.status().message.find("no dependency dropped"),
+            std::string::npos);
+  EXPECT_NE(model.status().message.find("key=one-more-row"), std::string::npos);
+  EXPECT_NE(model.status().message.find("stored_rows=39"), std::string::npos);
+  EXPECT_NE(model.status().message.find("incoming_rows=1"), std::string::npos);
+  EXPECT_NE(model.status().message.find("required_rows=40"), std::string::npos);
+  EXPECT_NE(model.status().message.find("driver_dimension=15"),
+            std::string::npos);
+}
+
+TEST(NativeJointErrorTest, PointBatchPreflightMatchesActualRowCapacity) {
+  for (const std::size_t points : {1U, 4U, 12U}) {
+    SCOPED_TRACE(points);
+    LocalConfig config;
+    config.enable_native_joint_error = true;
+    config.native_joint_max_memory_rows = 33 + 18 + 3 * points;
+    NativeJointError model(config);
+    model.Initialize(Initial());
+    const auto internal = model.Get("internal");
+    const auto output = model.Get("output");
+    EXPECT_TRUE(
+        model.CheckAdditionalCapacity(18 + 3 * points, 3 * points).ok());
+    const auto refused =
+        model.CheckAdditionalCapacity(18 + 3 * (points + 1), 3 * (points + 1));
+    EXPECT_EQ(refused.reason, Reason::CORRELATION_UNQUALIFIED);
+    EXPECT_TRUE(model.active());
+    EXPECT_TRUE(model.Get("internal").isApprox(internal, 0));
+    EXPECT_TRUE(model.Get("output").isApprox(output, 0));
+    model.Set("lidar_prior", model.Get("internal"));
+    for (std::size_t point = 0; point < points; ++point) {
+      model.Independent("raw_point", Eigen::Matrix3d::Identity());
+      const Eigen::MatrixXd loading =
+          model.Get("internal").topRows(3) + model.Get("raw_point");
+      model.Set("deskew:" + std::to_string(point), loading);
+      ASSERT_TRUE(model.active()) << model.status().message;
+    }
+    model.Set("one-more-row",
+              Eigen::MatrixXd::Zero(1, model.Get("internal").cols()));
+    EXPECT_FALSE(model.active());
+  }
+}
+
+TEST(NativeJointErrorTest, PreflightChecksDriversAndOverflowWithoutMutation) {
+  LocalConfig config;
+  config.enable_native_joint_error = true;
+  config.native_joint_max_memory_rows = 64;
+  NativeJointError model(config);
+  model.Initialize(Initial());
+  const auto internal = model.Get("internal");
+  EXPECT_TRUE(model.CheckAdditionalCapacity(0, 49).ok());
+  auto refused = model.CheckAdditionalCapacity(0, 50);
+  EXPECT_EQ(refused.reason, Reason::CORRELATION_UNQUALIFIED);
+  EXPECT_NE(refused.message.find("driver_dimension=15"), std::string::npos);
+  EXPECT_NE(refused.message.find("additional_drivers=50"), std::string::npos);
+  EXPECT_FALSE(
+      model.CheckAdditionalCapacity(std::numeric_limits<std::size_t>::max(), 0)
+          .ok());
+  EXPECT_FALSE(
+      model.CheckAdditionalCapacity(0, std::numeric_limits<std::size_t>::max())
+          .ok());
+  EXPECT_TRUE(model.active());
+  EXPECT_TRUE(model.Get("internal").isApprox(internal, 0));
+  model.Fail({Reason::CORRELATION_UNQUALIFIED, "original failure"});
+  EXPECT_EQ(model.CheckAdditionalCapacity(0, 0).message, "original failure");
+}
+
+TEST(NativeJointErrorTest, IndependentPointsRetainSharedPoseAndFullNoiseRank) {
+  LocalConfig config;
+  config.enable_native_joint_error = true;
+  NativeJointError model(config);
+  auto state = Initial();
+  model.Initialize(state);
+  const Eigen::Matrix3d transform =
+      Eigen::AngleAxisd(0.3, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+  constexpr int points = 4;
+  for (int point = 0; point < points; ++point) {
+    model.Independent("raw", 2 * Eigen::Matrix3d::Identity());
+    const Eigen::MatrixXd loading =
+        3 * model.Get("internal").topRows(3) + transform * model.Get("raw");
+    model.Set("deskew:" + std::to_string(point), loading);
+  }
+  model.Drop("raw");
+  model.Publish(state, {});
+  ASSERT_TRUE(model.active()) << model.status().message;
+  LocalState snapshot;
+  ASSERT_TRUE(model.Lookup(1, &snapshot).ok());
+  EXPECT_EQ(snapshot.joint_error->covariance.rows(), 15 + 3 * points);
+  const auto first = model.Get("deskew:0");
+  const auto second = model.Get("deskew:1");
+  EXPECT_TRUE((first * first.transpose())
+                  .isApprox(11 * Eigen::Matrix3d::Identity(), 1e-12));
+  EXPECT_TRUE((first * second.transpose())
+                  .isApprox(9 * Eigen::Matrix3d::Identity(), 1e-12));
+  EXPECT_TRUE((model.Get("internal") * first.transpose())
+                  .topRows(3)
+                  .isApprox(3 * Eigen::Matrix3d::Identity(), 1e-12));
+  EXPECT_TRUE(((first - second) * (first - second).transpose())
+                  .isApprox(4 * Eigen::Matrix3d::Identity(), 1e-12));
+}
+
+TEST(NativeJointErrorTest, PointBatchPreflightCountsOutstandingTaskPins) {
+  LocalConfig config;
+  config.enable_native_joint_error = true;
+  config.native_joint_max_memory_rows = 78;
+  NativeJointError model(config);
+  model.Initialize(Initial());
+  auto fork = model.PinFork();
+  ASSERT_TRUE(fork);
+  // 33 initial + 15 fork-root + 24 prior/raw/deskew + 6 pinned raw drivers.
+  EXPECT_TRUE(model.CheckAdditionalCapacity(24, 6).ok());
+  const auto refused = model.CheckAdditionalCapacity(27, 9);
+  EXPECT_EQ(refused.reason, Reason::CORRELATION_UNQUALIFIED);
+  EXPECT_NE(refused.message.find("pinned_driver_rows=9"), std::string::npos);
+  fork.reset();
+  EXPECT_TRUE(model.CheckAdditionalCapacity(27, 9).ok());
 }
 
 TEST(NativeJointErrorTest, SingularNoisePreservesSmallPhysicalScales) {

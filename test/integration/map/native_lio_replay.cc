@@ -60,6 +60,50 @@ void WriteImuTrace(std::ostream& stream, const u::LocalEstimatorTrace& trace) {
   if (!stream) throw std::runtime_error("incomplete IMU trace write");
 }
 
+void WriteCovarianceTrace(std::ostream& stream,
+                          const u::LocalEstimatorTrace& trace,
+                          const u::LocalState& internal_before,
+                          const u::LocalState& output_before,
+                          const u::LocalState& internal_after,
+                          const u::LocalState& output_after, double scale) {
+  const Eigen::Isometry3d propagated = u::Pose(output_before) *
+                                       u::Pose(internal_before).inverse() *
+                                       u::Pose(internal_after);
+  const Eigen::Vector3d translation =
+      output_after.position - propagated.translation();
+  const Eigen::Vector3d velocity =
+      output_after.velocity -
+      (propagated.translation() - output_before.position) / trace.dt;
+  const Eigen::Vector3d rotation =
+      u::LogRotation(Eigen::Quaterniond(propagated.linear()).conjugate() *
+                     output_after.orientation);
+  stream << std::setprecision(17) << trace.stamp.sequence << ','
+         << trace.stamp.time << ',' << trace.dt << ',' << scale << ','
+         << output_after.covariance_model_valid;
+  for (const auto* matrix :
+       {&internal_before.covariance, &internal_after.covariance,
+        &output_before.covariance, &output_after.covariance,
+        &trace.error_transition, &trace.process_noise_covariance}) {
+    stream << ',';
+    for (int row = 0; row < 15; ++row)
+      for (int col = 0; col < 15; ++col) {
+        if (row || col) stream << ';';
+        stream << (*matrix)(row, col);
+      }
+  }
+  for (const auto* vector :
+       {&translation, &velocity, &rotation, &output_after.position}) {
+    stream << ','
+           << vector->transpose().format(
+                  Eigen::IOFormat(Eigen::FullPrecision, 0, ";", ";"));
+  }
+  stream << ','
+         << output_after.orientation.coeffs().transpose().format(
+                Eigen::IOFormat(Eigen::FullPrecision, 0, ";", ";"))
+         << '\n';
+  if (!stream) throw std::runtime_error("incomplete covariance trace write");
+}
+
 void WriteLocalCorrection(std::ostream& stream, uint64_t sequence,
                           int64_t stamp, const u::Result& decision,
                           const u::LocalState& before,
@@ -156,7 +200,8 @@ void Run(const std::filesystem::path& input,
          const std::map<std::string, uint32_t>& native_joint_limits,
          const openloc::replay::NativeGlobalOdometryFault& odometry_fault,
          std::pair<int64_t, int64_t> map_holdout, uint32_t arrival_rate,
-         bool tracking_gain, bool profile_map_timing, bool profile_local_timing) {
+         bool tracking_gain, bool profile_map_timing, bool profile_local_timing,
+         bool fixed_gain_update) {
   if (!std::filesystem::create_directory(output))
     throw std::runtime_error("output must be a new directory");
   auto config = Configuration((input / "config.csv").string());
@@ -187,7 +232,13 @@ void Run(const std::filesystem::path& input,
     map = std::make_unique<openloc::replay::NativeMapDiagnostic>(
         map_bundle, output, map_digests, gnss_bundle, gnss_digests,
         global_holdback_ns, async_global, level_odom_gnss_bootstrap,
-        odometry_fault, map_holdout, profile_map_timing);
+        odometry_fault, map_holdout, profile_map_timing, fixed_gain_update);
+  if (fixed_gain_update) {
+    std::ofstream policy(output / "global_mean_policy.csv");
+    policy << "mode,covariance,trust_ceiling\n"
+              "fixed_half_residual,unknown_correlation_bound,diagnostic\n";
+    if (!policy) throw std::runtime_error("incomplete diagnostic mean policy");
+  }
   std::atomic<bool> global_initialized{false};
   std::unique_ptr<openloc::replay::NativeDiagnosticExecutor> global_executor;
   if (async_global)
@@ -261,9 +312,20 @@ void Run(const std::filesystem::path& input,
                    "emitted_steady_ns,deadline_ns\n";
   }
   std::ofstream trace;
+  std::ofstream covariance_trace;
+  std::optional<u::LocalEstimatorTrace> propagation_trace;
   if (imu_trace) {
     trace.open(output / "imu_trace.csv");
     if (!trace) throw std::runtime_error("cannot open IMU trace");
+    covariance_trace.open(output / "local_covariance.csv");
+    if (!covariance_trace)
+      throw std::runtime_error("cannot open local covariance trace");
+    covariance_trace
+        << "sequence,time_s,dt_s,correction_variance_scale,"
+           "covariance_model_valid,internal_before,internal_after,"
+           "output_before,output_after,transition,process_noise,"
+           "translation_correction,velocity_correction,rotation_correction,"
+           "output_position,output_quaternion_xyzw\n";
     trace
         << "sequence,time_s,dt_s,force_x,force_y,force_z,rate_x,rate_y,rate_z,"
            "acceleration_x,acceleration_y,acceleration_z,"
@@ -279,8 +341,9 @@ void Run(const std::filesystem::path& input,
            "accel_bias_covariance_trace,velocity_position_cross_norm,"
            "attitude_position_cross_norm,gyro_bias_position_cross_norm,"
            "accel_bias_position_cross_norm\n";
-    local.SetTraceCallback([&trace](const u::LocalEstimatorTrace& item) {
+    local.SetTraceCallback([&](const u::LocalEstimatorTrace& item) {
       WriteImuTrace(trace, item);
+      propagation_trace = item;
     });
   }
   if (!states || !decisions || !initialization || !capability || !corrections)
@@ -396,6 +459,12 @@ void Run(const std::filesystem::path& input,
       sample.acceleration[axis] = csv::Number(row[axis + 2]);
       sample.angular_velocity[axis] = csv::Number(row[axis + 5]);
     }
+    u::LocalState internal_before, output_before;
+    if (imu_trace) {
+      internal_before = local.internal_state();
+      output_before = local.state();
+      propagation_trace.reset();
+    }
     auto started = Clock::now();
     const auto result = local.AddImu(sample);
     const double imu_ms =
@@ -417,6 +486,14 @@ void Run(const std::filesystem::path& input,
           integrity.ok()))
       throw std::runtime_error(result.message);
     const auto& state = local.state();
+    if (imu_trace && state.valid && output_before.valid && propagation_trace) {
+      if (propagation_trace->stamp.sequence != sample.stamp.sequence)
+        throw std::runtime_error("covariance trace frontier mismatch");
+      WriteCovarianceTrace(covariance_trace, *propagation_trace,
+                           internal_before, output_before,
+                           local.internal_state(), state,
+                           config.lidar_correction_variance_scale);
+    }
     if (timer) timer->Update(state, integrity.ok(), stamp, receive, target);
     health.Update(state, integrity, stamp, receive, global_initialized.load());
     if (motion_bootstrap && !state.valid) bootstrap.AddImu(sample);
@@ -727,6 +804,7 @@ int main(int argc, char** argv) {
     bool profile_map_timing = false;
     bool profile_local_timing = false;
     bool level_odom_gnss_bootstrap = false;
+    bool fixed_gain_update = false;
     double native_joint_sample_period = 0;
     std::map<std::string, uint32_t> native_joint_limits;
     openloc::replay::NativeGlobalOdometryFault odometry_fault;
@@ -741,6 +819,8 @@ int main(int argc, char** argv) {
         motion_bootstrap = true;
       } else if (option == "--imu-trace" && !imu_trace) {
         imu_trace = true;
+      } else if (option == "--diagnostic-fixed-gain" && !fixed_gain_update) {
+        fixed_gain_update = true;
       } else if (option == "--global-map-holdout" && !map_holdout.first &&
                  i + 2 < argc) {
         map_holdout.first = csv::Time(argv[++i]);
@@ -764,7 +844,8 @@ int main(int argc, char** argv) {
         async_global = true;
       } else if (option == "--arrival-paced" && !arrival_paced) {
         arrival_paced = true;
-      } else if (option == "--arrival-rate" && !has_arrival_rate && i + 1 < argc) {
+      } else if (option == "--arrival-rate" && !has_arrival_rate &&
+                 i + 1 < argc) {
         const auto rate = csv::Time(argv[++i]);
         if (rate != 1 && rate != 2 && rate != 5)
           throw std::runtime_error("arrival rate must be 1, 2 or 5");
@@ -846,6 +927,8 @@ int main(int argc, char** argv) {
     if (map_bundle.empty() != map_digests.empty())
       throw std::runtime_error(
           "map bundle and explicit input hashes required together");
+    if (fixed_gain_update && map_bundle.empty() && gnss_bundle.empty())
+      throw std::runtime_error("diagnostic fixed gain requires a global owner");
     if (profile_map_timing && map_bundle.empty())
       throw std::runtime_error("map timing profiling requires map input");
     if (profile_local_timing && (prefetch_lidar || async_local_delay_ns))
@@ -898,7 +981,8 @@ int main(int argc, char** argv) {
         async_local_delay_ns, prefetch_lidar, timer_output,
         level_odom_gnss_bootstrap, native_joint_sample_period,
         native_joint_limits, odometry_fault, map_holdout, arrival_rate,
-        tracking_gain, profile_map_timing, profile_local_timing);
+        tracking_gain, profile_map_timing, profile_local_timing,
+        fixed_gain_update);
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "native_lio_replay: " << error.what() << '\n';

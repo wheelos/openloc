@@ -311,6 +311,54 @@ TEST(ScanToMapTest, SelectsPointToPlaneIcpBackendAndReportsMetricType) {
   EXPECT_GT(result.icp_solver_ms, 0.0);
 }
 
+TEST(ScanToMapTest, ReentryRequiresSupportedSeedAndDoesNotPoisonLaterMatches) {
+  const PointCloud::Ptr map = AsymmetricMap();
+  auto config = TestConfig();
+  config.algorithm = ScanMatchingAlgorithm::kPointToPlaneIcp;
+  config.icp_minimum_target_overlap = .25;
+  ScanToMapLocalizer localizer(config);
+  std::string error;
+  ASSERT_TRUE(localizer.Configure(TestMetadata(), map, &error)) << error;
+  const Eigen::Isometry3d truth =
+      Eigen::Translation3d(.35, -.22, .18) *
+      Eigen::AngleAxisd(.09, Eigen::Vector3d::UnitZ()) *
+      Eigen::AngleAxisd(-.04, Eigen::Vector3d::UnitY());
+  ScanToMapRequest request;
+  request.timestamp_ns = 10'000'000'000LL;
+  request.clock_domain = "sensor_unix";
+  request.cloud_frame = "lidar";
+  request.deskewed = true;
+  request.cloud = ScanInCloudFrame(*map, truth);
+  for (const double offset : {0.0, .1, .5}) {
+    SCOPED_TRACE(offset);
+    request.map_from_base_initial = truth;
+    request.map_from_base_initial.translation().x() += offset;
+    const auto result = localizer.Match(request);
+    ASSERT_TRUE(result.valid) << result.reason << " " << result.detail;
+    EXPECT_LT((result.map_from_base.translation() - truth.translation()).norm(),
+              10 * config.icp_translation_tolerance_m);
+    EXPECT_LT(Eigen::AngleAxisd(truth.linear().transpose() *
+                                result.map_from_base.linear())
+                  .angle(),
+              10 * config.icp_rotation_tolerance_rad);
+    EXPECT_TRUE(result.diagnostic_only);
+    EXPECT_FALSE(result.covariance_calibrated);
+    request.timestamp_ns += 1'000'000'000LL;
+  }
+  request.map_from_base_initial.translation() = Eigen::Vector3d(1000, 1000, 0);
+  request.timestamp_ns += 120'000'000'000LL;
+  const auto outside = localizer.Match(request);
+  EXPECT_FALSE(outside.valid);
+  EXPECT_EQ(MatchStatus::kNotReady, outside.status);
+  EXPECT_EQ("map_window_not_ready", outside.reason);
+  request.map_from_base_initial = truth;
+  request.timestamp_ns += 1'000'000'000LL;
+  const auto returned = localizer.Match(request);
+  ASSERT_TRUE(returned.valid) << returned.reason;
+  EXPECT_LT((returned.map_from_base.translation() - truth.translation()).norm(),
+            10 * config.icp_translation_tolerance_m);
+}
+
 TEST(ScanToMapTest, TransformsUncertaintyThroughNonzeroCloudExtrinsic) {
   const PointCloud::Ptr map = AsymmetricMap();
   const Eigen::Isometry3d map_from_cloud =

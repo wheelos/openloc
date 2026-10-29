@@ -40,6 +40,15 @@ catch-up frontier, epoch and single-commit checks. `EvaluateIntegrity()` is
 not `Evaluate()`: finite propagation does not qualify capability, uncertainty
 or graph admission. The interface has no absolute-pose or global-reset input
 and does not expose an invented qualified LIO motion factor.
+Exactly zero process noise uses `LocalState::covariance_square_root` to retain
+the marginal as `P = L L^T` instead of repeatedly rounding an ill-conditioned
+covariance. Existing factors survive wheel, zero-velocity, LiDAR and continuous
+output updates using orthogonal factor reduction; ordinary positive-noise
+propagation retains its existing dense path. The factor and rounded dense view
+must agree, and unresolved factor rank still rejects. This is not a sufficient
+cross-time/geometry model or a precision qualification. Dense-inverse motion
+and graph consumers still reject covariance they cannot resolve; they do not
+silently obtain temporal sufficiency from this marginal factor.
 `MotionBetween()` now exports the owner's actual joint motion at exact retained
 endpoints, including source identities and cross-covariance, without private
 headers. It does not qualify uncertainty: unmodeled LIO/startup intervals
@@ -167,6 +176,17 @@ graph admission. The graph is the target implementation; the separate 4DoF
 and conservative CI entries remain only as explicitly selected comparison
 baselines with existing replay runners, never as implicit fallback backends.
 Their output covariances and startup requirements are not interchangeable.
+`DiagnosticAlignmentConfig::use_fixed_gain_update` selects an explicit
+conservative comparison instead of the legacy covariance-intersection mean.
+Full-pose updates use half the alignment residual; XY/XYZ updates change only
+the measured translation mean, not orientation through covariance cross terms.
+The first-order covariance bound retains all cross terms and assumes no
+independence: `2[(I-KH)P(I-KH)^T + KRK^T]`. It is not a calibrated uncertainty
+claim, optimal fusion, a FixedLag substitute or a new trusted default.
+`native_lio_replay --diagnostic-fixed-gain` selects this policy explicitly and
+writes `global_mean_policy.csv`; without the flag, the existing CI path is
+unchanged. Source admission, ODOM isolation and full-pose freshness remain
+separate requirements.
 `FixedLagAlignmentConfig::allow_uncalibrated_inputs` explicitly admits declared
 sufficient but uncalibrated models into this same graph. Its default is false.
 Quality, stochastic-model validity, source dependencies and conditional
@@ -245,17 +265,39 @@ env -u LD_LIBRARY_PATH python3 test/integration/map/evaluate_localization_scenar
 
 Run in the mapped-user managed container. Output must be new; it includes
 source/runtime pins, per-source terminal decisions, pre-update residual/NIS,
-freshness/trust, JSON and HTML. The current matrix has 14 functional scenarios,
-336 state rows, 498 observation outcomes and 386 recomputed NIS samples.
+freshness/trust, JSON and HTML. The current graph matrix has 23 functional
+scenarios, 1,026 state rows and 1,165 recomputed NIS samples. The original S01-S15
+remain functional regressions; W01-W03 add 1.5/3/15 s absolute-source loss
+around a 3 s window, and R01/R00 compare a 15 s rejected GNSS burst with its
+omitted-source control. Their poses and full alignment covariances match.
+Three long map-loss cases retain GNSS XY for 30/60/120 s, then require actual
+map commits and renewed full-pose freshness. Public API regressions separately
+check analytically derived covariance-bound growth and recovery after 120 s of
+accepted 0.1 m GNSS bias. These are not general accepted-fault robustness proofs.
+Public full-pose freshness now preserves the committed integer measurement
+time, including the lease's -1/0/+1 ns boundary, without partial-source renewal.
+S15 freezes field-derived sparse map/GNSS availability, not real
+measurement noise or front-end geometry.
 GNSS XY-only cold start deliberately reports **no full pose**, not zero error
 or a successful localization result; refusal of unobservable startup is correct
 behavior, not itself a functional failure. The
-[factor/scenario report](.agents/notes/factor_scenario_principles_20261028_v2/index.html)
+[current synthetic report](.agents/notes/synthetic_production_gate_20261029_v2/scenes/index.html)
 also includes known local drift during joint absolute-source loss: increasing
 error is accepted when degradation, ODOM isolation and source recovery match
 the contract. Coverage records observed node intervals, dimensions and delays,
 not a guarantee over untested ranges or real field data. Real-record FixedLag and robust
 indoor/outdoor product acceptance remain open.
+
+The [field-state report](.agents/notes/field_state_matrix_20261028_v1/final/index.html)
+contains four captures and 16 source-ablation replay arms. The ChengTou 180 s
+diagnostic combination has a **990.55 m** peak paired GNSS discrepancy
+(same-source consistency, not independent truth). D01 separately exercises
+`DiagnosticGlobalAlignment` with correlated positive-definite bounds and a
+small rotation residual: an accepted, fresh correction can amplify translation.
+Its passing characterization regression does **not** establish acceptable
+accuracy. The actual large correction is reconstructed from logged covariance
+and residual to about 1e-11 m; it is not explained by normal joint-source loss.
+No online gains, gates or covariance policy were changed.
 
 ## Build and tests
 
@@ -647,7 +689,7 @@ truncation from violating exact constraints. Lag, solve budget, maximum
 iterations, source gates and the 1e-6 feasibility tolerance are unchanged.
 `retained_relinearizations` makes this work visible in evaluation CSV/JSON.
 
-The matched 8-node/5 s and 12-node/60 s experiments now each complete all 640
+The earlier matched 8-node/5 s and 12-node/60 s experiments each completed all 640
 trials; the old failures remain frozen evidence. Regression includes both
 previously failing no-eviction seeds and a turning/shared-source/dimension-change
 case that failed before the repair. Correctly modeled semi-synthetic errors
@@ -655,6 +697,34 @@ show no detected mean-NEES inconsistency in these experiments; deliberately
 unmodeled correlation remains inconsistent. Neither establishes calibration
 or real-record FixedLag acceptance. See the
 [current graph diagnostics](.agents/notes/goal_graph_20261028_v1/validation/index.html).
+
+The current evaluator adds overconfident/conservative observation-covariance
+arms to those five correlation models. It verifies the same sampled errors
+with declared map/GNSS variance scaled by .25/1/4, using `generated.csv`;
+local covariance is unchanged. The frozen 8-node, 128-seed, 5/60 s study has
+1,792 successful runs, paired across models and windows, not 1,792 independent
+samples. Mean NEES at 5 s is 6.1223 for matched independent noise, 19.4024 for
+the overconfident declaration and 2.8338 for the conservative one. Lower-tail
+conservatism is distinguished from overconfidence, not automatically a bug.
+See the [statistical report](.agents/notes/window_covariance_matrix_20261029_v2/statistics_lag5/index.html)
+and the canonical plan's 18-mode classification for executed and still-missing
+coverage. These fixed-admission synthetic trials do not qualify production
+robustness, native input capacity or field accuracy.
+
+Use `--map-loss BEGIN_S END_S` with `evaluate_fixed_lag.py` to omit map
+submissions in a source-relative half-open interval while keeping GNSS.
+All map noises are still sampled/journaled, including omitted observations,
+so changing availability does not change the paired random sequence.
+`admission_schedule.json` independently checks every submitted source/node;
+an interval that never triggers cannot pass.
+The [long-loss study](.agents/notes/synthetic_production_gate_20261029_v2/verification.json)
+uses 24 nodes over 170.35 s, 15 s lag, seven models and 128 paired seeds for
+each of two schedules: no map return before the endpoint, and return after
+120 s loss. Correctly modeled mean NEES lies inside the simultaneous six-test
+reference interval; misspecified correlation/variance controls trigger.
+This remains a fixed-admission synthetic study, not online fault detection or
+production qualification. The diagnostic fixed-half exponential-bound failure,
+native model/capacity, full fault-mode coverage and product budgets remain open.
 
 For source exclusion, native replay accepts
 `--global-map-holdout START_NS STOP_NS` with an explicit diagnostic map. It

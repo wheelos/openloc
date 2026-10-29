@@ -6,9 +6,14 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <limits>
 #include <map>
 
 #include "gtest/gtest.h"
+
+#include "Eigen/Eigenvalues"
+#include "Eigen/SVD"
+#include "candidates/local/local_motion.h"
 
 namespace openloc {
 namespace localization {
@@ -252,6 +257,93 @@ TEST(LocalLioGeometryTest, StoredPlaneErrorRetainsSupportAndOriginalNoiseReuse) 
   };
   const auto nominal = select_plane(errors);
   ASSERT_EQ(nominal.points.size(), scan.points.size() / 2);
+  const auto check_moment_queries = [&scan](const std::vector<StoredPlaneError>&
+                                                planes) {
+    const Eigen::Index drivers = 9 * scan.points.size() + 6;
+    std::vector<Eigen::MatrixXd> direct, reduced;
+    for (const auto& plane : planes) {
+      Eigen::MatrixXd point_query = Eigen::MatrixXd::Zero(6, drivers);
+      std::map<uint64_t, Eigen::MatrixXd> scan_moments;
+      Eigen::Matrix3d second = Eigen::Matrix3d::Zero();
+      Eigen::MatrixXd one_point;
+      for (const auto& point : plane.points) {
+        Eigen::MatrixXd loading = Eigen::MatrixXd::Zero(3, drivers);
+        loading.block<3, 3>(
+            0, 3 * ((point.source_sequence - 1) * scan.points.size() +
+                    point.point_index)) = 0.02 * Eigen::Matrix3d::Identity();
+        loading.rightCols<6>().leftCols<3>() =
+            0.01 * Eigen::Matrix3d::Identity();
+        loading.rightCols<3>() = -0.005 * Skew(point.point);
+        one_point = loading;
+        Eigen::Matrix<double, 9, 3> derivative =
+            Eigen::Matrix<double, 9, 3>::Zero();
+        derivative.topRows<3>().setIdentity();
+        const auto& p = point.point;
+        derivative.row(3) << 2 * p.x(), 0, 0;
+        derivative.row(4) << p.y(), p.x(), 0;
+        derivative.row(5) << p.z(), 0, p.x();
+        derivative.row(6) << 0, 2 * p.y(), 0;
+        derivative.row(7) << 0, p.z(), p.y();
+        derivative.row(8) << 0, 0, 2 * p.z();
+        auto& moments = scan_moments[point.source_sequence];
+        if (moments.size() == 0) moments = Eigen::MatrixXd::Zero(9, drivers);
+        moments += derivative * loading;
+        point_query.topRows<3>() += point.center * loading;
+        point_query.bottomRows<3>() += point.normal * loading;
+        second += p * p.transpose();
+      }
+      const double count = plane.points.size();
+      const Eigen::Matrix3d covariance =
+          second / count - plane.center * plane.center.transpose();
+      const Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> spectrum(covariance);
+      EXPECT_EQ(spectrum.info(), Eigen::Success);
+      Eigen::Matrix<double, 6, 9> projection =
+          Eigen::Matrix<double, 6, 9>::Zero();
+      projection.topLeftCorner<3, 3>() = Eigen::Matrix3d::Identity() / count;
+      for (int column = 0; column < 9; ++column) {
+        Eigen::Vector3d center = Eigen::Vector3d::Zero();
+        Eigen::Matrix3d change = Eigen::Matrix3d::Zero();
+        if (column < 3) {
+          center[column] = 1 / count;
+        } else {
+          constexpr int row[] = {0, 0, 0, 1, 1, 2};
+          constexpr int col[] = {0, 1, 2, 1, 2, 2};
+          change(row[column - 3], col[column - 3]) = 1 / count;
+          change(col[column - 3], row[column - 3]) = 1 / count;
+        }
+        change -= center * plane.center.transpose() +
+                  plane.center * center.transpose();
+        for (int axis = 1; axis < 3; ++axis) {
+          const Eigen::Vector3d direction = spectrum.eigenvectors().col(axis);
+          projection.block<3, 1>(3, column) +=
+              direction *
+              (direction.dot(change * plane.normal) /
+               (spectrum.eigenvalues()[0] - spectrum.eigenvalues()[axis]));
+        }
+      }
+      Eigen::MatrixXd moments = Eigen::MatrixXd::Zero(9, drivers);
+      for (const auto& retained : scan_moments) moments += retained.second;
+      const Eigen::MatrixXd compressed = projection * moments;
+      EXPECT_TRUE(compressed.isApprox(point_query, 1e-12));
+      direct.push_back(point_query);
+      reduced.push_back(compressed);
+
+      // Plane moments do not retain arbitrary future raw-point queries.
+      const Eigen::JacobiSVD<Eigen::MatrixXd> support(moments,
+                                                      Eigen::ComputeThinV);
+      const auto basis = support.matrixV().leftCols(support.rank()).eval();
+      const Eigen::MatrixXd missing =
+          one_point - one_point * basis * basis.transpose();
+      EXPECT_GT(missing.norm(),
+                64 * std::numeric_limits<double>::epsilon() * one_point.norm());
+    }
+    for (std::size_t first = 0; first < direct.size(); ++first)
+      for (std::size_t last = 0; last < direct.size(); ++last)
+        EXPECT_TRUE(
+            (direct[first] * direct[last].transpose())
+                .isApprox(reduced[first] * reduced[last].transpose(), 1e-12));
+  };
+  check_moment_queries(errors);
   Eigen::Matrix3d center_sum = Eigen::Matrix3d::Zero();
   Eigen::Matrix3d normal_sum = Eigen::Matrix3d::Zero();
   Eigen::Matrix<double, 3, 15> center_anchor =
@@ -316,6 +408,7 @@ TEST(LocalLioGeometryTest, StoredPlaneErrorRetainsSupportAndOriginalNoiseReuse) 
   std::map<uint64_t, LocalState> anchors;
   ASSERT_TRUE(lio.GeometryErrorMap(&errors, &anchors).ok());
   ASSERT_EQ(errors.size(), 2);
+  check_moment_queries(errors);
   EXPECT_EQ(anchors.size(), 2);
   EXPECT_EQ(anchors.count(1), 0);
   EXPECT_EQ(anchors.count(2), 1);
@@ -471,7 +564,7 @@ TEST(LocalLioGeometryTest, CorridorDoesNotCreateLongitudinalInformation) {
 
 TEST(LocalLioGeometryTest, RelinearizationDoesNotReapplyTheSamePlanarObservation) {
   const Epoch epoch{"session", 1};
-  const auto estimate = [&epoch](uint32_t iterations) {
+  const auto estimate = [&epoch](uint32_t iterations, bool use_factor = false) {
     LocalConfig config = LioConfig();
     config.lidar_min_correspondences = 10;
     config.lidar_max_update_iterations = iterations;
@@ -482,6 +575,11 @@ TEST(LocalLioGeometryTest, RelinearizationDoesNotReapplyTheSamePlanarObservation
     // translation/velocity observation with an unchanged plane association.
     state.covariance.block<3, 3>(6, 6) *= 1e-10;
     state.covariance(0, 3) = state.covariance(3, 0) = 0.002;
+    if (use_factor) {
+      EXPECT_TRUE(AdvanceCovarianceSquareRoot(state, Matrix15d::Identity(),
+                                              Matrix15d::Zero(), &state)
+                      .ok());
+    }
     LidarScan scan;
     scan.stamp = state.stamp;
     scan.epoch = epoch;
@@ -516,6 +614,14 @@ TEST(LocalLioGeometryTest, RelinearizationDoesNotReapplyTheSamePlanarObservation
   EXPECT_NEAR(iterated.position.x(), once.position.x(), 1e-10);
   EXPECT_NEAR(iterated.velocity.x(), once.velocity.x(), 1e-10);
   EXPECT_TRUE(iterated.covariance.isApprox(once.covariance, 1e-10));
+  for (const uint32_t iterations : {1U, 5U}) {
+    const auto factored = estimate(iterations, true);
+    EXPECT_TRUE(factored.covariance_square_root);
+    EXPECT_TRUE(ValidLocalCovariance(factored));
+    EXPECT_TRUE(factored.position.isApprox(iterated.position, 1e-10));
+    EXPECT_TRUE(factored.covariance.isApprox(iterated.covariance, 1e-10));
+    EXPECT_FALSE(factored.covariance_model_valid);
+  }
 }
 
 TEST(LocalLioGeometryTest, LargeAnchorUncertaintyDoesNotErasePlanarGeometry) {
