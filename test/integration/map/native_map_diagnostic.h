@@ -61,16 +61,22 @@ class NativeMapDiagnostic {
                       NativeGlobalOdometryFault odometry_fault = {},
                       std::pair<int64_t, int64_t> map_holdout = {},
                       bool profile_map_timing = false,
-                      bool fixed_gain_update = false)
+                      bool fixed_gain_update = false,
+                      bool structured_closure = false)
       : matches_(output / "map.csv"),
         global_(output / "global.csv"),
         decisions_(output / "global_decisions.csv"),
+        measurements_(output / "graph_measurements.csv"),
         odometry_fault_(std::move(odometry_fault)),
         admission_(output / "global_admission.csv"),
         holdback_ns_(holdback_ns),
         async_recovery_(async_recovery),
         map_holdout_(map_holdout) {
     namespace loc = localization;
+    measurements_ << std::setprecision(17)
+                  << "kind,timestamp_ns,receive_ns,sequence,px,py,pz,qx,qy,qz,qw,"
+                     "projection,covariance,lever_x,lever_y,lever_z,ambiguous\n";
+    if (!measurements_) throw std::runtime_error("cannot open measurement journal");
     if (level_odom_gnss_bootstrap && gnss_bundle.empty())
       throw std::runtime_error("horizontal bootstrap requires GNSS input");
     if (odometry_fault_.kind != NativeGlobalOdometryFault::Kind::kNone &&
@@ -184,6 +190,8 @@ class NativeMapDiagnostic {
       matcher_config.enable_icp_profiling = profile_map_timing;
       matcher_config.algorithm =
           loc::map::ScanMatchingAlgorithm::kPointToPlaneIcp;
+      matcher_config.retain_joint_error_support = structured_closure;
+      matcher_config.condition_on_fixed_target = structured_closure;
       const auto window =
           ReadRows((bundle / "window.csv").string(), "radius_m,cell_size_m", 2);
       if (window.size() != 1)
@@ -633,6 +641,56 @@ class NativeMapDiagnostic {
 
   bool initialized() const { return alignment_initialized_; }
 
+  const localization::DiagnosticAlignmentConfig& configuration() const {
+    return config_;
+  }
+
+  localization::map::ScanToMapResult MatchStructured(
+      const localization::unified::StructuredLidarScan& scan, int64_t stamp) {
+    namespace u = localization::unified;
+    if (!matcher_ || causal_search_ || !scan.conditioning_state.state.valid)
+      throw std::runtime_error("structured closure requires a fixed prior-map seed");
+    const auto& current = scan.conditioning_state;
+    if (!structured_seed_) {
+      if (seed_reference_ns_ == 0 ||
+          std::abs(stamp - seed_reference_ns_) > seed_maximum_offset_ns_)
+        throw std::runtime_error("structured map seed reference outside tolerance");
+      structured_seed_ = current;
+      map_from_odom_ = seed_ * u::Pose(current.state).inverse();
+    }
+    localization::map::ScanToMapRequest request;
+    request.timestamp_ns = stamp;
+    request.clock_domain = "unix";
+    request.cloud_frame = config_.base_frame.value;
+    request.deskewed = true;
+    request.structured_scan = &scan;
+    request.map_from_base_initial = map_from_odom_ * u::Pose(current.state);
+    Eigen::Matrix<double, 6, 15> first =
+        Eigen::Matrix<double, 6, 15>::Zero(), last = first;
+    const auto& initial = structured_seed_->state;
+    first.topLeftCorner<3, 3>() = -map_from_odom_.linear();
+    first.block<3, 3>(0, 6) =
+        seed_.linear() *
+        u::Skew(initial.orientation.conjugate() *
+                (current.state.position - initial.position));
+    first.block<3, 3>(3, 6) = -seed_.linear();
+    last.topLeftCorner<3, 3>() = map_from_odom_.linear();
+    last.block<3, 3>(3, 6) = request.map_from_base_initial.linear();
+    // The configuration seed is fixed at the first scan, not an independent
+    // stochastic map/odom alignment. Later seeds reuse BOTH native endpoints.
+    request.initial_structured_error = u::JointErrorExpression::Combine(
+        6, {{first, structured_seed_->output_error}, {last, current.output_error}});
+    return matcher_->Match(request);
+  }
+
+  template <class Submit>
+  void DrainStructuredGnss(int64_t receive, Submit submit, bool available) {
+    if (!gnss_) throw std::runtime_error("structured closure requires prepared GNSS");
+    gnss_->Drain(receive, std::move(submit), available);
+  }
+
+  void FinishStructuredGnss() { gnss_->Finish(); }
+
  private:
   Eigen::Vector2d GlobalOdometryOffset(int64_t stamp) const {
     if (odometry_fault_.kind == NativeGlobalOdometryFault::Kind::kNone ||
@@ -745,6 +803,7 @@ class NativeMapDiagnostic {
 
   template <class T>
   localization::Status SubmitGlobal(T observation, int64_t receive) {
+    WriteMeasurement(observation);
     const auto& context = observation.context;
     // Keep the owner's validation for future-on-arrival inputs; the holdback
     // must not launder an invalid future measurement into a valid past one.
@@ -764,6 +823,48 @@ class NativeMapDiagnostic {
     pending_.insert(position, {context, std::move(observation), receive});
     return {localization::StatusCode::kPending,
             "retained in bounded diagnostic global holdback"};
+  }
+
+  void WriteMeasurement(const localization::GlobalMapObservation& observation) {
+    const bool full =
+        observation.kind == localization::GlobalMapObservation::Kind::kFullPose;
+    WriteMeasurementContext(full ? "map" : "projected_map", observation.context);
+    const auto& pose = observation.map_from_base;
+    measurements_ << ',' << pose.translation.x() << ',' << pose.translation.y()
+                  << ',' << pose.translation.z() << ',' << pose.rotation.x()
+                  << ',' << pose.rotation.y() << ',' << pose.rotation.z()
+                  << ',' << pose.rotation.w() << ',';
+    measurements_ << Flatten(full ? Eigen::MatrixXd(Eigen::Matrix<double, 6, 6>::Identity())
+                                  : observation.projection)
+                  << ','
+                  << Flatten(full ? Eigen::MatrixXd(observation.covariance)
+                                  : observation.projected_covariance)
+                  << ",0,0,0," << observation.ambiguous << '\n';
+    FlushMeasurements();
+  }
+
+  void WriteMeasurement(
+      const localization::GlobalHorizontalObservation& observation) {
+    WriteMeasurementContext("gnss", observation.context);
+    measurements_ << ',' << observation.position.x() << ','
+                  << observation.position.y() << ",0,0,0,0,1,"
+                  << Flatten(Eigen::Matrix2d::Identity()) << ','
+                  << Flatten(observation.covariance);
+    for (int axis = 0; axis < 3; ++axis)
+      measurements_ << ',' << observation.point_in_base[axis];
+    measurements_ << ",0\n";
+    FlushMeasurements();
+  }
+
+  void WriteMeasurementContext(
+      const char* kind, const localization::GlobalObservationContext& context) {
+    measurements_ << kind << ',' << context.measurement_time.nanoseconds << ','
+                  << context.receive_time.nanoseconds << ',' << context.sequence;
+  }
+
+  void FlushMeasurements() {
+    measurements_.flush();
+    if (!measurements_) throw std::runtime_error("incomplete measurement journal");
   }
 
   void WriteAdmission(const localization::GlobalObservationContext& context,
@@ -898,6 +999,7 @@ class NativeMapDiagnostic {
   std::deque<Pending> pending_;
   std::unique_ptr<localization::map::ScanToMapLocalizer> matcher_;
   std::unique_ptr<NativeGnssDiagnostic> gnss_;
+  std::optional<localization::unified::StructuredLocalState> structured_seed_;
   std::deque<localization::unified::LocalState> history_;
   Eigen::Isometry3d seed_ = Eigen::Isometry3d::Identity();
   Eigen::Isometry3d map_from_odom_ = Eigen::Isometry3d::Identity();
@@ -907,6 +1009,7 @@ class NativeMapDiagnostic {
   int64_t last_odom_stamp_ = 0;
   int64_t seed_reference_ns_ = 0, seed_maximum_offset_ns_ = 0;
   std::ofstream matches_, global_, decisions_, seed_evidence_, horizontal_;
+  std::ofstream measurements_;
   std::ofstream odometry_injection_;
   std::ofstream map_profile_;
   NativeGlobalOdometryFault odometry_fault_;

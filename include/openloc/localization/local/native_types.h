@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -60,6 +61,36 @@ struct Result {
   Reason reason = Reason::NONE;
   std::string message;
   bool ok() const { return reason == Reason::NONE; }
+};
+
+// Immutable linear errors over shared primitive identities. Copies and affine
+// combinations preserve identity; covariance queries never invent independence.
+class JointErrorExpression {
+ public:
+  struct Term;
+  JointErrorExpression() = default;
+  static JointErrorExpression Primitive(
+      const std::shared_ptr<const int>& identity, const Eigen::MatrixXd& root);
+  static JointErrorExpression Combine(Eigen::Index rows,
+                                      const std::vector<Term>& terms);
+  Eigen::Index rows() const;
+  bool valid() const { return static_cast<bool>(node_); }
+  Result CrossCovariance(const JointErrorExpression& other,
+                         Eigen::MatrixXd* covariance) const;
+  Result Covariance(Eigen::MatrixXd* covariance) const {
+    return CrossCovariance(*this, covariance);
+  }
+
+ private:
+  struct Node;
+  explicit JointErrorExpression(std::shared_ptr<const Node> node)
+      : node_(std::move(node)) {}
+  std::shared_ptr<const Node> node_;
+};
+
+struct JointErrorExpression::Term {
+  Eigen::MatrixXd coefficient;
+  JointErrorExpression error;
 };
 
 struct Stamp {
@@ -154,6 +185,33 @@ struct JointLidarScan {
   std::vector<Eigen::MatrixXd> point_jacobians;
 };
 
+// Source-aware query snapshot, deliberately not a finite Markov/sufficient
+// dense joint state. Dense graph/transport APIs must not accept this type.
+struct StructuredLocalState {
+  LocalState state;
+  JointErrorExpression output_error;
+};
+
+// Owner-local observations, not allocated-byte estimates or model qualification.
+struct NativeStructuredResourceUsage {
+  uint64_t primitive_sources = 0;
+  uint64_t primitive_rows = 0;
+  uint64_t memory_keys = 0;
+  uint64_t snapshots = 0;
+  uint64_t publish_queries = 0;
+  double publish_query_ms = 0;
+  uint64_t retired_registry_sources = 0;
+  uint64_t retired_registry_rows = 0;
+};
+
+struct StructuredLidarScan {
+  StructuredLocalState conditioning_state;
+  Stamp reference;
+  uint64_t lidar_revision = 0;
+  std::vector<Eigen::Vector3d> points_in_reference_base;
+  std::vector<JointErrorExpression> point_errors;
+};
+
 struct MotionIncrement {
   Epoch epoch;
   Stamp start;
@@ -220,6 +278,20 @@ struct LidarDeskewErrorMap {
   uint64_t lidar_revision = 0;
   std::vector<LidarDeskewHistoryState> history;
   std::vector<LidarDeskewPointError> points;
+};
+
+// Read-only PRE-update query support, not a graph motion model or a retained
+// corrected scan. Shared loadings use one unit-covariance native memory basis.
+// Each raw point adds its own independent 3D error with raw_point_variance;
+// reuse across queries must preserve (epoch, scan sequence, point index).
+// Basis coordinates are snapshot-local; do not combine separate exports.
+// Finite query covariance does not establish a sufficient temporal state.
+struct JointLidarInputErrorMap {
+  LidarDeskewErrorMap deskew;
+  Eigen::MatrixXd internal_loading;
+  Eigen::MatrixXd output_loading;
+  std::vector<Eigen::MatrixXd> history_loadings;
+  double raw_point_variance = 0.0;
 };
 
 struct StoredPlanePointError {
@@ -355,6 +427,12 @@ struct LocalConfig {
   // Opt-in, uncalibrated frozen-linearization stochastic observer. It never
   // replaces the nominal owner's diagnostic covariance or source decisions.
   bool enable_native_joint_error = false;
+  // Exact source-aware native queries; dense graph export remains unsupported.
+  // Requires enable_native_joint_error. Limits on dense matrices stay intact.
+  // Primitive storage is separately bounded by the configured scan capacities
+  // (3 * lidar_max_points * lidar_max_scans) and IMU history (12 *
+  // max_history_states). Exhaustion rejects without retiring needed sources.
+  bool enable_native_structured_error = false;
   uint32_t native_joint_max_dimension = 256;
   uint32_t native_joint_max_memory_rows = 4096;
   uint32_t native_joint_max_snapshots = 64;

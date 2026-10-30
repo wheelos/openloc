@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License");
 
 #include "candidates/local/native_joint_error.h"
+#include "candidates/local/bounded_joint_error.h"
 
 #include <limits>
 
@@ -432,6 +433,327 @@ TEST(NativeJointErrorTest, DelayedBranchesShareDriversAndPinRetiredDependencies)
   const auto exported = live.MotionBetween(1, 3, &motion);
   ASSERT_TRUE(exported.ok()) << exported.message;
   EXPECT_NEAR(motion.cross_covariance(3, 3), 1, 1e-12);
+}
+
+TEST(NativeJointErrorTest, StructuredQueriesPreserveHiddenTemporalPointReuse) {
+  LocalConfig config;
+  config.enable_native_joint_error = true;
+  config.enable_native_structured_error = true;
+  NativeJointError model(config);
+  auto state = Initial();
+  model.Initialize(state);
+  model.Independent("point:a", Eigen::Matrix3d::Identity(), "lidar:1:0");
+  model.Independent("point:b", Eigen::Matrix3d::Identity(), "lidar:1:1");
+  const auto original = model.Error("point:a");
+  Eigen::Matrix<double, 18, 15> internal =
+      Eigen::Matrix<double, 18, 15>::Zero();
+  internal.topRows(15).setIdentity();
+  Eigen::Matrix<double, 18, 3> point =
+      Eigen::Matrix<double, 18, 3>::Zero();
+  point(0, 0) = 1;
+  for (int step = 0; step < 3; ++step) {
+    std::vector<NativeJointError::LinearTerm> terms{{internal, "internal"}};
+    if (step != 1) terms.push_back({point, "point:a"});
+    if (step != 0) terms.push_back({point, "point:b"});
+    model.Linear("output", terms);
+    state.stamp = {1.0 + step, 1.0 + step, uint64_t(1 + step), "unix"};
+    model.Publish(state, step == 0
+                             ? std::vector<SourceSampleId>{{"imu", 1}}
+                             : std::vector<SourceSampleId>{
+                                   {"imu", uint64_t(step)},
+                                   {"imu", uint64_t(step + 1)}});
+    ASSERT_TRUE(model.active()) << model.status().message;
+  }
+  MotionIncrement first, second, whole;
+  ASSERT_TRUE(model.StructuredMotionBetween(1, 2, &first).ok());
+  ASSERT_TRUE(model.StructuredMotionBetween(2, 3, &second).ok());
+  ASSERT_TRUE(model.StructuredMotionBetween(1, 3, &whole).ok());
+  EXPECT_NEAR(whole.cross_covariance(0, 0), 2, 1e-12);
+  const Matrix15d false_markov =
+      first.cross_covariance *
+      first.end_covariance.llt().solve(second.cross_covariance);
+  EXPECT_NEAR(false_markov(0, 0), 1, 1e-12);
+  model.Retain({"internal", "output"});
+  StructuredLocalState retained;
+  ASSERT_TRUE(model.StructuredLookup(3, &retained).ok());
+  Eigen::MatrixXd cross;
+  ASSERT_TRUE(original.CrossCovariance(retained.output_error, &cross).ok());
+  EXPECT_NEAR(cross(0, 0), 1, 1e-12);
+  LocalState sentinel = Initial();
+  EXPECT_EQ(model.Lookup(3, &sentinel).reason, Reason::CORRELATION_UNQUALIFIED);
+  EXPECT_EQ(sentinel.stamp.time, 1);
+}
+
+TEST(NativeJointErrorTest, StructuredDelayedBranchesKeepOriginalSourceIdentity) {
+  LocalConfig config;
+  config.enable_native_joint_error = true;
+  config.enable_native_structured_error = true;
+  config.native_imu_sample_period = 1;
+  config.accel_noise = 1;
+  config.gyro_noise = config.gyro_bias_noise = config.accel_bias_noise = 0;
+  NativeJointError live(config);
+  auto state = Initial();
+  live.Initialize(state);
+  live.Publish(state, {});
+  const auto lease = live.PinFork();
+  NativeJointError candidate = live;
+  candidate.Independent("scan", Eigen::Matrix3d::Identity(), "lidar:1:0");
+  const auto original = candidate.Error("scan");
+  Eigen::Matrix<double, 15, 3> scan =
+      Eigen::Matrix<double, 15, 3>::Zero();
+  scan.middleRows(3, 3).setIdentity();
+  candidate.Linear("internal",
+                   {{Matrix15d::Identity(), "internal"}, {scan, "scan"}});
+  ImuSample first, second;
+  first.stamp = state.stamp;
+  second.stamp = {2, 2, 2, "unix"};
+  Eigen::Matrix<double, 15, 6> input = Eigen::Matrix<double, 15, 6>::Zero();
+  input(3, 0) = 0.5;
+  state.stamp = second.stamp;
+  for (auto* branch : {&live, &candidate}) {
+    branch->BeginImu(first, second);
+    branch->AdvanceImu(Matrix15d::Identity(), input, input, 1, 2);
+    branch->CopyInternalToOutput();
+    branch->Retain({"internal", "output", "imu:last"});
+    branch->Publish(state, {{"imu", 1}, {"imu", 2}});
+    ASSERT_TRUE(branch->active()) << branch->status().message;
+  }
+  ASSERT_TRUE(live.SpliceCandidate(candidate, lease, 1).ok());
+  Eigen::MatrixXd output, corrected, cross, original_cross;
+  ASSERT_TRUE(live.Error("output").Covariance(&output).ok());
+  ASSERT_TRUE(live.Error("internal").Covariance(&corrected).ok());
+  ASSERT_TRUE(live.Error("internal")
+                  .CrossCovariance(live.Error("output"), &cross).ok());
+  ASSERT_TRUE(original.CrossCovariance(live.Error("internal"),
+                                        &original_cross).ok());
+  EXPECT_NEAR(output(3, 3), 1.5, 1e-12);
+  EXPECT_NEAR(corrected(3, 3), 2.5, 1e-12);
+  EXPECT_NEAR(cross(3, 3), 1.5, 1e-12);
+  EXPECT_NEAR(original_cross(0, 3), 1, 1e-12);
+}
+
+TEST(NativeJointErrorTest, StructuredSourceExhaustionDoesNotEvictQuerySupport) {
+  LocalConfig config;
+  config.enable_native_joint_error = true;
+  config.enable_native_structured_error = true;
+  config.max_history_states = 2;
+  NativeJointError model(config);
+  model.Initialize(Initial());
+  model.Publish(Initial(), {});
+  model.Independent("a", 2 * Eigen::Matrix3d::Identity(), "lidar:1:0");
+  const auto original = model.Error("a");
+  model.Independent("b", Eigen::Matrix3d::Identity(), "lidar:1:1");
+  model.Independent("c", Eigen::Matrix3d::Identity(), "lidar:1:2");
+  ASSERT_TRUE(model.active());
+  model.Independent("d", Eigen::Matrix<double, 1, 1>::Identity(), "lidar:1:3");
+  ASSERT_FALSE(model.active());
+  EXPECT_NE(model.status().message.find("source capacity exhausted"),
+            std::string::npos);
+  Eigen::MatrixXd covariance;
+  ASSERT_TRUE(original.Covariance(&covariance).ok());
+  EXPECT_TRUE(covariance.isApprox(2 * Eigen::Matrix3d::Identity(), 1e-12));
+  StructuredLocalState old;
+  ASSERT_TRUE(model.StructuredLookup(1, &old).ok());
+  EXPECT_TRUE(old.state.covariance.isApprox(Matrix15d::Identity(), 1e-12));
+}
+
+TEST(NativeJointErrorTest, ResourceObservationDistinguishesHistoryFromSourceLifetime) {
+  LocalConfig config;
+  config.enable_native_joint_error = true;
+  config.enable_native_structured_error = true;
+  config.native_joint_max_snapshots = 2;
+  NativeJointError model(config);
+  auto state = Initial();
+  model.Initialize(state);
+  const auto original = model.Error("internal");
+  for (int step = 0; step < 4; ++step) {
+    model.Independent("temporary", Eigen::Matrix3d::Identity(),
+                      "point:" + std::to_string(step));
+    model.Drop("temporary");
+    state.stamp.time = 1.0 + .01 * step;
+    model.Publish(state, {});
+    ASSERT_TRUE(model.active()) << model.status().message;
+  }
+  const auto usage = model.StructuredResourceUsage();
+  EXPECT_EQ(usage.snapshots, 2);
+  EXPECT_EQ(usage.primitive_sources, 5);
+  EXPECT_EQ(usage.primitive_rows, 27);
+  EXPECT_EQ(usage.memory_keys, 2);
+  EXPECT_EQ(usage.publish_queries, 4);
+  EXPECT_GE(usage.publish_query_ms, 0);
+  Eigen::MatrixXd covariance;
+  ASSERT_TRUE(original.Covariance(&covariance).ok());
+  EXPECT_TRUE(covariance.isApprox(Matrix15d::Identity(), 1e-12));
+  model.Reset();
+  EXPECT_EQ(model.StructuredResourceUsage().primitive_sources, 0);
+  EXPECT_EQ(model.StructuredResourceUsage().publish_queries, 0);
+  ASSERT_TRUE(original.Covariance(&covariance).ok());
+  EXPECT_TRUE(covariance.isApprox(Matrix15d::Identity(), 1e-12));
+}
+
+TEST(NativeJointErrorTest, RegistryReclaimsOnlySourcesWithNoExpressionOrForkHolder) {
+  LocalConfig config;
+  config.enable_native_joint_error = true;
+  config.enable_native_structured_error = true;
+  config.max_history_states = 2;
+  NativeJointError model(config);
+  model.Initialize(Initial());
+  NativeJointError replay = model;
+  model.Independent("pinned", 2 * Eigen::Matrix3d::Identity(), "pinned");
+  NativeJointError fork = model;
+  const auto pinned = fork.Error("pinned");
+  model.Drop("pinned");
+  for (int i = 0; i < 20; ++i) {
+    model.Independent("unused", Eigen::Matrix3d::Identity(), std::to_string(i));
+    ASSERT_TRUE(model.active()) << model.status().message;
+    model.Drop("unused");
+  }
+  const auto usage = model.StructuredResourceUsage();
+  EXPECT_LE(usage.primitive_rows, 24);
+  EXPECT_GT(usage.retired_registry_sources, 0);
+  Eigen::MatrixXd covariance;
+  ASSERT_TRUE(pinned.Covariance(&covariance).ok());
+  EXPECT_TRUE(covariance.isApprox(2 * Eigen::Matrix3d::Identity(), 1e-12));
+  replay.Independent("same-source", 2 * Eigen::Matrix3d::Identity(), "pinned");
+  ASSERT_TRUE(replay.active()) << replay.status().message;
+  Eigen::MatrixXd cross;
+  ASSERT_TRUE(pinned.CrossCovariance(replay.Error("same-source"), &cross).ok());
+  EXPECT_TRUE(cross.isApprox(2 * Eigen::Matrix3d::Identity(), 1e-12));
+}
+
+TEST(NativeJointErrorTest, SelfCovarianceMatchesDistinctQueryWithSharedPrimitivePaths) {
+  const auto identity = std::make_shared<const int>(0);
+  Eigen::Matrix<double, 3, 2> root;
+  root << 1, 2, -3, 4, .5, -.25;
+  const auto first = JointErrorExpression::Primitive(identity, root);
+  const auto reused = JointErrorExpression::Primitive(identity, 2 * root);
+  const auto independent = JointErrorExpression::Primitive(
+      std::make_shared<const int>(0), Eigen::Matrix2d::Identity());
+  Eigen::Matrix<double, 2, 3> a, b;
+  a << 1, 2, 0, -.5, .25, 2;
+  b << -1, 0, 3, 0, 2, -.25;
+  const auto query = JointErrorExpression::Combine(
+      2, {{a, first}, {b, reused}, {3 * Eigen::Matrix2d::Identity(), independent}});
+  const auto distinct = JointErrorExpression::Combine(
+      2, {{Eigen::Matrix2d::Identity(), query}});
+  const Eigen::Matrix2d loading = (a + 2 * b) * root;
+  const Eigen::Matrix2d expected =
+      loading * loading.transpose() + 9 * Eigen::Matrix2d::Identity();
+  Eigen::MatrixXd self, cross;
+  ASSERT_TRUE(query.Covariance(&self).ok());
+  ASSERT_TRUE(query.CrossCovariance(distinct, &cross).ok());
+  EXPECT_TRUE(self.isApprox(expected, 1e-12));
+  EXPECT_TRUE(cross.isApprox(expected, 1e-12));
+}
+
+TEST(NativeJointErrorTest, ExactZeroDerivativeDoesNotRetainAnUnusedPrimitive) {
+  auto identity = std::make_shared<const int>(0);
+  const std::weak_ptr<const int> unused = identity;
+  auto primitive = JointErrorExpression::Primitive(
+      identity, Eigen::Matrix3d::Identity());
+  const auto query = JointErrorExpression::Combine(
+      3, {{Eigen::Matrix3d::Zero(), primitive}});
+  primitive = {};
+  identity.reset();
+  EXPECT_TRUE(unused.expired());
+  Eigen::MatrixXd covariance;
+  ASSERT_TRUE(query.Covariance(&covariance).ok());
+  EXPECT_TRUE(covariance.isZero(0));
+}
+
+TEST(NativeJointErrorTest, ClosedFrontierPreservesReuseForksAndRetiredQueries) {
+  BoundedJointError frontier(30);
+  std::map<std::string, Eigen::MatrixXd> oracle;
+  Eigen::Index dimension = 0;
+  const Eigen::Matrix3d identity = Eigen::Matrix3d::Identity();
+  const auto independent = [&](const std::string& key, double scale) {
+    ASSERT_TRUE(frontier.Independent(key, scale * identity).ok());
+    for (auto& entry : oracle) {
+      entry.second.conservativeResize(Eigen::NoChange, dimension + 3);
+      entry.second.rightCols(3).setZero();
+    }
+    Eigen::MatrixXd next = Eigen::MatrixXd::Zero(3, dimension + 3);
+    next.rightCols(3) = scale * identity;
+    dimension += 3;
+    oracle[key] = std::move(next);
+  };
+  const auto linear = [&](const std::string& key,
+                          const std::vector<BoundedJointError::Term>& terms) {
+    ASSERT_TRUE(frontier.Linear(key, terms).ok());
+    Eigen::MatrixXd next = Eigen::MatrixXd::Zero(3, dimension);
+    for (const auto& term : terms)
+      next.noalias() += term.coefficient * oracle.at(term.key);
+    oracle[key] = std::move(next);
+  };
+  independent("state", 1);
+  independent("point", 0.2);
+  linear("held", {{identity, "state"}});
+  for (int step = 0; step < 1000; ++step) {
+    SCOPED_TRACE(step);
+    independent("noise", 0.01);
+    linear("state", {{0.99 * identity, "state"},
+                     {0.02 * identity, "point"}, {identity, "noise"}});
+    // Both branches reuse exactly the same sampled driver, not independent
+    // reinsertions. Pins also stand for previously published query handles.
+    if (step % 10 == 0 || step % 10 == 6)
+      linear("fork", {{identity, "state"}});
+    if (oracle.count("fork"))
+      linear("fork", {{identity, "fork"}, {0.5 * identity, "noise"}});
+    if (step % 10 == 4) {
+      ASSERT_EQ(oracle.count("fork"), 1);
+      linear("state", {{0.7 * identity, "state"}, {0.3 * identity, "fork"}});
+      oracle.erase("fork");
+    }
+    if (step % 10 == 8) {
+      ASSERT_EQ(oracle.count("fork"), 1);
+      oracle.erase("fork");  // discarded task
+    }
+    oracle.erase("noise");
+    if (step % 7 == 6) {
+      oracle.erase("point");
+      std::vector<std::string> keep;
+      for (const auto& entry : oracle) keep.push_back(entry.first);
+      ASSERT_TRUE(frontier.Retain(keep).ok());
+      ASSERT_TRUE(frontier.Compact().ok());
+      independent("point", 0.2);
+    }
+    std::vector<std::string> keep;
+    for (const auto& entry : oracle) keep.push_back(entry.first);
+    ASSERT_TRUE(frontier.Retain(keep).ok());
+    ASSERT_TRUE(frontier.Compact().ok());
+    EXPECT_LE(frontier.rows(), 12);
+    EXPECT_LE(frontier.dimension(), 12);
+    for (const auto& a : oracle)
+      for (const auto& b : oracle) {
+        Eigen::MatrixXd covariance;
+        ASSERT_TRUE(frontier.CrossCovariance(a.first, b.first, &covariance).ok());
+        const Eigen::MatrixXd expected = a.second * b.second.transpose();
+        EXPECT_LE((covariance - expected).norm(),
+                  1e-10 * std::max(1.0, expected.norm()));
+      }
+  }
+}
+
+TEST(NativeJointErrorTest, ClosedFrontierKeepsWeakSingularDirectionsAndFailsClosed) {
+  BoundedJointError frontier(9);
+  Eigen::Matrix3d root = Eigen::Matrix3d::Zero();
+  root(0, 0) = 1;
+  root(1, 1) = 1e-12;
+  ASSERT_TRUE(frontier.Independent("state", root).ok());
+  ASSERT_TRUE(frontier.Independent("retired", Eigen::Matrix3d::Identity()).ok());
+  ASSERT_TRUE(frontier.Retain({"state"}).ok());
+  ASSERT_TRUE(frontier.Compact().ok());
+  Eigen::MatrixXd covariance;
+  ASSERT_TRUE(frontier.CrossCovariance("state", "state", &covariance).ok());
+  EXPECT_DOUBLE_EQ(covariance(0, 0), 1);
+  EXPECT_NEAR(covariance(1, 1), 1e-24, 1e-38);
+  EXPECT_DOUBLE_EQ(covariance(2, 2), 0);
+  EXPECT_FALSE(frontier.Independent("too_large", Eigen::MatrixXd::Identity(7, 7)).ok());
+  EXPECT_FALSE(frontier.Retain({"missing"}).ok());
+  EXPECT_FALSE(frontier.Linear("state", {{root, "retired"}}).ok());
+  Eigen::MatrixXd unchanged;
+  ASSERT_TRUE(frontier.CrossCovariance("state", "state", &unchanged).ok());
+  EXPECT_TRUE(unchanged.isApprox(covariance, 0));
 }
 
 }  // namespace

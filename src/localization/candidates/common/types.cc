@@ -4,7 +4,9 @@
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
 
+#include <algorithm>
 #include <cmath>
+#include <set>
 
 #include "Eigen/Cholesky"
 #include "openloc/localization/local/native_types.h"
@@ -12,6 +14,112 @@
 namespace openloc {
 namespace localization {
 namespace unified {
+
+struct JointErrorExpression::Node {
+  Eigen::Index rows;
+  std::shared_ptr<const int> primitive;
+  Eigen::MatrixXd root;
+  std::vector<Term> terms;
+};
+
+JointErrorExpression JointErrorExpression::Primitive(
+    const std::shared_ptr<const int>& identity, const Eigen::MatrixXd& root) {
+  if (!identity || root.rows() == 0 || !root.allFinite()) return {};
+  auto node = std::make_shared<Node>();
+  node->rows = root.rows();
+  node->primitive = identity;
+  node->root = root;
+  return JointErrorExpression(std::move(node));
+}
+
+JointErrorExpression JointErrorExpression::Combine(
+    Eigen::Index rows, const std::vector<Term>& terms) {
+  if (rows <= 0 || terms.empty()) return {};
+  auto node = std::make_shared<Node>();
+  node->rows = rows;
+  for (const auto& term : terms) {
+    if (!term.error.valid() || term.coefficient.rows() != rows ||
+        term.coefficient.cols() != term.error.rows() ||
+        !term.coefficient.allFinite())
+      return {};
+    if (term.coefficient.isZero(0)) continue;
+    node->terms.push_back(term);
+  }
+  return JointErrorExpression(std::move(node));
+}
+
+Eigen::Index JointErrorExpression::rows() const {
+  return node_ ? node_->rows : 0;
+}
+
+Result JointErrorExpression::CrossCovariance(
+    const JointErrorExpression& other, Eigen::MatrixXd* covariance) const {
+  if (!covariance || !valid() || !other.valid())
+    return {Reason::INVALID_INPUT, "Invalid structured error covariance query"};
+  // Iterative postorder handles shared DAG nodes once and avoids recursive
+  // traversal of long sampled-IMU histories.
+  std::vector<std::pair<std::shared_ptr<const Node>, bool>> pending{
+      {node_, false}, {other.node_, false}};
+  std::set<const Node*> visited;
+  std::vector<std::shared_ptr<const Node>> order;
+  while (!pending.empty()) {
+    auto item = std::move(pending.back());
+    pending.pop_back();
+    if (item.second) {
+      order.push_back(std::move(item.first));
+      continue;
+    }
+    if (!visited.insert(item.first.get()).second) continue;
+    pending.emplace_back(item.first, true);
+    for (const auto& term : item.first->terms)
+      pending.emplace_back(term.error.node_, false);
+  }
+  const bool self = node_ == other.node_;
+  const Eigen::Index total = self ? rows() : rows() + other.rows();
+  std::map<const Node*, Eigen::MatrixXd> weights;
+  weights[node_.get()] = Eigen::MatrixXd::Zero(total, rows());
+  weights[node_.get()].topRows(rows()).setIdentity();
+  if (!self) {
+    auto& second = weights[other.node_.get()];
+    if (second.size() == 0)
+      second = Eigen::MatrixXd::Zero(total, other.rows());
+    second.bottomRows(other.rows()).setIdentity();
+  }
+  std::map<std::shared_ptr<const int>, Eigen::MatrixXd,
+           std::owner_less<std::shared_ptr<const int>>> sources;
+  for (auto it = order.rbegin(); it != order.rend(); ++it) {
+    const auto& node = **it;
+    const auto found = weights.find(it->get());
+    if (found == weights.end()) continue;
+    Eigen::MatrixXd weight = std::move(found->second);
+    weights.erase(found);
+    if (node.primitive) {
+      Eigen::MatrixXd loading = weight * node.root;
+      auto& shared = sources[node.primitive];
+      if (shared.size() == 0) shared = std::move(loading);
+      else if (shared.cols() == loading.cols()) shared += loading;
+      else
+        return {Reason::CORRELATION_UNQUALIFIED,
+                "Structured primitive reused with inconsistent dimension"};
+    } else {
+      for (const auto& term : node.terms) {
+        Eigen::MatrixXd loading = weight * term.coefficient;
+        auto& next = weights[term.error.node_.get()];
+        if (next.size() == 0) next = std::move(loading);
+        else next += loading;
+      }
+    }
+  }
+  Eigen::MatrixXd next = Eigen::MatrixXd::Zero(rows(), other.rows());
+  for (const auto& source : sources)
+    next.noalias() += source.second.topRows(rows()) *
+                      source.second.bottomRows(other.rows()).transpose();
+  if (!next.allFinite())
+    return {Reason::CORRELATION_UNQUALIFIED,
+            "Structured covariance query overflowed"};
+  *covariance = std::move(next);
+  return {};
+}
 
 Eigen::Isometry3d Pose(const LocalState& state) {
   Eigen::Isometry3d pose = Eigen::Isometry3d::Identity();

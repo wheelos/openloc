@@ -14,6 +14,8 @@ namespace openloc::localization::unified {
 // Frozen correspondence/voxel/normal-support/gain model of the actual ICP
 // iterations. Pose errors are additive target translation and left rotation.
 // These are raw-input loadings, not independent pose covariance.
+// The explicitly deterministic-target mode leaves target loadings empty;
+// it neither models nor qualifies map-construction uncertainty.
 struct RegistrationErrorMap {
   Result assessment{Reason::CORRELATION_UNQUALIFIED,
                     "Raw registration error support was not requested"};
@@ -44,6 +46,7 @@ Result LinearizeRawIcp(
     const pcl::PointCloud<pcl::PointXYZ>& target, double source_voxel_size,
     double target_voxel_size, uint32_t normal_neighbors,
     uint32_t maximum_registration_points, uint32_t maximum_error_points,
-    const std::vector<IcpErrorStep>& steps, RegistrationErrorMap* output);
+    const std::vector<IcpErrorStep>& steps, RegistrationErrorMap* output,
+    bool deterministic_target = false);
 
 }  // namespace openloc::localization::unified

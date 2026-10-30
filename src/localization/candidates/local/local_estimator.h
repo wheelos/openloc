@@ -92,6 +92,17 @@ class LocalEstimator {
   }
   const Result& joint_error_status() const { return joint_error_.status(); }
   Result PrepareJointLidarScan(uint64_t sequence, JointLidarScan* scan);
+  Result PrepareStructuredLidarScan(uint64_t sequence, StructuredLidarScan* scan);
+  Result StructuredErrorLookup(double time, StructuredLocalState* state) const {
+    return joint_error_.StructuredLookup(time, state);
+  }
+  Result StructuredErrorMotionBetween(double start, double end,
+                                      MotionIncrement* motion) const {
+    return joint_error_.StructuredMotionBetween(start, end, motion);
+  }
+  NativeStructuredResourceUsage StructuredErrorResourceUsage() const {
+    return joint_error_.StructuredResourceUsage();
+  }
   Result OutputErrorTransition(ContinuousOutputErrorTransition* transition) const {
     if (!lio_active_)
       return {Reason::HISTORY_UNAVAILABLE, "Continuous LiDAR output is not active"};
@@ -99,6 +110,9 @@ class LocalEstimator {
   }
   Result DeskewErrorMap(const LidarScan& scan,
                         LidarDeskewErrorMap* error_map) const;
+  Result JointLidarInputErrorMap(
+      const LidarScan& scan,
+      unified::JointLidarInputErrorMap* error_map) const;
   Result StoredGeometryErrorMap(LidarStoredGeometryErrorMap* error_map) const;
   const Eigen::MatrixXd& lidar_observed_pose_basis() const {
     return lio_.observed_pose_basis();

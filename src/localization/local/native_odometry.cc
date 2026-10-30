@@ -90,10 +90,32 @@ unified::Result NativeOdometry::PrepareJointLidarScan(
     uint64_t sequence, unified::JointLidarScan* scan) {
   return impl_->owner.PrepareJointLidarScan(sequence, scan);
 }
+unified::Result NativeOdometry::StructuredErrorLookup(
+    double time, unified::StructuredLocalState* state) const {
+  return impl_->owner.StructuredErrorLookup(time, state);
+}
+unified::Result NativeOdometry::PrepareStructuredLidarScan(
+    uint64_t sequence, unified::StructuredLidarScan* scan) {
+  return impl_->owner.PrepareStructuredLidarScan(sequence, scan);
+}
+unified::Result NativeOdometry::StructuredErrorMotionBetween(
+    double start, double end, unified::MotionIncrement* motion) const {
+  return impl_->owner.StructuredErrorMotionBetween(start, end, motion);
+}
+unified::NativeStructuredResourceUsage
+NativeOdometry::StructuredErrorResourceUsage() const {
+  return impl_->owner.StructuredErrorResourceUsage();
+}
 unified::Result NativeOdometry::DeskewErrorMap(
     const unified::LidarScan& scan,
     unified::LidarDeskewErrorMap* error_map) const {
   return impl_->owner.DeskewErrorMap(scan, error_map);
+}
+
+unified::Result NativeOdometry::JointLidarInputErrorMap(
+    const unified::LidarScan& scan,
+    unified::JointLidarInputErrorMap* error_map) const {
+  return impl_->owner.JointLidarInputErrorMap(scan, error_map);
 }
 unified::Result NativeOdometry::StoredGeometryErrorMap(
     unified::LidarStoredGeometryErrorMap* error_map) const {

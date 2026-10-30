@@ -284,6 +284,17 @@ class NativeGnssReplayTest(unittest.TestCase):
             self.assertTrue(all(r["heading_available"] == "0" and
                                 r["receiver_accuracy_available"] == "0"
                                 for r in events))
+            submitted = [row for row in rows(root / "both/graph_measurements.csv")
+                         if row["kind"] == "gnss"]
+            self.assertTrue(submitted)
+            source = {row["sequence"]: row for row in events}
+            for measurement in submitted:
+                original = source[measurement["sequence"]]
+                for key in ("timestamp_ns", "receive_ns", "lever_x", "lever_y", "lever_z"):
+                    self.assertEqual(original[key], measurement[key])
+                self.assertEqual(original["x"], measurement["px"])
+                self.assertEqual(original["y"], measurement["py"])
+                self.assertEqual("0", measurement["ambiguous"])
             self.assertEqual([(r["lever_x"], r["lever_y"], r["lever_z"])
                               for r in events],
                              [("2", "-1", "0.40000000000000002")] * len(epochs))

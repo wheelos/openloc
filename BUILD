@@ -182,10 +182,14 @@ cc_test(
 cc_library(
     name = "native_joint_error",
     srcs = [
+        "src/localization/candidates/local/bounded_joint_error.cc",
         "src/localization/candidates/local/native_joint_error.cc",
         "src/localization/candidates/local/native_joint_splice.cc",
     ],
-    hdrs = ["src/localization/candidates/local/native_joint_error.h"],
+    hdrs = [
+        "src/localization/candidates/local/bounded_joint_error.h",
+        "src/localization/candidates/local/native_joint_error.h",
+    ],
     includes = ["src/localization"],
     deps = [
         ":local_motion",
@@ -282,6 +286,22 @@ cc_binary(
     deps = [
         ":global_alignment",
         ":local_motion",
+        "@eigen",
+    ],
+)
+
+cc_binary(
+    name = "keyframe_graph_replay",
+    testonly = True,
+    srcs = [
+        "test/integration/map/keyframe_graph_replay.cc",
+        "test/integration/map/replay_csv.h",
+    ],
+    copts = ["-std=c++17"],
+    deps = [
+        ":global_alignment",
+        ":local_motion",
+        ":native_joint_error",
         "@eigen",
     ],
 )
@@ -888,6 +908,8 @@ cc_binary(
         "test/integration/map/native_gnss_diagnostic.h",
         "test/integration/map/native_health_diagnostic.h",
         "test/integration/map/native_lio_replay.cc",
+        "test/integration/map/native_structured_closure.h",
+        "test/integration/map/native_joint_query_probe.h",
         "test/integration/map/native_lidar_scheduler.h",
         "test/integration/map/native_map_diagnostic.h",
         "test/integration/map/replay_csv.h",
@@ -899,11 +921,40 @@ cc_binary(
     deps = [
         ":diagnostic_regional_search",
         ":diagnostic_global_alignment",
+        ":fixed_lag_global_alignment",
         ":likelihood_field",
         ":native_odometry",
         ":localization_health",
         ":map_matcher",
         ":native_motion_bootstrap",
+        ":online_gnss_quality",
+        ":particle_hypothesis_tracker",
+        ":particle_relocalizer",
+        ":scan_to_map",
+        "@local_config_pcl//:io",
+    ],
+)
+
+cc_binary(
+    name = "native_structured_fault_replay",
+    testonly = True,
+    srcs = [
+        "test/integration/map/native_causal_map_search.h",
+        "test/integration/map/native_gnss_diagnostic.h",
+        "test/integration/map/native_map_diagnostic.h",
+        "test/integration/map/native_structured_closure.h",
+        "test/integration/map/native_structured_fault_replay.cc",
+        "test/integration/map/replay_csv.h",
+    ],
+    copts = ["-std=c++17"],
+    linkopts = ["-pthread"],
+    deps = [
+        ":diagnostic_regional_search",
+        ":diagnostic_global_alignment",
+        ":fixed_lag_global_alignment",
+        ":likelihood_field",
+        ":native_odometry",
+        ":map_matcher",
         ":online_gnss_quality",
         ":particle_hypothesis_tracker",
         ":particle_relocalizer",

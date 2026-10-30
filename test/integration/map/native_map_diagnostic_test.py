@@ -263,6 +263,15 @@ class NativeMapReplayTest(unittest.TestCase):
                                   read("global_decisions.csv"))
             self.assertGreater(metrics["accepted_map_matches"], 0)
             self.assertGreater(metrics["global_correction_updates"], 0)
+            measurements = read("graph_measurements.csv")
+            self.assertTrue(measurements)
+            self.assertEqual(len(measurements), sum(
+                row["valid"] == "1" for row in read("map.csv")))
+            self.assertTrue(all(row["kind"] in ("map", "projected_map")
+                                for row in measurements))
+            self.assertTrue(all(int(row["receive_ns"]) >= int(row["timestamp_ns"])
+                                for row in measurements))
+            self.assertTrue(all(row["ambiguous"] == "0" for row in measurements))
             self.assertTrue(all(int(row["map_window_points"]) <= len(points)
                                 for row in read("map.csv")))
             baseline = subprocess.run(

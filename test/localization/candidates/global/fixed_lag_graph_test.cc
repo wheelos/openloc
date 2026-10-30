@@ -12,6 +12,7 @@
 
 #include "Eigen/Cholesky"
 #include "gtest/gtest.h"
+#include "gtsam/linear/GaussianConditional.h"
 
 #include "candidates/global/global_alignment.h"
 
@@ -63,6 +64,36 @@ MotionIncrement Motion(const LocalState& start, const LocalState& end) {
       {{"imu", start.stamp.sequence}, {"imu", end.stamp.sequence}}, &motion);
   EXPECT_TRUE(result.ok()) << result.message;
   return motion;
+}
+
+TEST(FixedLagGraphTest, CroppedConditionalUsesSurvivingNoiseRowsIncludingExactZeros) {
+  const Eigen::Matrix3d identity = Eigen::Matrix3d::Identity();
+  const std::vector<std::pair<gtsam::Key, gtsam::Matrix>> terms{
+      {1, identity.leftCols(1)}, {2, identity.rightCols(2)}};
+  Eigen::Vector3d original;
+  original << 7, 0, 2;
+  gtsam::GaussianConditional conditional(
+      terms, 2, Eigen::Vector3d::Zero(),
+      gtsam::noiseModel::Constrained::MixedSigmas(original));
+  Eigen::VectorXd sigmas;
+  ASSERT_TRUE(ConditionalRowSigmas(conditional, &sigmas).ok());
+  EXPECT_TRUE(sigmas.isApprox(original));
+  conditional.matrixObject().firstBlock() += 1;
+  conditional.matrixObject().rowStart() = 1;
+  conditional.keys().erase(conditional.keys().begin());
+  --conditional.nrFrontals();
+  ASSERT_EQ(conditional.R().rows(), 2);
+  ASSERT_EQ(conditional.get_model()->sigmas().size(), 3);
+  ASSERT_TRUE(ConditionalRowSigmas(conditional, &sigmas).ok());
+  ASSERT_EQ(sigmas.size(), 2);
+  EXPECT_EQ(sigmas[0], 0);
+  EXPECT_EQ(sigmas[1], 2);
+  const Eigen::Matrix2d solved = conditional.R()
+      .transpose().triangularView<Eigen::Lower>().solve(Eigen::Matrix2d::Identity());
+  const Eigen::Matrix2d weighted = sigmas.asDiagonal() * solved;
+  Eigen::Matrix2d expected = Eigen::Matrix2d::Zero();
+  expected(1, 1) = 4;
+  EXPECT_TRUE((weighted.transpose() * weighted).isApprox(expected, 1e-12));
 }
 
 TEST(FixedLagGraphTest, BatchReferenceMatchesLinearKnownAnswerAcrossLagAndExactNoise) {

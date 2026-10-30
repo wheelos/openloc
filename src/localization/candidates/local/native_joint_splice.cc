@@ -52,6 +52,27 @@ Result NativeJointError::SpliceCandidate(
       shared_fork->second.lock() != lease)
     return {Reason::CORRELATION_UNQUALIFIED,
             "Delayed native task lost its original stochastic fork lease"};
+  if (structured()) {
+    if (!candidate.structured() || primitives_ != candidate.primitives_)
+      return {Reason::CORRELATION_UNQUALIFIED,
+              "Delayed structured task lost its primitive source registry"};
+    NativeJointError merged = candidate;
+    const auto output = Error("output");
+    if (!output.valid())
+      return {Reason::CORRELATION_UNQUALIFIED,
+              "Delayed structured task lost the actually published output"};
+    merged.structured_memory_["output"] = output;
+    merged.history_ = history_;
+    merged.frontier_finalized_ = frontier_finalized_;
+    merged.pending_sources_ = pending_sources_;
+    for (const auto& source : candidate.pending_sources_)
+      merged.pending_sources_.push_back(source);
+    merged.AddSource({"lidar_raw", scan_sequence});
+    merged.inserted_primitives_.insert(inserted_primitives_.begin(),
+                                       inserted_primitives_.end());
+    *this = std::move(merged);
+    return {};
+  }
   // A fork pins its original orthonormal basis and every later primitive
   // driver. These are independent unit variables spanning both branches,
   // even when ordinary history or old geometry dependencies have retired.

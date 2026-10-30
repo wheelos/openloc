@@ -127,6 +127,14 @@ LocalEstimator::LocalEstimator(const LocalConfig& config)
 }
 
 Result LocalEstimator::ValidateConfig() const {
+  if (config_.enable_native_structured_error &&
+      !config_.enable_native_joint_error)
+    return {Reason::CONFIG_INVALID,
+            "Structured native errors require native joint propagation"};
+  if (config_.enable_native_structured_error &&
+      config_.native_joint_max_dimension < 18)
+    return {Reason::CONFIG_INVALID,
+            "Structured native queries require the 18D output memory"};
   if (config_.enable_native_joint_error &&
       (config_.native_joint_max_dimension < 15 ||
        config_.native_joint_max_memory_rows < 48 ||
@@ -361,7 +369,7 @@ Result LocalEstimator::AddImu(const ImuSample& sample) {
     const LocalState start_output = output_state_;
     LocalState working = state_;
     if (joint_error_.active())
-      joint_error_.Set("previous_internal", joint_error_.Get("internal"));
+      joint_error_.Copy("previous_internal", "internal");
     joint_error_.BeginImu(interval_start, sample);
     Matrix15d error_transition = Matrix15d::Identity();
     Matrix15d process_covariance = Matrix15d::Zero();
@@ -468,10 +476,7 @@ Result LocalEstimator::AddImu(const ImuSample& sample) {
       output_state_ = state_;
       continuous_output_.Reset(output_state_);
       if (joint_error_.active()) {
-        Eigen::MatrixXd output = Eigen::MatrixXd::Zero(
-            18, joint_error_.Get("internal").cols());
-        output.topRows(15) = joint_error_.Get("internal");
-        joint_error_.Set("output", output);
+        joint_error_.CopyInternalToOutput();
       }
     }
     state_.valid = EvaluateIntegrity(sample.stamp.receive_time).ok();
@@ -1214,17 +1219,17 @@ void LocalEstimator::RecordInternalHistory(bool lidar_correction) {
       internal_history_.back().corrected.stamp.time == state_.stamp.time) {
     if (joint_error_.active() && lidar_correction &&
         !internal_history_.back().has_lidar_correction)
-      joint_error_.Set(
+      joint_error_.Copy(
           NativeJointError::History(state_.stamp.sequence, true),
-          joint_error_.Get(NativeJointError::History(state_.stamp.sequence)));
+          NativeJointError::History(state_.stamp.sequence));
     internal_history_.back().corrected = state_;
     internal_history_.back().has_lidar_correction |= lidar_correction;
   } else {
     internal_history_.push_back({state_, state_});
   }
   if (joint_error_.active())
-    joint_error_.Set(NativeJointError::History(state_.stamp.sequence),
-                    joint_error_.Get("internal"));
+    joint_error_.Copy(NativeJointError::History(state_.stamp.sequence),
+                     "internal");
   while (!internal_history_.empty() &&
          (state_.stamp.time - internal_history_.front().corrected.stamp.time >
               config_.history_duration ||

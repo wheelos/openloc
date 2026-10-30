@@ -18,6 +18,9 @@ Result AdaptScanToMapObservation(const map::ScanToMapResult& match,
                                  const MapObservationContract& contract,
                                  const MapObservationTiming& timing,
                                  GlobalObservation* observation) {
+  if (match.structured_error)
+    return {Reason::CORRELATION_UNQUALIFIED,
+            "Structured map sources require a source-aware graph adapter"};
   if (observation == nullptr || !local.valid || local.epoch.session.empty() ||
       local.epoch.generation == 0 || local.stamp.sequence == 0 ||
       !std::isfinite(local.stamp.time) || local.stamp.time <= 0.0 ||

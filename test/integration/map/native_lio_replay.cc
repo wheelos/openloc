@@ -20,9 +20,11 @@
 #include "openloc/localization/local/native_odometry.h"
 #include "test/integration/map/native_diagnostic_executor.h"
 #include "test/integration/map/native_health_diagnostic.h"
+#include "test/integration/map/native_joint_query_probe.h"
 #include "test/integration/map/native_lidar_scheduler.h"
 #include "test/integration/map/native_map_diagnostic.h"
 #include "test/integration/map/native_scan_reader.h"
+#include "test/integration/map/native_structured_closure.h"
 #include "test/integration/map/native_timer_output.h"
 #include "test/integration/map/replay_csv.h"
 
@@ -201,7 +203,9 @@ void Run(const std::filesystem::path& input,
          const openloc::replay::NativeGlobalOdometryFault& odometry_fault,
          std::pair<int64_t, int64_t> map_holdout, uint32_t arrival_rate,
          bool tracking_gain, bool profile_map_timing, bool profile_local_timing,
-         bool fixed_gain_update) {
+         bool fixed_gain_update, bool native_query_probe,
+         bool native_structured,
+         const std::filesystem::path& structured_selection) {
   if (!std::filesystem::create_directory(output))
     throw std::runtime_error("output must be a new directory");
   auto config = Configuration((input / "config.csv").string());
@@ -216,6 +220,7 @@ void Run(const std::filesystem::path& input,
   config.enable_lidar_stationary_initialization =
       lidar_stationary_initialization;
   config.enable_native_joint_error = native_joint_sample_period > 0;
+  config.enable_native_structured_error = native_structured;
   config.native_imu_sample_period = native_joint_sample_period;
   for (const auto& limit : native_joint_limits) {
     if (limit.first == "--native-joint-max-dimension")
@@ -232,7 +237,12 @@ void Run(const std::filesystem::path& input,
     map = std::make_unique<openloc::replay::NativeMapDiagnostic>(
         map_bundle, output, map_digests, gnss_bundle, gnss_digests,
         global_holdback_ns, async_global, level_odom_gnss_bootstrap,
-        odometry_fault, map_holdout, profile_map_timing, fixed_gain_update);
+        odometry_fault, map_holdout, profile_map_timing, fixed_gain_update,
+        !structured_selection.empty());
+  std::unique_ptr<openloc::replay::NativeStructuredClosure> closure;
+  if (!structured_selection.empty())
+    closure = std::make_unique<openloc::replay::NativeStructuredClosure>(
+        structured_selection, gnss_bundle, output, map.get());
   if (fixed_gain_update) {
     std::ofstream policy(output / "global_mean_policy.csv");
     policy << "mode,covariance,trust_ceiling\n"
@@ -286,6 +296,7 @@ void Run(const std::filesystem::path& input,
   std::ofstream capability(output / "capability.csv");
   std::ofstream corrections(output / "local_corrections.csv");
   std::ofstream joint_audit;
+  std::ofstream native_resources;
   std::ofstream local_profile;
   if (profile_local_timing) {
     local_profile.open(output / "local_profile.csv");
@@ -294,6 +305,15 @@ void Run(const std::filesystem::path& input,
                   << "sequence,frontier_ns,bootstrap,points,decode_ms,"
                      "estimator_ms,decode_start_ns,decode_end_ns,"
                      "estimator_start_ns,estimator_end_ns\n";
+    if (native_structured) {
+      native_resources.open(output / "native_resources.csv");
+      native_resources << std::setprecision(17)
+                       << "sequence,timestamp_ns,primitive_sources,primitive_rows,"
+                          "memory_keys,snapshots,publish_queries,publish_query_ms,"
+                          "retired_registry_sources,retired_registry_rows\n";
+      if (!native_resources)
+        throw std::runtime_error("cannot open structured resource journal");
+    }
   }
   if (config.enable_native_joint_error) {
     joint_audit.open(output / "native_joint.csv");
@@ -301,7 +321,9 @@ void Run(const std::filesystem::path& input,
     joint_audit
         << "sequence,timestamp_ns,receive_ns,reason,detail,dimension,"
            "imu_sample_period_s,maximum_dimension,maximum_memory_rows,"
-           "maximum_snapshots,history_duration_s,diagnostic_only,trusted\n";
+           "maximum_snapshots,history_duration_s,diagnostic_only,trusted";
+    if (native_structured) joint_audit << ",representation";
+    joint_audit << '\n';
   }
   std::ofstream host_timing;
   if (arrival_paced) {
@@ -375,6 +397,7 @@ void Run(const std::filesystem::path& input,
                  "output_pz,internal_vx,internal_vy,internal_vz,"
                  "output_vx,output_vy,output_vz\n";
   std::size_t next_scan = 0;
+  bool native_query_written = false;
   uint64_t initialized_ns = 0;
   uint64_t valid_states = 0;
   uint64_t lidar_updates = 0;
@@ -500,7 +523,7 @@ void Run(const std::filesystem::path& input,
     if (state.valid) {
       ++valid_states;
       if (initialized_ns == 0) initialized_ns = stamp;
-      if (map) {
+      if (map && !closure) {
         submit_global("odometry", sizeof(state),
                       [&, snapshot = state, stamp, receive] {
                         map->AddOdometry(snapshot, stamp, receive);
@@ -508,7 +531,7 @@ void Run(const std::filesystem::path& input,
                       });
       }
     }
-    if (map) {
+    if (map && !closure) {
       submit_global("gnss", sizeof(receive), [&, receive] {
         map->ProcessGnss(receive);
         global_initialized.store(map->initialized());
@@ -619,6 +642,13 @@ void Run(const std::filesystem::path& input,
           decision = {u::Reason::HISTORY_UNAVAILABLE,
                       "Scan overlaps pre-initialization history"};
         } else {
+          if (native_query_probe && !native_query_written) {
+            u::JointLidarInputErrorMap query;
+            const auto modeled = local.JointLidarInputErrorMap(scan, &query);
+            if (!modeled.ok()) throw std::runtime_error(modeled.message);
+            csv::WriteNativeJointQueryProbe(output, query);
+            native_query_written = true;
+          }
           const u::LocalState before = local.internal_state();
           started = Clock::now();
           estimator_start = started;
@@ -638,12 +668,17 @@ void Run(const std::filesystem::path& input,
           // Use the pre-LIO continuous-output frontier already submitted to
           // the global owner, not a mixture with corrected internal history.
           if (map) {
-            const std::size_t bytes =
-                sizeof(scan) + scan.points.size() * sizeof(u::TimedLidarPoint);
-            submit_global("scan", bytes, [&, snapshot = scan, stamp, receive] {
-              map->Observe(snapshot, stamp, receive);
-              global_initialized.store(map->initialized());
-            });
+            if (closure) {
+              closure->Observe(&local, sequence, csv::Time(source[0]), stamp,
+                               receive);
+            } else {
+              const std::size_t bytes =
+                  sizeof(scan) + scan.points.size() * sizeof(u::TimedLidarPoint);
+              submit_global("scan", bytes, [&, snapshot = scan, stamp, receive] {
+                map->Observe(snapshot, stamp, receive);
+                global_initialized.store(map->initialized());
+              });
+            }
           }
         }
       }
@@ -705,7 +740,8 @@ void Run(const std::filesystem::path& input,
             decision.message == "Scan overlaps pre-initialization history"))
         throw std::runtime_error(decision.message);
     }
-    if (map) {
+    if (closure) closure->AddOdometry(&local, stamp, receive);
+    if (map && !closure) {
       submit_global("drain", sizeof(receive), [&, receive] {
         map->DrainGlobal(receive);
         global_initialized.store(map->initialized());
@@ -713,29 +749,52 @@ void Run(const std::filesystem::path& input,
     }
     if (config.enable_native_joint_error && local.state().valid) {
       u::LocalState joint;
-      const auto assessment =
-          local.JointErrorLookup(local.state().stamp.time, &joint);
+      u::StructuredLocalState structured;
+      auto assessment = native_structured
+          ? local.StructuredErrorLookup(local.state().stamp.time, &structured)
+          : local.JointErrorLookup(local.state().stamp.time, &joint);
+      const auto& observer_status = local.joint_error_status();
+      if (native_structured && !observer_status.ok())
+        assessment = observer_status;
       joint_audit << index + 1 << ',' << stamp << ',' << receive << ','
                   << u::ReasonName(assessment.reason) << ',';
       csv::Text(joint_audit, assessment.message);
       joint_audit << ','
-                  << (assessment.ok() ? joint.joint_error->covariance.rows() : 0)
+                  << (assessment.ok() && !native_structured
+                          ? joint.joint_error->covariance.rows() : 0)
                   << ',' << std::setprecision(17)
                   << config.native_imu_sample_period << ','
                   << config.native_joint_max_dimension << ','
                   << config.native_joint_max_memory_rows << ','
                   << config.native_joint_max_snapshots << ','
-                  << config.history_duration << ",1,0\n";
+                  << config.history_duration << ",1,0";
+      if (native_structured)
+        joint_audit << ",structured_sources_not_dense_graph_state";
+      joint_audit << '\n';
       joint_audit.flush();
       if (!joint_audit)
         throw std::runtime_error("incomplete native joint audit");
+      if (profile_local_timing && native_structured) {
+        const auto usage = local.StructuredErrorResourceUsage();
+        native_resources << index + 1 << ',' << stamp << ','
+                         << usage.primitive_sources << ',' << usage.primitive_rows
+                         << ',' << usage.memory_keys << ',' << usage.snapshots
+                         << ',' << usage.publish_queries << ','
+                         << usage.publish_query_ms << ','
+                         << usage.retired_registry_sources << ','
+                         << usage.retired_registry_rows << '\n';
+        native_resources.flush();
+        if (!native_resources)
+          throw std::runtime_error("incomplete structured resource journal");
+      }
       if (!assessment.ok())
         throw std::runtime_error("native joint audit: " + assessment.message);
     }
   }
   if (scan_reader) scan_reader->Finish();
   if (local_scheduler) local_scheduler->Finish(last_imu);
-  if (map) {
+  if (closure) closure->Finish();
+  if (map && !closure) {
     submit_global("finish", 0, [&] { map->Finish(); });
     if (global_executor) global_executor->Finish();
   }
@@ -805,6 +864,9 @@ int main(int argc, char** argv) {
     bool profile_local_timing = false;
     bool level_odom_gnss_bootstrap = false;
     bool fixed_gain_update = false;
+    bool native_query_probe = false;
+    bool native_structured = false;
+    std::filesystem::path structured_selection;
     double native_joint_sample_period = 0;
     std::map<std::string, uint32_t> native_joint_limits;
     openloc::replay::NativeGlobalOdometryFault odometry_fault;
@@ -821,6 +883,13 @@ int main(int argc, char** argv) {
         imu_trace = true;
       } else if (option == "--diagnostic-fixed-gain" && !fixed_gain_update) {
         fixed_gain_update = true;
+      } else if (option == "--native-joint-query-probe" && !native_query_probe) {
+        native_query_probe = true;
+      } else if (option == "--native-joint-structured" && !native_structured) {
+        native_structured = true;
+      } else if (option == "--offline-structured-closure" &&
+                 structured_selection.empty() && i + 1 < argc) {
+        structured_selection = argv[++i];
       } else if (option == "--global-map-holdout" && !map_holdout.first &&
                  i + 2 < argc) {
         map_holdout.first = csv::Time(argv[++i]);
@@ -938,8 +1007,26 @@ int main(int argc, char** argv) {
       throw std::runtime_error("map holdout requires an explicit map");
     if (!native_joint_limits.empty() && native_joint_sample_period == 0)
       throw std::runtime_error("native joint limits require native joint audit");
+    if (native_query_probe && native_joint_sample_period == 0)
+      throw std::runtime_error("native query probe requires native joint audit");
+    if (native_structured && native_joint_sample_period == 0)
+      throw std::runtime_error("structured native mode requires native joint audit");
+    if (native_structured && native_query_probe)
+      throw std::runtime_error(
+          "structured native mode cannot export a dense query basis");
+    if (!structured_selection.empty() &&
+        (!native_structured || map_bundle.empty() || gnss_bundle.empty() ||
+         async_global || arrival_paced || async_local_delay_ns || prefetch_lidar ||
+         timer_output || fixed_gain_update || tracking_gain ||
+         level_odom_gnss_bootstrap || map_holdout.first || has_holdback ||
+         odometry_fault.kind !=
+             openloc::replay::NativeGlobalOdometryFault::Kind::kNone))
+      throw std::runtime_error(
+          "offline structured closure requires structured native audit, pinned "
+          "map/GNSS inputs and synchronous unmodified native replay");
     if (native_joint_sample_period > 0 &&
-        (!map_bundle.empty() || !gnss_bundle.empty() || arrival_paced ||
+        (((!map_bundle.empty() || !gnss_bundle.empty()) &&
+          structured_selection.empty()) || arrival_paced ||
          async_local_delay_ns || prefetch_lidar || timer_output))
       throw std::runtime_error(
           "native joint audit requires deterministic local-only replay");
@@ -982,7 +1069,8 @@ int main(int argc, char** argv) {
         level_odom_gnss_bootstrap, native_joint_sample_period,
         native_joint_limits, odometry_fault, map_holdout, arrival_rate,
         tracking_gain, profile_map_timing, profile_local_timing,
-        fixed_gain_update);
+        fixed_gain_update, native_query_probe, native_structured,
+        structured_selection);
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "native_lio_replay: " << error.what() << '\n';

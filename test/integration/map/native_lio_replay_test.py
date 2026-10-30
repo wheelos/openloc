@@ -342,6 +342,35 @@ class NativeReportTest(unittest.TestCase):
 class NativeReplayTest(unittest.TestCase):
     binary = None
 
+    def test_structured_closure_cannot_bypass_native_or_source_policy(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            common = ["--offline-structured-closure", "selected.csv"]
+            declared = [
+                "--native-joint-structured",
+                "--native-joint-audit-period-s", "0.005",
+                "--diagnostic-map", "map", "--map-input-sha256", "pin",
+                "--diagnostic-gnss", "gnss", "--gnss-input-sha256", "pin",
+            ]
+            for flags, message in (
+                (common, "requires structured native audit"),
+                (common + declared[:-4], "requires structured native audit"),
+                (common + declared + ["--diagnostic-fixed-gain"],
+                 "synchronous unmodified native replay"),
+                (common + declared + ["--diagnostic-lidar-tracking-gain"],
+                 "synchronous unmodified native replay"),
+                (common + declared + ["--arrival-paced"],
+                 "synchronous unmodified native replay"),
+                (common + common, "unknown or duplicate"),
+            ):
+                with self.subTest(flags=flags):
+                    completed = subprocess.run(
+                        [str(self.binary), str(root), str(root / "output"),
+                         *flags], capture_output=True, text=True)
+                    self.assertNotEqual(completed.returncode, 0)
+                    self.assertIn(message, completed.stderr)
+                    self.assertFalse((root / "output").exists())
+
     def test_fixed_gain_requires_explicit_owner_and_unique_option(self):
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
             root = Path(temporary)
@@ -431,6 +460,110 @@ class NativeReplayTest(unittest.TestCase):
                 self.assertIn("requires deterministic local-only replay",
                               completed.stderr)
                 self.assertFalse((root / "output").exists())
+
+    def test_native_query_probe_requires_audit_and_unique_flag(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            for flags, message in (
+                (["--native-joint-query-probe"], "requires native joint audit"),
+                (["--native-joint-query-probe", "--native-joint-query-probe"],
+                 "unknown or duplicate"),
+                (["--native-joint-structured"], "requires native joint audit"),
+                (["--native-joint-structured", "--native-joint-structured"],
+                 "unknown or duplicate"),
+                (["--native-joint-structured", "--native-joint-query-probe",
+                  "--native-joint-audit-period-s", "0.005"],
+                 "cannot export a dense query basis"),
+            ):
+                with self.subTest(flags=flags):
+                    completed = subprocess.run(
+                        [str(self.binary), str(root), str(root / "output"),
+                         *flags], capture_output=True, text=True)
+                    self.assertNotEqual(completed.returncode, 0)
+                    self.assertIn(message, completed.stderr)
+                    self.assertFalse((root / "output").exists())
+
+    def test_native_query_probe_does_not_bypass_dense_model_refusal(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            config = json.loads(Path(__file__).with_name(
+                "native_lio_diagnostic_config.json").read_text())
+            write_csv(root / "config.csv", "name,value", config.items())
+            write_csv(root / "extrinsic.csv", "tx,ty,tz", [[0, 0, 0]])
+            write_csv(
+                root / "imu.csv", "timestamp_ns,receive_ns,ax,ay,az,gx,gy,gz",
+                [[1_000_000_000 + i * 5_000_000,
+                  1_000_100_000 + i * 5_000_000, 0, 0, 9.80665, 0, 0, 0]
+                 for i in range(420)])
+            write_csv(root / "scan.csv", "timestamp_ns,x,y,z",
+                      [[3_000_000_000, 0.25 * x + 0.025, 0.25 * y + 0.025, 2.25]
+                       for x in range(1, 26) for y in range(1, 26)])
+            write_csv(root / "second_scan.csv", "timestamp_ns,x,y,z",
+                      [[3_050_000_000, 0.25 * x + 0.025, 0.25 * y + 0.025, 2.26]
+                       for x in range(1, 26) for y in range(1, 26)])
+            write_csv(root / "scans.csv", "end_ns,receive_ns,points",
+                      [[3_000_000_000, 3_000_100_000, "scan.csv"],
+                       [3_050_000_000, 3_050_100_000, "second_scan.csv"]])
+            outputs = []
+            for name, flags in (("plain", []),
+                                ("probe", ["--native-joint-query-probe"])):
+                completed = subprocess.run(
+                    [str(self.binary), str(root), str(root / name),
+                     "--native-joint-audit-period-s", "0.005",
+                     "--native-joint-max-dimension", "128",
+                     "--native-joint-max-memory-rows", "256", *flags],
+                    capture_output=True, text=True)
+                self.assertEqual(1, completed.returncode, completed.stderr)
+                self.assertIn("capacity exceeded before allocation",
+                              completed.stderr)
+                output = {}
+                for filename in ("native_joint.csv", "odometry.csv"):
+                    with (root / name / filename).open() as stream:
+                        output[filename] = [
+                            {k: v for k, v in row.items() if k != "imu_ms"}
+                            for row in csv.DictReader(stream)]
+                outputs.append(output)
+            self.assertEqual(outputs[0], outputs[1])
+            with (root / "probe/native_query_scope.csv").open() as stream:
+                scope = next(csv.DictReader(stream))
+            self.assertEqual("625", scope["points"])
+            self.assertEqual("0", scope["graph_motion_exported"])
+            with (root / "probe/native_query_points.csv").open() as stream:
+                points = list(csv.DictReader(stream))
+            self.assertEqual(list(range(625)),
+                             [int(point["index"]) for point in points])
+            self.assertFalse((root / "plain/native_query_scope.csv").exists())
+            completed = subprocess.run(
+                [str(self.binary), str(root), str(root / "structured"),
+                 "--native-joint-audit-period-s", "0.005",
+                 "--native-joint-max-dimension", "128",
+                 "--native-joint-max-memory-rows", "256",
+                 "--native-joint-structured", "--profile-local-timing"],
+                capture_output=True, text=True)
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            with (root / "structured/native_joint.csv").open() as stream:
+                audit = list(csv.DictReader(stream))
+            self.assertEqual("420", audit[-1]["sequence"])
+            self.assertTrue(all(row["reason"] == "NONE" for row in audit))
+            self.assertTrue(all(row["dimension"] == "0" for row in audit))
+            self.assertTrue(all(row["representation"] ==
+                                "structured_sources_not_dense_graph_state"
+                                for row in audit))
+            self.assertTrue(all(row["trusted"] == "0" for row in audit))
+            with (root / "structured/native_resources.csv").open() as stream:
+                resources = list(csv.DictReader(stream))
+            self.assertEqual([row["sequence"] for row in audit],
+                             [row["sequence"] for row in resources])
+            self.assertGreater(int(resources[-1]["primitive_sources"]),
+                               int(resources[0]["primitive_sources"]))
+            query_ms = [float(row["publish_query_ms"]) for row in resources]
+            self.assertEqual(query_ms, sorted(query_ms))
+            self.assertTrue(all(int(row["snapshots"]) <= 64 for row in resources))
+            with (root / "structured/odometry.csv").open() as stream:
+                nominal = [{k: v for k, v in row.items() if k != "imu_ms"}
+                           for row in csv.DictReader(stream)]
+            self.assertEqual(outputs[0]["odometry.csv"],
+                             nominal[:len(outputs[0]["odometry.csv"])])
 
     def test_timer_requires_arrival_pacing_before_creating_output(self):
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:

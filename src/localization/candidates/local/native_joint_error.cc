@@ -4,6 +4,7 @@
 #include "candidates/local/native_joint_error.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <set>
@@ -32,6 +33,9 @@ void NativeJointError::Reset() {
   frontier_finalized_ = false;
   dimension_ = 0;
   memory_.clear();
+  structured_memory_.clear();
+  primitives_ = std::make_shared<PrimitiveRegistry>();
+  inserted_primitives_.clear();
   history_.clear();
   pending_sources_.clear();
   driving_cross_.clear();
@@ -40,6 +44,8 @@ void NativeJointError::Reset() {
   next_fork_ = 0;
   first_imu_ = second_imu_ = {};
   previous_cross_.resize(0, 0);
+  publish_queries_ = 0;
+  publish_query_ms_ = 0;
   status_ = {Reason::CORRELATION_UNQUALIFIED,
              "Native joint stochastic propagation has not initialized"};
 }
@@ -48,6 +54,7 @@ void NativeJointError::Fail(const Result& result) {
   if (active_ || status_.ok()) status_ = result;
   active_ = false;
   memory_.clear();
+  structured_memory_.clear();
   dimension_ = 0;
   previous_cross_.resize(0, 0);
   driving_cross_.clear();
@@ -67,9 +74,7 @@ void NativeJointError::Initialize(const LocalState& state) {
   }
   Independent("internal", state.covariance);
   if (!active_) return;
-  Eigen::MatrixXd output = Eigen::MatrixXd::Zero(18, dimension_);
-  output.topRows(15) = Get("internal");
-  Set("output", output);
+  CopyInternalToOutput();
 }
 
 void NativeJointError::InitializeStationary(
@@ -118,14 +123,18 @@ void NativeJointError::InitializeStationary(
       (Eigen::AngleAxisd(-angle, Eigen::Vector3d::UnitX()) *
        Eigen::Vector3d::UnitY()) * pitch;
   mean.block<3, 3>(9, 3).setIdentity();
-  Set("internal", Get("internal") +
-      mean * Get("stationary_measurements").topRows(6));
-  Set("imu:last", Get("stationary_measurements").bottomRows(6));
+  Eigen::Matrix<double, 15, 12> mean_loading =
+      Eigen::Matrix<double, 15, 12>::Zero();
+  mean_loading.leftCols(6) = mean;
+  Linear("internal", {{Matrix15d::Identity(), "internal"},
+                       {mean_loading, "stationary_measurements"}});
+  Eigen::Matrix<double, 6, 12> last =
+      Eigen::Matrix<double, 6, 12>::Zero();
+  last.rightCols(6).setIdentity();
+  Linear("imu:last", {{last, "stationary_measurements"}});
   Drop("stationary_measurements");
   if (!active_) return;
-  Eigen::MatrixXd output = Eigen::MatrixXd::Zero(18, dimension_);
-  output.topRows(15) = Get("internal");
-  Set("output", output);
+  CopyInternalToOutput();
 }
 
 void NativeJointError::InitializeRelative(
@@ -140,12 +149,16 @@ void NativeJointError::InitializeRelative(
   joint.topLeftCorner<15, 15>() += state.covariance;
   Independent("startup:joint", joint, "startup:raw");
   if (!active_) return;
-  Set("internal", Get("startup:joint").topRows(15));
-  Set("imu:last", Get("startup:joint").bottomRows(6));
+  Eigen::Matrix<double, 15, 21> internal =
+      Eigen::Matrix<double, 15, 21>::Zero();
+  internal.leftCols(15).setIdentity();
+  Eigen::Matrix<double, 6, 21> last =
+      Eigen::Matrix<double, 6, 21>::Zero();
+  last.rightCols(6).setIdentity();
+  Linear("internal", {{internal, "startup:joint"}});
+  Linear("imu:last", {{last, "startup:joint"}});
   Drop("startup:joint");
-  Eigen::MatrixXd output = Eigen::MatrixXd::Zero(18, dimension_);
-  output.topRows(15) = Get("internal");
-  Set("output", output);
+  CopyInternalToOutput();
 }
 
 void NativeJointError::RejectInitialization(const Result& result) {
@@ -156,6 +169,71 @@ void NativeJointError::RejectInitialization(const Result& result) {
 Eigen::MatrixXd NativeJointError::Get(const std::string& key) const {
   const auto found = memory_.find(key);
   return found == memory_.end() ? Eigen::MatrixXd() : found->second;
+}
+
+JointErrorExpression NativeJointError::Error(const std::string& key) const {
+  const auto found = structured_memory_.find(key);
+  return found == structured_memory_.end() ? JointErrorExpression()
+                                          : found->second;
+}
+
+void NativeJointError::Linear(const std::string& key,
+                              const std::vector<LinearTerm>& terms) {
+  if (!active_) return;
+  if (!structured()) {
+    Eigen::MatrixXd next;
+    for (const auto& term : terms) {
+      const auto loading = Get(term.key);
+      if (loading.rows() == 0 || term.coefficient.cols() != loading.rows()) {
+        Fail({Reason::CORRELATION_UNQUALIFIED,
+              "Missing native linear-error dependency"});
+        return;
+      }
+      if (next.size() == 0) next = term.coefficient * loading;
+      else next.noalias() += term.coefficient * loading;
+    }
+    Set(key, next);
+    return;
+  }
+  if (terms.empty() ||
+      terms.front().coefficient.rows() > config_.native_joint_max_dimension) {
+    Fail({Reason::CORRELATION_UNQUALIFIED,
+          "Structured native finite query exceeds configured row capacity"});
+    return;
+  }
+  std::vector<JointErrorExpression::Term> inputs;
+  for (const auto& term : terms)
+    inputs.push_back({term.coefficient, Error(term.key)});
+  auto next = JointErrorExpression::Combine(
+      terms.front().coefficient.rows(), inputs);
+  if (!next.valid()) {
+    Fail({Reason::CORRELATION_UNQUALIFIED,
+          "Missing or nonfinite structured native dependency"});
+    return;
+  }
+  structured_memory_[key] = std::move(next);
+}
+
+void NativeJointError::Copy(const std::string& key, const std::string& source) {
+  if (!active_) return;
+  if (!structured()) {
+    Set(key, Get(source));
+    return;
+  }
+  auto error = Error(source);
+  if (!error.valid()) {
+    Fail({Reason::CORRELATION_UNQUALIFIED,
+          "Missing structured native memory clone"});
+    return;
+  }
+  structured_memory_[key] = std::move(error);
+}
+
+void NativeJointError::CopyInternalToOutput() {
+  Eigen::Matrix<double, 18, 15> projection =
+      Eigen::Matrix<double, 18, 15>::Zero();
+  projection.topRows(15).setIdentity();
+  Linear("output", {{projection, "internal"}});
 }
 
 Result NativeJointError::CheckAdditionalCapacity(std::size_t rows,
@@ -233,10 +311,17 @@ void NativeJointError::Set(const std::string& key,
   memory_[key] = loading;
 }
 
-void NativeJointError::Drop(const std::string& key) { memory_.erase(key); }
+void NativeJointError::Drop(const std::string& key) {
+  memory_.erase(key);
+  structured_memory_.erase(key);
+}
 
 void NativeJointError::Retain(const std::vector<std::string>& keys) {
   const std::set<std::string> retained(keys.begin(), keys.end());
+  for (auto it = structured_memory_.begin(); it != structured_memory_.end();) {
+    if (retained.count(it->first)) ++it;
+    else it = structured_memory_.erase(it);
+  }
   for (auto it = forks_.begin(); it != forks_.end();) {
     if (it->second.expired()) it = forks_.erase(it);
     else ++it;
@@ -255,7 +340,8 @@ std::shared_ptr<const int> NativeJointError::PinFork() {
   const std::string key = "fork:" + std::to_string(++next_fork_) + ":";
   auto lease = std::make_shared<const int>(0);
   forks_[key] = lease;
-  Set(key + "root", Eigen::MatrixXd::Identity(dimension_, dimension_));
+  if (!structured())
+    Set(key + "root", Eigen::MatrixXd::Identity(dimension_, dimension_));
   return lease;
 }
 
@@ -313,6 +399,59 @@ void NativeJointError::Independent(const std::string& key,
   const Eigen::Index added = root.cols();
   const std::string identity = source.empty()
       ? "anonymous:" + std::to_string(++anonymous_source_) : source;
+  if (structured()) {
+    if (!inserted_primitives_.insert(identity).second) {
+      Fail({Reason::CORRELATION_UNQUALIFIED,
+            "A native primitive noise source was independently inserted twice"});
+      return;
+    }
+    std::lock_guard<std::mutex> lock(primitives_->mutex);
+    auto found = primitives_->entries.find(identity);
+    if (found == primitives_->entries.end()) {
+      // Bound the retained source registry from the existing configured scan
+      // and IMU-history capacities. Live expression/fork identities never evict.
+      const uint64_t points =
+          uint64_t(config_.lidar_max_points) * config_.lidar_max_scans;
+      const uint64_t imu_rows = 12ULL * config_.max_history_states;
+      if (points > (std::numeric_limits<uint64_t>::max() - imu_rows) / 3) {
+        Fail({Reason::CONFIG_INVALID,
+              "Structured native source capacity overflows"});
+        return;
+      }
+      const uint64_t limit = 3 * points + imu_rows;
+      if (primitives_->rows + std::max<Eigen::Index>(1, added) > limit) {
+        for (auto it = primitives_->entries.begin();
+             it != primitives_->entries.end();) {
+          if (it->second.identity.use_count() != 1) {
+            ++it;
+            continue;
+          }
+          const uint64_t retired = std::max<Eigen::Index>(1, it->second.root.cols());
+          primitives_->rows -= retired;
+          primitives_->retired_rows += retired;
+          ++primitives_->retired_sources;
+          it = primitives_->entries.erase(it);
+        }
+      }
+      if (primitives_->rows + std::max<Eigen::Index>(1, added) > limit) {
+        Fail({Reason::CORRELATION_UNQUALIFIED,
+              "Structured native source capacity exhausted; no source dropped"});
+        return;
+      }
+      found = primitives_->entries.emplace(
+          identity, Primitive{std::make_shared<const int>(0), root}).first;
+      primitives_->rows += std::max<Eigen::Index>(1, added);
+    } else if (found->second.root.rows() != root.rows() ||
+               found->second.root.cols() != root.cols() ||
+               !found->second.root.isApprox(root, 1e-12)) {
+      Fail({Reason::CORRELATION_UNQUALIFIED,
+            "Replayed native primitive has inconsistent covariance"});
+      return;
+    }
+    structured_memory_[key] =
+        JointErrorExpression::Primitive(found->second.identity, root);
+    return;
+  }
   if (driving_cross_.count(identity)) {
     Fail({Reason::CORRELATION_UNQUALIFIED,
           "A native primitive noise source was independently inserted twice"});
@@ -364,7 +503,8 @@ void NativeJointError::BeginImu(const ImuSample& first, const ImuSample& second)
   }
   first_imu_ = first.stamp;
   second_imu_ = second.stamp;
-  if (Get("imu:last").rows() == 6) Set("imu:first", Get("imu:last"));
+  if ((structured() ? Error("imu:last").rows() : Get("imu:last").rows()) == 6)
+    Copy("imu:first", "imu:last");
   else {
     Matrix6d covariance = Matrix6d::Zero();
     covariance.diagonal().head<3>().setConstant(
@@ -405,10 +545,23 @@ void NativeJointError::AdvanceImu(
            << start << ":" << end;
   Independent("bias:driving", covariance, identity.str());
   if (!active_) return;
-  Eigen::MatrixXd next = transition * Get("internal") +
-      first * ImuAt(start) + second * ImuAt(end);
-  next.bottomRows(6) += Get("bias:driving");
-  Set("internal", next);
+  if (structured()) {
+    const double duration = second_imu_.time - first_imu_.time;
+    const double a = (start - first_imu_.time) / duration;
+    const double b = (end - first_imu_.time) / duration;
+    Eigen::Matrix<double, 15, 6> bias =
+        Eigen::Matrix<double, 15, 6>::Zero();
+    bias.bottomRows(6).setIdentity();
+    Linear("internal", {{transition, "internal"},
+                         {(1 - a) * first + (1 - b) * second, "imu:first"},
+                         {a * first + b * second, "imu:last"},
+                         {bias, "bias:driving"}});
+  } else {
+    Eigen::MatrixXd next = transition * Get("internal") +
+        first * ImuAt(start) + second * ImuAt(end);
+    next.bottomRows(6) += Get("bias:driving");
+    Set("internal", next);
+  }
   Drop("bias:driving");
 }
 
@@ -421,16 +574,17 @@ void NativeJointError::AdvanceInternal(const Matrix15d& transition,
   if (!active_) return;
   Independent("driving", noise);
   if (!active_) return;
-  Set("internal", transition * Get("internal") + Get("driving"));
+  Linear("internal", {{transition, "internal"},
+                       {Matrix15d::Identity(), "driving"}});
   Drop("driving");
 }
 
 void NativeJointError::AdvanceOutput(
     const ContinuousOutputErrorTransition& transition) {
   if (!active_) return;
-  Set("output", transition.previous_internal * Get("previous_internal") +
-                    transition.current_internal * Get("internal") +
-                    transition.previous_output * Get("output"));
+  Linear("output", {{transition.previous_internal, "previous_internal"},
+                     {transition.current_internal, "internal"},
+                     {transition.previous_output, "output"}});
 }
 
 void NativeJointError::Compact() {
@@ -492,6 +646,46 @@ void NativeJointError::Compact() {
 void NativeJointError::Publish(
     const LocalState& state, const std::vector<SourceSampleId>& sources) {
   if (!active_) return;
+  if (structured()) {
+    Eigen::Matrix<double, 15, 18> projection =
+        Eigen::Matrix<double, 15, 18>::Zero();
+    projection.leftCols(15).setIdentity();
+    auto output = JointErrorExpression::Combine(15, {{projection, Error("output")}});
+    Eigen::MatrixXd covariance;
+    const auto started = std::chrono::steady_clock::now();
+    const auto status = output.Covariance(&covariance);
+    publish_query_ms_ += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - started).count();
+    ++publish_queries_;
+    if (!status.ok() ||
+        Eigen::LLT<Matrix15d>(covariance).info() != Eigen::Success) {
+      Fail({Reason::CORRELATION_UNQUALIFIED,
+            "Structured native output lost finite full-rank covariance"});
+      return;
+    }
+    LocalState modeled = state;
+    modeled.covariance = (0.5 * (covariance + covariance.transpose())).eval();
+    modeled.covariance_square_root.reset();
+    modeled.joint_error.reset();
+    modeled.covariance_model_valid = true;
+    modeled.uncertainty_qualified = false;
+    auto all_sources = sources;
+    std::set<std::pair<std::string, uint64_t>> identities;
+    for (const auto& source : all_sources)
+      identities.emplace(source.source, source.sequence);
+    for (const auto& source : pending_sources_)
+      if (identities.emplace(source.source, source.sequence).second)
+        all_sources.push_back(source);
+    pending_sources_.clear();
+    history_.push_back(
+        {std::move(modeled), {}, std::move(all_sources), std::move(output)});
+    frontier_finalized_ = false;
+    while (history_.size() > config_.native_joint_max_snapshots ||
+           state.stamp.time - history_.front().state.stamp.time >
+               config_.history_duration)
+      history_.pop_front();
+    return;
+  }
   Compact();
   if (!active_) return;
   LocalState modeled = state;
@@ -530,6 +724,9 @@ void NativeJointError::Publish(
 
 Result NativeJointError::FinalizeFrontier(const LocalState& state) {
   if (!active_) return status_;
+  if (structured())
+    return {Reason::CORRELATION_UNQUALIFIED,
+            "Structured native sources require the source-aware scan API"};
   if (frontier_finalized_)
     return {Reason::DUPLICATE, "Joint frontier has already been exported"};
   if (history_.empty() ||
@@ -564,6 +761,9 @@ Result NativeJointError::FinalizeFrontier(const LocalState& state) {
 Result NativeJointError::Lookup(double time, LocalState* state) const {
   if (!state || !std::isfinite(time) || time <= 0)
     return {Reason::INVALID_INPUT, "Invalid joint-error history request"};
+  if (structured())
+    return {Reason::CORRELATION_UNQUALIFIED,
+            "Structured native source model is not a dense sufficient state"};
   for (const auto& entry : history_) {
     if (entry.state.stamp.time != time) continue;
     *state = entry.state;
@@ -571,6 +771,59 @@ Result NativeJointError::Lookup(double time, LocalState* state) const {
   }
   if (!status_.ok()) return status_;
   return {Reason::HISTORY_UNAVAILABLE, "No exact retained joint-error snapshot"};
+}
+
+NativeStructuredResourceUsage NativeJointError::StructuredResourceUsage() const {
+  NativeStructuredResourceUsage usage;
+  if (!structured() || !primitives_) return usage;
+  std::lock_guard<std::mutex> lock(primitives_->mutex);
+  usage.primitive_sources = primitives_->entries.size();
+  usage.primitive_rows = primitives_->rows;
+  usage.memory_keys = structured_memory_.size();
+  usage.snapshots = history_.size();
+  usage.publish_queries = publish_queries_;
+  usage.publish_query_ms = publish_query_ms_;
+  usage.retired_registry_sources = primitives_->retired_sources;
+  usage.retired_registry_rows = primitives_->retired_rows;
+  return usage;
+}
+
+Result NativeJointError::StructuredLookup(double time,
+                                          StructuredLocalState* state) const {
+  if (!state || !std::isfinite(time) || time <= 0)
+    return {Reason::INVALID_INPUT, "Invalid structured native history query"};
+  if (!structured())
+    return {Reason::CORRELATION_UNQUALIFIED,
+            "Structured native source propagation is not enabled"};
+  for (const auto& entry : history_) {
+    if (entry.state.stamp.time != time) continue;
+    *state = {entry.state, entry.output_error};
+    return {};
+  }
+  if (!status_.ok()) return status_;
+  return {Reason::HISTORY_UNAVAILABLE, "No exact structured native snapshot"};
+}
+
+Result NativeJointError::StructuredMotionBetween(
+    double start, double end, MotionIncrement* motion) const {
+  if (!motion || !std::isfinite(start) || !std::isfinite(end) ||
+      start <= 0 || end <= start)
+    return {Reason::INVALID_INPUT, "Invalid structured native motion query"};
+  StructuredLocalState first, last;
+  auto status = StructuredLookup(start, &first);
+  if (status.ok()) status = StructuredLookup(end, &last);
+  if (!status.ok()) return status;
+  Eigen::MatrixXd cross;
+  status = first.output_error.CrossCovariance(last.output_error, &cross);
+  if (!status.ok()) return status;
+  std::vector<SourceSampleId> sources;
+  std::set<std::pair<std::string, uint64_t>> identities;
+  for (const auto& entry : history_)
+    if (entry.state.stamp.time > start && entry.state.stamp.time <= end)
+      for (const auto& source : entry.sources)
+        if (identities.emplace(source.source, source.sequence).second)
+          sources.push_back(source);
+  return ComputeMotionIncrement(first.state, last.state, cross, sources, motion);
 }
 
 Result NativeJointError::MotionBetween(double start, double end,

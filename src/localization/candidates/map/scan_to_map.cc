@@ -30,6 +30,13 @@ bool IsRigidTransform(const Eigen::Isometry3d& transform) {
          std::abs(transform.linear().determinant() - 1.0) <= 1e-6;
 }
 
+bool SameTimestamp(double reference, int64_t nanoseconds) {
+  // Native replay divides by 1e9; Timestamp adapters multiply by 1e-9.
+  // At Unix epochs those equivalent conversions can differ by one double ULP.
+  return reference == static_cast<double>(nanoseconds) / 1e9 ||
+         std::abs(reference - nanoseconds * 1e-9) <= 1e-9;
+}
+
 Eigen::Matrix3d Skew(const Eigen::Vector3d& vector) {
   Eigen::Matrix3d skew;
   skew << 0.0, -vector.z(), vector.y(), vector.z(), 0.0, -vector.x(),
@@ -137,6 +144,7 @@ bool ScanToMapLocalizer::ValidateConfig(std::string* error) const {
     return invalid("unknown scan matching algorithm");
   }
   if (config_.maximum_error_points == 0 ||
+      (config_.condition_on_fixed_target && !config_.retain_joint_error_support) ||
       (config_.retain_joint_error_support &&
        config_.algorithm != ScanMatchingAlgorithm::kPointToPlaneIcp))
     return invalid("joint registration support requires bounded point-to-plane ICP");
@@ -389,6 +397,8 @@ ScanToMapResult ScanToMapLocalizer::Match(const ScanToMapRequest& request) {
   const auto started = std::chrono::steady_clock::now();
   ScanToMapResult output;
   if (request.joint_scan) output.joint_error.emplace();
+  if (request.structured_scan) output.structured_error.emplace();
+  const bool source_aware = request.joint_scan || request.structured_scan;
   const auto finish = [&started](ScanToMapResult result) {
     result.processing_time_ms = std::chrono::duration<double, std::milli>(
                                     std::chrono::steady_clock::now() - started)
@@ -416,12 +426,62 @@ ScanToMapResult ScanToMapLocalizer::Match(const ScanToMapRequest& request) {
   output.independent_reference = metadata_.independent_reference;
   output.covariance_calibrated = false;
   output.calibration_state = CalibrationState::kUncalibrated;
+  if (request.structured_scan) output.diagnostic_only = true;
   if (!ready_) {
     output.status = MatchStatus::kNotReady;
     output.reason = "map_not_ready";
     return finish(std::move(output));
   }
   PointCloud::ConstPtr cloud = request.cloud;
+  if (request.structured_scan) {
+    const auto& scan = *request.structured_scan;
+    const auto& local = scan.conditioning_state;
+    if (request.cloud || request.joint_scan ||
+        request.initial_joint_jacobian.size() != 0 ||
+        !config_.retain_joint_error_support ||
+        config_.cloud_frame != config_.base_frame ||
+        !config_.base_from_cloud.matrix().isApprox(Eigen::Matrix4d::Identity(), 0) ||
+        !local.state.valid || !local.state.covariance_model_valid ||
+        local.state.epoch.session.empty() || local.state.epoch.generation == 0 ||
+        local.state.stamp.sequence == 0 || scan.reference.sequence == 0 ||
+        local.state.joint_error ||
+        !unified::ValidLocalCovariance(local.state) ||
+        !local.output_error.valid() || local.output_error.rows() != 15 ||
+        !request.initial_structured_error.valid() ||
+        request.initial_structured_error.rows() != 6 ||
+        !std::isfinite(local.state.stamp.time) ||
+        !std::isfinite(scan.reference.time) || scan.reference.time <= 0 ||
+        scan.reference.time > local.state.stamp.time ||
+        scan.reference.clock_id != request.clock_domain ||
+        local.state.stamp.clock_id != request.clock_domain ||
+        !SameTimestamp(scan.reference.time, request.timestamp_ns) ||
+        scan.points_in_reference_base.size() > config_.maximum_error_points ||
+        scan.points_in_reference_base.size() != scan.point_errors.size()) {
+      output.reason = "invalid_structured_scan_or_seed_error_support";
+      return finish(std::move(output));
+    }
+    Eigen::MatrixXd local_covariance;
+    const auto assessed = local.output_error.Covariance(&local_covariance);
+    if (!assessed.ok() ||
+        !local_covariance.isApprox(local.state.covariance, 1e-9)) {
+      output.reason = "inconsistent_structured_local_error_support";
+      return finish(std::move(output));
+    }
+    PointCloud::Ptr points(new PointCloud);
+    for (std::size_t i = 0; i < scan.points_in_reference_base.size(); ++i) {
+      const auto& point = scan.points_in_reference_base[i];
+      if (!point.allFinite() || !scan.point_errors[i].valid() ||
+          scan.point_errors[i].rows() != 3) {
+        output.reason = "invalid_structured_point_error_support";
+        return finish(std::move(output));
+      }
+      points->emplace_back(point.x(), point.y(), point.z());
+    }
+    cloud = std::move(points);
+  } else if (request.initial_structured_error.valid()) {
+    output.reason = "structured_seed_requires_structured_scan";
+    return finish(std::move(output));
+  }
   if (request.joint_scan) {
     const auto& scan = *request.joint_scan;
     const auto valid = unified::ValidateJointLocalError(scan.conditioning_state);
@@ -433,7 +493,7 @@ ScanToMapResult ScanToMapLocalizer::Match(const ScanToMapRequest& request) {
        scan.reference.time > scan.conditioning_state.stamp.time ||
        scan.reference.clock_id != request.clock_domain ||
        scan.conditioning_state.stamp.clock_id != request.clock_domain ||
-       std::abs(scan.reference.time - request.timestamp_ns * 1e-9) > 1e-9 ||
+       !SameTimestamp(scan.reference.time, request.timestamp_ns) ||
        scan.points_in_reference_base.size() > config_.maximum_error_points ||
        scan.points_in_reference_base.size() != scan.point_jacobians.size() ||
        request.initial_joint_jacobian.rows() != 6 ||
@@ -491,7 +551,7 @@ ScanToMapResult ScanToMapLocalizer::Match(const ScanToMapRequest& request) {
       continue;
     }
     filtered->push_back(point);
-    if (request.joint_scan) source_indices.push_back(index);
+    if (source_aware) source_indices.push_back(index);
   }
   output.source_points = static_cast<uint32_t>(filtered->size());
   const Eigen::Isometry3d map_from_cloud_initial =
@@ -511,7 +571,8 @@ ScanToMapResult ScanToMapLocalizer::Match(const ScanToMapRequest& request) {
   unified::RegistrationErrorMap errors;
   const unified::Result status =
       window->matcher.Match(filtered, map_from_cloud_initial, &match,
-                             request.joint_scan ? &errors : nullptr);
+                             source_aware ? &errors : nullptr,
+                             source_aware && config_.condition_on_fixed_target);
   output.converged = match.converged;
   output.ambiguous = match.ambiguous;
   output.score = match.score;
@@ -586,6 +647,43 @@ ScanToMapResult ScanToMapLocalizer::Match(const ScanToMapRequest& request) {
                       cloud_to_base_jacobian.transpose();
   output.observed_covariance = std::move(base_projected_covariance);
   output.observability_available = match.projection.rows() > 0;
+  if (request.structured_scan) {
+    auto& model = *output.structured_error;
+    model.assessment = errors.assessment;
+    if (!errors.assessment.ok()) return finish(std::move(output));
+    if (!match.full_pose ||
+        errors.source_point_jacobians.size() != source_indices.size()) {
+      model.assessment = {unified::Reason::CORRELATION_UNQUALIFIED,
+                          "Structured registration requires full pose support"};
+      return finish(std::move(output));
+    }
+    const auto& scan = *request.structured_scan;
+    std::vector<unified::JointErrorExpression::Term> terms{
+        {cloud_to_base_jacobian * errors.initial_jacobian,
+         request.initial_structured_error}};
+    for (std::size_t i = 0; i < source_indices.size(); ++i)
+      terms.push_back(
+          {cloud_to_base_jacobian * errors.source_point_jacobians[i],
+           scan.point_errors[source_indices[i]]});
+    auto pose_error = unified::JointErrorExpression::Combine(6, terms);
+    Eigen::MatrixXd covariance, cross;
+    model.assessment = pose_error.Covariance(&covariance);
+    if (model.assessment.ok())
+      model.assessment = scan.conditioning_state.output_error.CrossCovariance(
+          pose_error, &cross);
+    if (!model.assessment.ok()) return finish(std::move(output));
+    covariance = (0.5 * (covariance + covariance.transpose())).eval();
+    if (Eigen::LLT<unified::Matrix6d>(covariance).info() != Eigen::Success) {
+      model.assessment = {unified::Reason::CORRELATION_UNQUALIFIED,
+                          "Structured registration pose marginal is not full rank"};
+      return finish(std::move(output));
+    }
+    model.pose_error = std::move(pose_error);
+    model.conditioning = scan.conditioning_state.state.stamp;
+    model.source_sequence = scan.reference.sequence;
+    model.covariance = covariance;
+    model.local_cross_covariance = cross;
+  }
   if (request.joint_scan) {
     auto& model = *output.joint_error;
     model.assessment = errors.assessment;

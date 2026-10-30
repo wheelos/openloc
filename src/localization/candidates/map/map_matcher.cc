@@ -685,7 +685,8 @@ Result ProjectMapInformation(const Matrix6d& information,
 Result MapMatcher::Match(const Cloud::ConstPtr& base_cloud,
                          const Eigen::Isometry3d& initial,
                          MatchResult* result,
-                         RegistrationErrorMap* errors) const {
+                         RegistrationErrorMap* errors,
+                         bool deterministic_error_target) const {
   if (errors) *errors = RegistrationErrorMap();
   const auto started = std::chrono::steady_clock::now();
   const auto finish = [&started, result](Result status) {
@@ -740,7 +741,7 @@ Result MapMatcher::Match(const Cloud::ConstPtr& base_cloud,
     if (errors) {
       if (!matched.ok()) {
         errors->assessment = matched;
-      } else if (!raw_error_map_) {
+      } else if (!raw_error_map_ && !deterministic_error_target) {
         errors->assessment = {
             Reason::CORRELATION_UNQUALIFIED,
             "Registration target raw support was not retained or exceeded capacity"};
@@ -748,10 +749,11 @@ Result MapMatcher::Match(const Cloud::ConstPtr& base_cloud,
         const double target_voxel = config_.target_voxel_size > 0
             ? config_.target_voxel_size : config_.source_voxel_size;
         errors->assessment = LinearizeRawIcp(
-            *base_cloud, *filtered, *raw_error_map_, *map_,
+            *base_cloud, *filtered,
+            deterministic_error_target ? *map_ : *raw_error_map_, *map_,
             config_.source_voxel_size, target_voxel, config_.normal_neighbors,
             config_.maximum_registration_points, config_.maximum_error_points,
-            steps, errors);
+            steps, errors, deterministic_error_target);
       }
     }
     return finish(matched);

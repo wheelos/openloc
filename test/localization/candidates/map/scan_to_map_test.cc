@@ -110,6 +110,177 @@ Eigen::Matrix3d Skew(const Eigen::Vector3d& vector) {
   return skew;
 }
 
+TEST(ScanToMapTest, StructuredRegistrationMatchesDenseReusedPointAndSeedErrors) {
+  namespace u = unified;
+  auto config = TestConfig();
+  config.base_frame = config.cloud_frame = "body";
+  config.algorithm = ScanMatchingAlgorithm::kPointToPlaneIcp;
+  config.retain_joint_error_support = true;
+  config.scan_voxel_size_m = 0.05;
+  config.normal_neighbors = 6;
+  config.minimum_points = config.icp_minimum_pairs = 20;
+  config.local_window_radius_m = 10;
+  config.maximum_scan_range_m = 10;
+  PointCloud::Ptr reference(new PointCloud);
+  for (int a = 0; a < 4; ++a)
+    for (int b = 0; b < 4; ++b) {
+      const double x = 0.2 * a + 0.03713, y = 0.2 * b + 0.04317;
+      reference->emplace_back(x, y, 0.45119);
+      reference->emplace_back(2.73713, x, y + 1.6);
+      reference->emplace_back(x, 2.34317, y + 1.6);
+    }
+  ScanToMapLocalizer matcher(config);
+  std::string error;
+  ASSERT_TRUE(matcher.Configure(TestMetadata(), reference, &error)) << error;
+  u::JointLidarScan dense;
+  u::StructuredLidarScan structured;
+  dense.reference = structured.reference = {1, 1, 7, "unix"};
+  const Eigen::Index dimension = 15 + 3 * (reference->size() + 1);
+  auto& state = dense.conditioning_state;
+  state.valid = true;
+  state.epoch = {"source-aware-map-test", 1};
+  state.stamp = {1, 1, 9, "unix"};
+  state.covariance = 0.01 * u::Matrix15d::Identity();
+  Eigen::MatrixXd local_loading = Eigen::MatrixXd::Zero(15, dimension);
+  local_loading.leftCols(15) = 0.1 * u::Matrix15d::Identity();
+  state.joint_error = u::JointLocalError{
+      Eigen::MatrixXd::Identity(dimension, dimension), local_loading};
+  structured.conditioning_state.state = state;
+  structured.conditioning_state.state.joint_error.reset();
+  const auto local_error = u::JointErrorExpression::Primitive(
+      std::make_shared<const int>(0), 0.1 * u::Matrix15d::Identity());
+  structured.conditioning_state.output_error = local_error;
+  Eigen::Matrix<double, 3, 15> shared =
+      Eigen::Matrix<double, 3, 15>::Zero();
+  shared.leftCols(3) = 0.2 * Eigen::Matrix3d::Identity();
+  std::vector<u::JointErrorExpression> raw;
+  for (std::size_t i = 0; i <= reference->size(); ++i) {
+    const Eigen::Vector3d point = i == reference->size()
+        ? Eigen::Vector3d(20, 20, 20)
+        : Eigen::Vector3d((*reference)[i].x, (*reference)[i].y, (*reference)[i].z);
+    dense.points_in_reference_base.push_back(point);
+    structured.points_in_reference_base.push_back(point);
+    Eigen::MatrixXd loading = shared * local_loading;
+    loading.middleCols(15 + 3 * i, 3) = 0.01 * Eigen::Matrix3d::Identity();
+    dense.point_jacobians.push_back(loading);
+    raw.push_back(u::JointErrorExpression::Primitive(
+        std::make_shared<const int>(0), 0.01 * Eigen::Matrix3d::Identity()));
+    structured.point_errors.push_back(u::JointErrorExpression::Combine(
+        3, {{shared, local_error}, {Eigen::Matrix3d::Identity(), raw.back()}}));
+  }
+  Eigen::Matrix<double, 6, 15> local_seed =
+      Eigen::Matrix<double, 6, 15>::Zero();
+  local_seed.leftCols(3).topRows(3).setIdentity();
+  local_seed.block<3, 3>(3, 6).setIdentity();
+  Eigen::Matrix<double, 6, 3> point_seed =
+      Eigen::Matrix<double, 6, 3>::Constant(0.13);
+  point_seed.topRows(3) += Eigen::Matrix3d::Identity();
+  const Eigen::MatrixXd seed_loading =
+      local_seed * local_loading +
+      point_seed * dense.point_jacobians.front() -
+      0.5 * point_seed * dense.point_jacobians[1];
+  const auto seed = u::JointErrorExpression::Combine(
+      6, {{local_seed, local_error},
+          {point_seed, structured.point_errors.front()},
+          {-0.5 * point_seed, structured.point_errors[1]}});
+  Eigen::MatrixXd known_seed_cross;
+  ASSERT_TRUE(seed.CrossCovariance(
+      structured.point_errors.front(), &known_seed_cross).ok());
+  EXPECT_TRUE(known_seed_cross.isApprox(
+      seed_loading * dense.point_jacobians.front().transpose(), 1e-12));
+  ScanToMapRequest request;
+  request.timestamp_ns = 1'000'000'000;
+  request.clock_domain = "unix";
+  request.cloud_frame = "body";
+  request.deskewed = true;
+  request.joint_scan = &dense;
+  request.initial_joint_jacobian = seed_loading;
+  const auto dense_match = matcher.Match(request);
+  ASSERT_TRUE(dense_match.valid) << dense_match.reason << ": " << dense_match.detail;
+  ASSERT_TRUE(dense_match.joint_error);
+  ASSERT_TRUE(dense_match.joint_error->assessment.ok())
+      << dense_match.joint_error->assessment.message;
+  request.joint_scan = nullptr;
+  request.initial_joint_jacobian.resize(0, 0);
+  request.structured_scan = &structured;
+  request.initial_structured_error = seed;
+  const auto match = matcher.Match(request);
+  ASSERT_TRUE(match.valid) << match.reason << ": " << match.detail;
+  ASSERT_TRUE(match.structured_error);
+  ASSERT_TRUE(match.structured_error->assessment.ok())
+      << match.structured_error->assessment.message;
+  EXPECT_FALSE(match.joint_error);
+  EXPECT_FALSE(match.covariance_calibrated);
+  EXPECT_TRUE(match.diagnostic_only);
+  EXPECT_EQ(match.source_points, reference->size());
+  EXPECT_TRUE(match.map_from_base.matrix().isApprox(
+      dense_match.map_from_base.matrix(), 0));
+  EXPECT_TRUE(match.covariance.isApprox(dense_match.covariance, 0));
+  const auto& model = *match.structured_error;
+  const auto& oracle = *dense_match.joint_error;
+  EXPECT_EQ(model.conditioning.sequence, state.stamp.sequence);
+  EXPECT_EQ(model.source_sequence, dense.reference.sequence);
+  EXPECT_LE((model.covariance - oracle.covariance).norm(), 1e-11);
+  EXPECT_LE((model.local_cross_covariance -
+             local_loading * oracle.local_cross_covariance).norm(), 1e-11);
+  Eigen::MatrixXd cross;
+  ASSERT_TRUE(model.pose_error.CrossCovariance(seed, &cross).ok());
+  EXPECT_LE((cross - oracle.pose_jacobian * seed_loading.transpose()).norm(), 1e-11);
+  for (std::size_t i = 0; i < structured.point_errors.size(); ++i) {
+    ASSERT_TRUE(model.pose_error.CrossCovariance(
+        structured.point_errors[i], &cross).ok());
+    EXPECT_LE((cross - oracle.pose_jacobian *
+                          dense.point_jacobians[i].transpose()).norm(), 1e-11);
+  }
+  const auto repeated = matcher.Match(request);
+  ASSERT_TRUE(repeated.structured_error);
+  ASSERT_TRUE(repeated.structured_error->assessment.ok());
+  ASSERT_TRUE(model.pose_error.CrossCovariance(
+      repeated.structured_error->pose_error, &cross).ok());
+  EXPECT_TRUE(cross.isApprox(model.covariance, 1e-11));
+  constexpr int64_t kUnixTime = 1791882562503163099LL;
+  const double native_time = static_cast<double>(kUnixTime) / 1e9;
+  ASSERT_NE(native_time, kUnixTime * 1e-9);
+  request.timestamp_ns = kUnixTime;
+  dense.reference.time = structured.reference.time = native_time;
+  state.stamp.time = structured.conditioning_state.state.stamp.time = native_time;
+  const auto unix_structured = matcher.Match(request);
+  ASSERT_TRUE(unix_structured.valid) << unix_structured.reason;
+  ASSERT_TRUE(unix_structured.structured_error->assessment.ok());
+  request.timestamp_ns += 1000000;
+  EXPECT_EQ(matcher.Match(request).reason,
+            "invalid_structured_scan_or_seed_error_support");
+  request.timestamp_ns = kUnixTime;
+  request.structured_scan = nullptr;
+  request.initial_structured_error = {};
+  request.joint_scan = &dense;
+  request.initial_joint_jacobian = seed_loading;
+  ASSERT_TRUE(matcher.Match(request).valid);
+  request.timestamp_ns = 1'000'000'000;
+  dense.reference.time = structured.reference.time = 1;
+  state.stamp.time = structured.conditioning_state.state.stamp.time = 1;
+  request.joint_scan = nullptr;
+  request.initial_joint_jacobian.resize(0, 0);
+  request.structured_scan = &structured;
+  request.initial_structured_error = seed;
+  u::GlobalObservation sentinel;
+  sentinel.source = "unchanged";
+  EXPECT_EQ(u::AdaptScanToMapObservation(match, state, {}, {}, &sentinel).reason,
+            u::Reason::CORRELATION_UNQUALIFIED);
+  EXPECT_EQ(sentinel.source, "unchanged");
+  request.initial_structured_error = {};
+  EXPECT_EQ(matcher.Match(request).reason,
+            "invalid_structured_scan_or_seed_error_support");
+  request.initial_structured_error = seed;
+  request.joint_scan = &dense;
+  EXPECT_EQ(matcher.Match(request).reason,
+            "invalid_structured_scan_or_seed_error_support");
+  request.joint_scan = nullptr;
+  structured.conditioning_state.state.covariance *= 2;
+  EXPECT_EQ(matcher.Match(request).reason,
+            "inconsistent_structured_local_error_support");
+}
+
 TEST(ScanToMapTest, SeparateSupportCannotBecomeQualifiedFromMapMetadata) {
   auto config = TestConfig();
   config.separate_ndt_support = true;

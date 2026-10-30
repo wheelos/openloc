@@ -117,7 +117,8 @@ class MapMatcher {
   Result SetMap(const Cloud::ConstPtr& cloud, bool retain_error_support = false);
   Result Match(const Cloud::ConstPtr& base_cloud,
                const Eigen::Isometry3d& initial, MatchResult* result,
-               RegistrationErrorMap* errors = nullptr) const;
+               RegistrationErrorMap* errors = nullptr,
+               bool deterministic_error_target = false) const;
   Result Recover(const Cloud::ConstPtr& base_cloud,
                  const std::vector<Eigen::Isometry3d>& seeds,
                  MatchResult* result) const;

@@ -8,6 +8,15 @@ then remove obsolete notes.
 
 ## OpenLoc validation entry points
 
+- **当前整体状态与下一步计划（2026-10-30）：**
+  [进展、阻塞与分阶段验收](status-plan-20261030.md)。
+  最新 [GNSS 数值修复报告](gnss_constraint_repair_20261030_v1/REPORT.md)
+  已替代早先长段 GNSS 失败结论：八组近似模型因果消融完成，
+  300 项 C++、39 项 Python 和 80 图／780 断言通过。
+  原生 source 容量、独立精度/校准可信度及宿主实时资格仍未完成。
+  下一优先级是完整活跃前沿/外部查询/异步分支的生命周期与稀疏表示，
+  不是将 15D 诊断模型提升为原生模型。下列 2026-10-28 及更早条目
+  保留为各自范围的历史证据，不代表最新总体验收状态。
 - **当前LIO局部优化（2026-10-28）：**
   [阶段瓶颈、21次实跑与负面结果](lio_performance_20261028_v1/REPORT.md) /
   [逐次指标及精确对照](lio_performance_20261028_v1/metrics.json)。

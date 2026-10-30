@@ -82,6 +82,147 @@ Memory rows, minimal stochastic dimension and exported snapshot count are
 separately bounded; dependency/rank overflow rejects the observer without
 dropping a physical dependency or changing nominal ODOM.
 
+`JointLidarInputErrorMap()` exposes a fresh scan's **pre-update** structured
+support at the exact current frontier: shared internal/output/history loadings
+in one unit-covariance memory basis, actual deskew Jacobians, and independent
+raw-point variance keyed by epoch, scan sequence and point index. Repeated
+queries must reuse those raw sources; shared basis coordinates are local to
+one snapshot and must not be mixed across exports. The read-only export neither
+inserts all point drivers nor substitutes for a retained corrected `JointLidarScan`,
+graph motion, or a sufficient temporal model. The test-only replay flag
+`--native-joint-query-probe`, requiring native joint audit, writes this support
+for the first eligible scan and then continues normal admission; a subsequent
+native capacity refusal still fails the replay.
+
+The separate, default-off `LocalConfig::enable_native_structured_error`
+requires native joint propagation and keeps the same frozen-linearization
+errors as immutable source-aware expressions instead of a dense full-point
+basis. `StructuredErrorLookup()`, `PrepareStructuredLidarScan()` and
+`StructuredErrorMotionBetween()` expose finite covariance queries, retaining
+original point identities and shared errors through correction, history and
+delayed forks. Adjacent endpoint covariances are **not** a sufficient Markov
+graph model. Dense joint lookup/scan/query-basis exports reject this mode;
+the existing graph/host transport must not treat it as an independent 15D
+chain or serialize a zero-dimensional joint state. Source-aware scan-to-map
+requests use `ScanToMapRequest::structured_scan` with an explicit 6D
+`initial_structured_error`; the result's separate `structured_error` preserves
+actual seed/point identities and finite pose/output cross-covariance. The
+explicit `condition_on_fixed_target` submodel differentiates only stochastic
+source points and seeds, not deterministic target voxels or target normals;
+default raw ICP still validates target derivatives. Source voxel ambiguities
+remain rejected in both modes. The legacy dense
+map-observation adapter rejects that result instead of inventing
+independence. A frozen finite-query-family regression connects actual native
+outputs and ICP errors to the existing graph using their complete joint
+covariance; it is offline synthetic evidence, not an arbitrary-future streaming
+adapter or real-capture map/GNSS fusion acceptance. Its source registry is
+bounded but does not yet compact for indefinite operation. This is a native
+producer/map capability, not complete streaming native-to-graph integration or
+runtime qualification.
+
+`StructuredErrorResourceUsage()` reports owner-local structured source rows,
+registry entries, retained snapshots and cumulative publication covariance-query
+time. It does not estimate allocated bytes, include external expression holders,
+or qualify uncertainty. With `--profile-local-timing --native-joint-structured`,
+the replay writes these counters to `native_resources.csv` alongside its existing
+per-IMU and per-scan timings. Snapshot retirement does not imply primitive-source
+retirement; use process-memory measurements separately. At registry exhaustion,
+only identities with no expression/fork holder can be reclaimed. Counters expose
+this bookkeeping reclamation; it is not compression of live dependencies or an
+indefinite-memory guarantee.
+Exactly zero derivative terms do not retain primitive identities; nonzero
+dependencies are never pruned by a tolerance.
+
+The test-only `native_structured_fault_replay` reloads the frozen finite family
+for direct factor omission/outlier experiments without rerunning raw LIO/ICP.
+Its `--causal-prefixes` mode rebuilds each available receive-time prefix from
+only that prefix's covariance rows and observations. It tests growing query
+families without future factors; it still consumes an offline frozen bundle,
+rebuilds the graph and does not implement a live sensor adapter, prior transfer,
+source compaction or host transport.
+
+The test-only `keyframe_graph_replay` additionally accepts
+`--experimental-independent-keyframes --causal-receive-order`. Its node header
+is `timestamp_ns,px,py,pz,qx,qy,qz,qw,receive_ns`; measurements retain the existing
+schema and must be sorted by receive time. Two streaming cursors merge arrivals
+(nodes first on receive-time ties); observations never move to a nearest node.
+Missing or retired nodes are explicit refusals, not silently queued forever.
+Initialization uses an available full-pose map anchor, including in the LIO/GNSS
+arms. Graph state, local retention and factor slots are reported in `events.csv`;
+evaluation-history archiving is disabled.
+
+This mode uses the caller's explicit random-walk model, not native stochastic
+propagation. Its closed named error frontier uses orthogonal QR to preserve
+joint covariance of retained queries without a rank threshold. A delayed task
+or reused point must remain a named pin until its last use; retired primitive
+identities and unmanaged old query handles cannot be replayed. That contract
+does not automatically hold for the native frontend's full active geometry.
+The prototype does not repair native structured-source exhaustion or qualify
+LIO/map/GNSS independence, uncertainty, global health, host scheduling or
+physical accuracy. Production defaults and source-admission gates are unchanged.
+
+For a bounded **real-input offline functional experiment**, test-only
+`//:native_lio_replay` additionally accepts
+`--offline-structured-closure SELECTED_SCANS.csv` together with
+`--native-joint-structured`, the native audit/limits, and the existing explicitly
+pinned `--diagnostic-map` / `--diagnostic-gnss` bundles. The selection schema is
+`scan_sequence` with 3..16 strictly increasing original scan identities.
+This synchronous path reuses the actual raw replay/bootstrap, original retained
+points, existing map loader/ICP, GNSS quality gate and `FixedLagGlobalAlignment`.
+The fixed map seed needs its existing explicit time policy. Subsequent seed
+errors include both the first native endpoint and the current native output;
+map/graph results never feed back into native ODOM or later matcher seeds.
+
+The complete covariance of only the selected native output / actual ICP
+expressions is rooted in a shared unit basis, bounded by 2048 query rows.
+Unresolved rank rejects without noise inflation. Original GNSS measurement
+timestamps remain unchanged: missing exact native samples use explicitly
+approximate linear position/velocity/bias and SLERP attitude interpolation,
+with the corresponding shared-error Jacobians and both original IMU brackets.
+The first two full-pose map matches are common absolute bootstrap anchors in
+all four arms (LIO continuation, +GNSS, +later map, +both). Each runs the same
+available prefix with 300 ms lag and a no-eviction control.
+
+Continuous-output error propagation uses analytic limiter Jacobians. It
+rejects unresolved branch equality using floating-point roundoff bounds,
+including position-cancellation error before division by the IMU interval,
+not a fixed finite-difference probe radius. Exact limiter kinks and the
+rotation-log branch boundary still reject; nominal limits and covariance
+assumptions are unchanged.
+
+This model conditions on a deterministic prior map/configuration seed and
+**assumes**, but does not establish, GNSS cross-source independence. Real GNSS
+map-construction dependencies remain recorded and unmodeled. GNSS uses an
+explicitly approximate conditional factor with zero cross-covariance and its
+unchanged prepared residual covariance; it does not assert independent-source
+qualification against the recorded shared dependencies. Algebraic
+finite-family sufficiency is not a field qualification or an arbitrary-future
+source model; covariance calibration stays false and graph estimates stay
+diagnostic/untrusted. `structured_scope.csv`, `structured_nodes.csv`,
+`structured_map.csv`, complete family covariance/root, and per-arm
+`*_decisions.csv` / `*_sources.csv` preserve interpolation, admissions,
+rejections and actual pre-update NIS (not post-fit residuals).
+Run the focused schema and functional checks in the managed container with
+`python3 test/integration/map/native_structured_closure_test.py bazel-bin/native_lio_replay`.
+
+For bottom-up **offline engineering experiments**,
+`//:keyframe_graph_replay` reuses the target `FixedLagGraph` numerical core
+with frozen nominal poses, original map/XY observations and a caller-declared
+independent-keyframe random-walk model. It requires
+`--experimental-independent-keyframes`, one common full-pose map anchor for
+every arm (including LIO/GNSS), and exact measurement-time nodes. It archives
+the committed factors for a no-marginalization batch reference and writes
+decisions, residuals, costs and explicit untrusted/model-scope flags.
+This is not the public qualified facade, an exact native LIO covariance model,
+or a remedy for native capacity overflow. Actual scan/source correlations are
+unmodeled; internal model endpoint tokens are not original IMU identities.
+`native_lio_replay` now records submitted pre-owner observation geometry and
+covariance in `graph_measurements.csv` without changing diagnostic admission.
+The input schemas and known-answer/add-source tests are in
+[`keyframe_graph_replay_test.py`](test/integration/map/keyframe_graph_replay_test.py).
+Neither successful optimization nor agreement with batch establishes physical
+accuracy, calibration, causal online operation or runtime readiness.
+
 The IMU model requires explicit `native_imu_sample_period`: raw acceleration/
 gyro sample variances are the configured continuous-time PSDs divided by that
 period. Each original sample error is shared by both adjacent trapezoids and
@@ -689,6 +830,18 @@ truncation from violating exact constraints. Lag, solve budget, maximum
 iterations, source gates and the 1e-6 feasibility tolerance are unchanged.
 `retained_relinearizations` makes this work visible in evaluation CSV/JSON.
 
+If feasibility still fails after the initial retained GN refinement, the
+remaining iteration budget now uses GTSAM's scale-aware LM step policy.
+The original marginalized information/chart and all exact equations are kept;
+damping controls optimization steps and is not retained as sensor information.
+The accepted mean is paired with an undamped posterior linearization, without
+applying another unrestricted GN step. Iteration, time, angular-domain and
+feasibility checks still reject unsuccessful candidates transactionally.
+Causal replay reports the committed `solve_iterations`, `damped_iterations`
+and `maximum_motion_residual`. This repairs the reproduced weak-axis
+oscillation, not every possible nonlinear convergence failure or native-source
+capacity limit.
+
 The earlier matched 8-node/5 s and 12-node/60 s experiments each completed all 640
 trials; the old failures remain frozen evidence. Regression includes both
 previously failing no-eviction seeds and a turning/shared-source/dimension-change
@@ -888,6 +1041,13 @@ configured local history duration, not a claimed retained support span.
 Increasing capacity does not repair rank loss, missing physical dependencies
 or target-graph bootstrap/source-provenance requirements. An audit failure
 preserves its decision and aborts without replacing nominal ODOM covariance.
+
+`--native-joint-structured` additionally selects the explicit structured
+producer above; it requires `--native-joint-audit-period-s` and cannot be
+combined with the dense `--native-joint-query-probe`. Structured audit rows
+declare `structured_sources_not_dense_graph_state`, dimension 0 and trusted 0.
+The zero dimension denotes the absence of a dense exported basis, not zero
+uncertainty or permission for graph admission.
 
 Latest three-capture trace evidence is under
 `.agents/notes/native_imu_trace_validation_20261023_v2/`.

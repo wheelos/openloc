@@ -244,15 +244,33 @@ Result ContinuousOutput::LinearizeLastStep(
   const auto nominal = AdvanceNominal(config_, input.previous_internal,
                                       input.internal, input.output,
                                       input.memory, input.dt);
-  const auto at_boundary = [](double norm, double limit) {
-    return std::abs(norm - limit) <= 1e-5 * std::max(1.0, limit);
+  const double roundoff = 64 * std::numeric_limits<double>::epsilon();
+  const double rate_roundoff =
+      roundoff *
+      (input.previous_internal.position.norm() + input.internal.position.norm() +
+       input.output.position.norm() + nominal.translation_error.norm()) /
+      input.dt;
+  const auto at_boundary = [](double norm, double limit, double uncertainty) {
+    return std::abs(norm - limit) <= uncertainty;
   };
+  // Analytic derivatives need a resolved branch, not a finite-difference probe
+  // radius. Account for cancellation in the positions before dividing by dt.
   if (at_boundary(nominal.translation_error.norm() / input.dt,
-                  config_.lidar_max_translation_correction_rate) ||
+                  config_.lidar_max_translation_correction_rate,
+                  rate_roundoff +
+                      roundoff * config_.lidar_max_translation_correction_rate) ||
       at_boundary((nominal.target_memory - input.memory).norm(),
-                  config_.lidar_max_velocity_correction_acceleration * input.dt) ||
+                  config_.lidar_max_velocity_correction_acceleration * input.dt,
+                  rate_roundoff +
+                      roundoff * (nominal.target_memory.norm() +
+                                  input.memory.norm() +
+                                  config_.lidar_max_velocity_correction_acceleration *
+                                      input.dt)) ||
       at_boundary(nominal.rotation_error.norm(),
-                  config_.lidar_max_rotation_correction_rate * input.dt) ||
+                  config_.lidar_max_rotation_correction_rate * input.dt,
+                  roundoff * (1.0 + nominal.rotation_error.norm() +
+                              config_.lidar_max_rotation_correction_rate *
+                                  input.dt)) ||
       nominal.rotation_error.norm() >= std::acos(-1.0) - 1e-5) {
     return {Reason::CORRELATION_UNQUALIFIED,
             "Output limiter/rotation boundary has no unique local error Jacobian"};

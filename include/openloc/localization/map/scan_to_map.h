@@ -117,6 +117,10 @@ struct ScanToMapConfig {
   // Opt-in uncalibrated model conditional on a deterministic versioned map.
   // Map construction/survey uncertainty is NOT qualified by this assumption.
   bool retain_joint_error_support = false;
+  // Explicit fixed-target submodel: omit target voxel/normal derivatives,
+  // since only source/seed errors vary. Does not qualify map construction.
+  // Default preserves the existing full raw-derivative validation.
+  bool condition_on_fixed_target = false;
   uint32_t maximum_error_points = 100000;
 };
 
@@ -132,6 +136,27 @@ struct ScanToMapRequest {
   // configuration seed has a zero loading; a graph/GNSS seed is not fixed.
   const unified::JointLidarScan* joint_scan = nullptr;
   Eigen::MatrixXd initial_joint_jacobian;
+  // Exclusive with cloud/joint_scan. Seed error uses the registration's
+  // [map translation, left map attitude] convention, sharing the actual
+  // primitive identities of all reused inputs. A fixed seed needs an explicit
+  // zero expression; an absent expression never implies deterministic.
+  const unified::StructuredLidarScan* structured_scan = nullptr;
+  unified::JointErrorExpression initial_structured_error;
+};
+
+struct ScanToMapStructuredError {
+  unified::Result assessment{
+      unified::Reason::CORRELATION_UNQUALIFIED,
+      "Structured registration error model is unavailable"};
+  unified::Stamp conditioning;
+  uint64_t source_sequence = 0;
+  // [map translation, left map attitude], not a sufficient graph state.
+  unified::JointErrorExpression pose_error;
+  // Exact E[published local 15D error * map pose error^T].
+  Eigen::Matrix<double, 15, 6> local_cross_covariance =
+      Eigen::Matrix<double, 15, 6>::Zero();
+  Eigen::Matrix<double, 6, 6> covariance =
+      Eigen::Matrix<double, 6, 6>::Zero();
 };
 
 struct ScanToMapJointError {
@@ -209,6 +234,9 @@ struct ScanToMapResult {
   // Separate from residual-Hessian diagnostics above. In this model every
   // source-point error is mediated by the native joint state, not duplicated.
   std::optional<ScanToMapJointError> joint_error;
+  // Separate contract: legacy dense graph adapters must reject this, not
+  // relabel its finite marginal as independent registration noise.
+  std::optional<ScanToMapStructuredError> structured_error;
 };
 
 // Standalone scan-to-map component. It emits observations only; it does not

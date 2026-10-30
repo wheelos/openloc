@@ -266,6 +266,60 @@ TEST(ContinuousOutputTest, AnalyticMapMatchesActualRotatedLimiterBranches) {
   }
 }
 
+TEST(ContinuousOutputTest, ResolvedNearLimiterBranchesKeepAnalyticDerivatives) {
+  for (int limiter = 0; limiter < 3; ++limiter) {
+    for (double side : {-1.0, 0.0, 1.0}) {
+      SCOPED_TRACE(limiter);
+      SCOPED_TRACE(side);
+      auto config = LinearizationConfig();
+      constexpr double dt = 0.005;
+      constexpr double margin = 1e-7;
+      config.lidar_max_translation_correction_rate = limiter == 0 ? 0.2 : 10;
+      config.lidar_max_velocity_correction_acceleration = limiter == 1 ? 0.3 : 100;
+      config.lidar_max_rotation_correction_rate = limiter == 2 ? 0.1 : 10;
+      const auto published = State(1, 0);
+      auto previous = published;
+      double error = limiter == 0 ? 0.2 * dt + side * margin * dt
+                     : limiter == 1 ? 0.3 * dt * dt + side * margin * dt
+                                    : 0.1 * dt + side * margin;
+      if (limiter == 2) previous.orientation = ExpRotation({error, 0, 0});
+      else previous.position.x() = error;
+      auto current = previous;
+      current.stamp.time += dt;
+      const auto evaluate = [&](double delta, ContinuousOutputErrorTransition* map) {
+        auto start = published;
+        if (limiter == 2) start.orientation = ExpRotation({delta, 0, 0});
+        else start.position.x() += delta;
+        ContinuousOutput output(config);
+        output.Reset(start);
+        EXPECT_TRUE(output.Advance(previous, current, Matrix15d::Identity(), dt).ok());
+        if (map) {
+          const auto result = output.LinearizeLastStep(map);
+          EXPECT_EQ(result.reason, side == 0 ? Reason::CORRELATION_UNQUALIFIED
+                                            : Reason::NONE);
+        }
+        return output.state();
+      };
+      ContinuousOutputErrorTransition map;
+      evaluate(0, &map);
+      if (side == 0) continue;
+      constexpr double step = 1e-11;
+      const auto plus = evaluate(step, nullptr);
+      const auto minus = evaluate(-step, nullptr);
+      const double derivative =
+          limiter == 2
+              ? LogRotation(minus.orientation.conjugate() * plus.orientation).x() /
+                    (2 * step)
+              : (plus.position.x() - minus.position.x()) / (2 * step);
+      const int index = limiter == 2 ? 6 : 0;
+      EXPECT_NEAR(map.previous_output(index, index), derivative, 1e-6);
+      const double expected =
+          side < 0 ? (limiter == 0 ? 0.5 : limiter == 1 ? 0.5 : 0.0) : 1.0;
+      EXPECT_NEAR(derivative, expected, 1e-6);
+    }
+  }
+}
+
 TEST(ContinuousOutputTest, LimiterKinksAreExplicitAndCannotReuseOldLinearization) {
   auto config = LinearizationConfig();
   config.lidar_max_translation_correction_rate = 0.2;

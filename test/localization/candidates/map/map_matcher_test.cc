@@ -197,6 +197,42 @@ TEST(MapMatcherTest, RawErrorSupportRejectionDoesNotReplaceNominalRegistration) 
   EXPECT_TRUE(errors.source_point_jacobians.empty());
 }
 
+TEST(MapMatcherTest, FixedTargetModelDoesNotRequireUnusedTargetVoxelDerivatives) {
+  auto config = Config();
+  config.algorithm = RegistrationAlgorithm::kPointToPlaneIcp;
+  const auto map = AsymmetricMap();  // Target includes exact voxel boundaries.
+  Eigen::Isometry3d pose = Eigen::Isometry3d::Identity();
+  pose.translation() = Eigen::Vector3d(0.03713, 0.04317, 0.05119);
+  const auto source = ScanInSensorFrame(*map, pose);
+  MapMatcher matcher(config);
+  ASSERT_TRUE(matcher.SetMap(map).ok());
+  MatchResult nominal, modeled;
+  ASSERT_TRUE(matcher.Match(source, pose, &nominal).ok());
+  RegistrationErrorMap errors;
+  ASSERT_TRUE(matcher.Match(source, pose, &modeled, &errors, true).ok());
+  ASSERT_TRUE(errors.assessment.ok()) << errors.assessment.message;
+  EXPECT_TRUE(errors.target_point_jacobians.empty());
+  ASSERT_EQ(errors.source_point_jacobians.size(), source->size());
+  EXPECT_TRUE(modeled.pose.matrix().isApprox(nominal.pose.matrix(), 0));
+  EXPECT_TRUE(modeled.covariance.isApprox(nominal.covariance, 0));
+  Eigen::Matrix<double, 6, 3> loading =
+      Eigen::Matrix<double, 6, 3>::Zero();
+  for (const auto& point : errors.source_point_jacobians) loading += point;
+  Eigen::Matrix<double, 6, 3> expected =
+      Eigen::Matrix<double, 6, 3>::Zero();
+  expected.topRows<3>() = -Eigen::Matrix3d::Identity();
+  EXPECT_TRUE(loading.isApprox(expected, 1e-5));
+
+  ASSERT_TRUE(matcher.SetMap(map, true).ok());
+  ASSERT_TRUE(matcher.Match(source, pose, &modeled, &errors).ok());
+  EXPECT_FALSE(errors.assessment.ok());
+  EXPECT_NE(errors.assessment.message.find("Target:"), std::string::npos);
+  ASSERT_TRUE(matcher.Match(map, Eigen::Isometry3d::Identity(),
+                            &modeled, &errors, true).ok());
+  EXPECT_FALSE(errors.assessment.ok());
+  EXPECT_NE(errors.assessment.message.find("Source:"), std::string::npos);
+}
+
 TEST(MapMatcherTest, RejectsInvalidVoxelAndSolverBudgets) {
   const Cloud::Ptr map = AsymmetricMap();
   MatchConfig config = Config();

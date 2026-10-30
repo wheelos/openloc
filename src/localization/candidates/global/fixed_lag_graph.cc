@@ -22,16 +22,40 @@
 #include "gtsam/geometry/Pose3.h"
 #include "gtsam/inference/Symbol.h"
 #include "gtsam/linear/JacobianFactor.h"
+#include "gtsam/linear/GaussianConditional.h"
 #include "gtsam/linear/linearExceptions.h"
 #include "gtsam/nonlinear/IncrementalFixedLagSmoother.h"
 #include "gtsam/nonlinear/GaussNewtonOptimizer.h"
 #include "gtsam/nonlinear/LinearContainerFactor.h"
+#include "gtsam/nonlinear/LevenbergMarquardtOptimizer.h"
 #include "gtsam/nonlinear/NonlinearFactor.h"
 #include "gtsam/slam/PriorFactor.h"
 
 namespace openloc {
 namespace localization {
 namespace unified {
+
+Result ConditionalRowSigmas(const gtsam::GaussianConditional& conditional,
+                            Eigen::VectorXd* sigmas) {
+  const Eigen::Index rows = conditional.R().rows();
+  if (!sigmas || rows <= 0)
+    return {Reason::INVALID_INPUT, "Invalid conditional noise query"};
+  const auto& noise = conditional.get_model();
+  if (!noise) {
+    *sigmas = Eigen::VectorXd::Ones(rows);
+    return {};
+  }
+  const auto& full = noise->sigmas();
+  if (full.size() < rows ||
+      full.size() - rows > conditional.matrixObject().rowStart() ||
+      !full.allFinite() || (full.array() < 0).any())
+    return {Reason::DEGENERATE, "Conditional noise does not match its active rows"};
+  // GTSAM marginalizeLeaves crops the frontal matrix view, but retains the
+  // original noise vector. The surviving equations are its trailing rows.
+  *sigmas = full.tail(rows);
+  return {};
+}
+
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -104,12 +128,8 @@ class AlignmentSmoother final : public gtsam::IncrementalFixedLagSmoother {
   explicit AlignmentSmoother(double lag)
       : gtsam::IncrementalFixedLagSmoother(lag, Parameters()) {}
 
-  void RelinearizeRetained() {
-    const auto estimate = calculateEstimate();
+  gtsam::NonlinearFactorGraph RetainedFactors() const {
     gtsam::NonlinearFactorGraph factors;
-    gtsam::FastMap<gtsam::Key, int> groups;
-    for (const auto& value : estimate)
-      groups[value.key] = gtsam::Symbol(value.key).chr() == 'x' ? 0 : 1;
     for (const auto& factor : getFactors()) {
       if (!factor) continue;
       const auto* marginal =
@@ -126,6 +146,37 @@ class AlignmentSmoother final : public gtsam::IncrementalFixedLagSmoother {
         factors.push_back(factor);
       }
     }
+    return factors;
+  }
+
+  void AdoptEstimate(const gtsam::NonlinearFactorGraph& factors,
+                     const gtsam::Values& estimate) {
+    class Posterior final : public gtsam::ISAM2 {
+     public:
+      Posterior() : gtsam::ISAM2(Parameters()) {}
+      void KeepAcceptedPoint() {
+        // The LM iterate owns the mean. This undamped tree supplies covariance;
+        // do not apply its unrestricted GN step a second time.
+        getDelta();
+        delta_.setZero();
+        deltaReplacedMask_.clear();
+      }
+    };
+    gtsam::FastMap<gtsam::Key, int> groups;
+    for (const auto& value : estimate)
+      groups[value.key] = gtsam::Symbol(value.key).chr() == 'x' ? 0 : 1;
+    Posterior replacement;
+    isamResult_ = replacement.update(factors, estimate, {}, groups);
+    replacement.KeepAcceptedPoint();
+    isam_ = std::move(replacement);
+  }
+
+  void RelinearizeRetained() {
+    const auto estimate = calculateEstimate();
+    const auto factors = RetainedFactors();
+    gtsam::FastMap<gtsam::Key, int> groups;
+    for (const auto& value : estimate)
+      groups[value.key] = gtsam::Symbol(value.key).chr() == 'x' ? 0 : 1;
     gtsam::ISAM2 replacement(Parameters());
     isamResult_ = replacement.update(factors, estimate, {}, groups);
     isam_ = std::move(replacement);
@@ -199,9 +250,10 @@ Result PosteriorCovariance(
         r.transpose().triangularView<Eigen::Lower>().solve(rhs);
     if (!solved.allFinite())
       return {Reason::DEGENERATE, "Posterior covariance triangular solve failed"};
-    const auto& noise = conditional.get_model();
-    const Eigen::MatrixXd weighted =
-        noise ? (noise->sigmas().asDiagonal() * solved).eval() : solved;
+    Eigen::VectorXd sigmas;
+    const auto noise_status = ConditionalRowSigmas(conditional, &sigmas);
+    if (!noise_status.ok()) return noise_status;
+    const Eigen::MatrixXd weighted = sigmas.asDiagonal() * solved;
     result.noalias() += weighted.transpose() * weighted;
     for (auto it = conditional.beginParents();
          it != conditional.endParents(); ++it) {
@@ -216,8 +268,12 @@ Result PosteriorCovariance(
     const auto valid = visit(visit, root);
     if (!valid.ok()) return valid;
   }
-  if (!adjoints.empty() || !result.allFinite())
-    return {Reason::DEGENERATE, "Incomplete or nonfinite posterior covariance"};
+  if (!adjoints.empty())
+    return {Reason::DEGENERATE,
+            "Incomplete posterior covariance: unresolved adjoint keys=" +
+                std::to_string(adjoints.size())};
+  if (!result.allFinite())
+    return {Reason::DEGENERATE, "Nonfinite posterior covariance accumulation"};
   *covariance = (0.5 * (result + result.transpose())).eval();
   return {};
 }
@@ -619,6 +675,9 @@ struct FixedLagGraph::Impl {
   gtsam::NonlinearFactorGraph evaluation_factors;
   gtsam::Values evaluation_initial;
   uint64_t retained_relinearizations = 0;
+  uint32_t solve_iterations = 0;
+  uint32_t damped_iterations = 0;
+  double maximum_motion_residual = 0;
 
   void Archive(const gtsam::NonlinearFactorGraph& factors,
                const gtsam::Values& values) {
@@ -627,10 +686,13 @@ struct FixedLagGraph::Impl {
   }
 
   Result Finalize(const FixedLagConfig& config, Clock::time_point started) {
-    double maximum_motion_residual = 0;
+    damped_iterations = 0;
+    std::unique_ptr<gtsam::LevenbergMarquardtOptimizer> refinement;
     for (uint32_t iteration = 0; iteration < config.max_iterations;
          ++iteration) {
-      const gtsam::Values estimate = smoother.calculateEstimate();
+      solve_iterations = iteration + 1;
+      const gtsam::Values estimate =
+          refinement ? refinement->values() : smoother.calculateEstimate();
       for (const auto& node : nodes) {
         const auto& error =
             estimate.at<gtsam::Vector>(ErrorKey(node.second.key));
@@ -644,7 +706,9 @@ struct FixedLagGraph::Impl {
       }
       bool consistent = true;
       maximum_motion_residual = 0;
-      for (const auto& factor : smoother.getFactors()) {
+      const auto& factors =
+          refinement ? refinement->graph() : smoother.getFactors();
+      for (const auto& factor : factors) {
         const auto* marginal =
             dynamic_cast<const FrozenMarginalFactor*>(factor.get());
         if (marginal) {
@@ -689,6 +753,10 @@ struct FixedLagGraph::Impl {
         consistent = consistent && residual.cwiseAbs().maxCoeff() <= 1e-6;
       }
       if (consistent) {
+        if (refinement) {
+          smoother.AdoptEstimate(refinement->graph(), estimate);
+          ++retained_relinearizations;
+        }
         return Snapshot(config.solve_budget_ms, started);
       }
       if (std::chrono::duration<double, std::milli>(Clock::now() - started)
@@ -696,12 +764,26 @@ struct FixedLagGraph::Impl {
         return {Reason::GLOBAL_STALE, "Graph exhausted its solve budget"};
       }
       if (iteration + 1 < config.max_iterations) {
-        if (!smoother.getISAM2().getFixedVariables().empty()) {
-          smoother.RelinearizeRetained();
-          ++retained_relinearizations;
-        } else {
-          smoother.update();
+        if (iteration == 0) {
+          if (!smoother.getISAM2().getFixedVariables().empty()) {
+            smoother.RelinearizeRetained();
+            ++retained_relinearizations;
+          } else {
+            smoother.update();
+          }
+          continue;
         }
+        if (!refinement) {
+          // Full GN steps can oscillate along weakly observed directions.
+          // Damping controls the step, not the measurement information.
+          auto parameters = gtsam::LevenbergMarquardtParams::CeresDefaults();
+          parameters.setLinearSolverType("MULTIFRONTAL_QR");
+          parameters.setMaxIterations(config.max_iterations - iteration - 1);
+          refinement.reset(new gtsam::LevenbergMarquardtOptimizer(
+              smoother.RetainedFactors(), estimate, parameters));
+        }
+        refinement->iterate();
+        ++damped_iterations;
       }
     }
     return {Reason::MATCH_FAILED,
@@ -792,6 +874,20 @@ Result FixedLagGraph::ValidateConfig() const {
 
 bool FixedLagGraph::initialized() const { return !impl_->nodes.empty(); }
 const GlobalState& FixedLagGraph::state() const { return impl_->output; }
+
+GraphResourceUsage FixedLagGraph::ResourceUsage() const {
+  GraphResourceUsage result;
+  result.retained_nodes = impl_->nodes.size();
+  result.retained_observations = impl_->observations.size();
+  result.factor_slots = impl_->smoother.getFactors().size();
+  for (const auto& factor : impl_->smoother.getFactors())
+    if (factor) ++result.active_factors;
+  result.archived_values = impl_->evaluation_initial.size();
+  result.solve_iterations = impl_->solve_iterations;
+  result.damped_iterations = impl_->damped_iterations;
+  result.maximum_motion_residual = impl_->maximum_motion_residual;
+  return result;
+}
 
 Result FixedLagGraph::EnableEvaluationHistory() {
   if (initialized())

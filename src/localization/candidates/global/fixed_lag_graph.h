@@ -12,9 +12,16 @@
 #include "candidates/local/local_motion.h"
 #include "openloc/localization/global/observation_types.h"
 
+namespace gtsam {
+class GaussianConditional;
+}
+
 namespace openloc {
 namespace localization {
 namespace unified {
+
+Result ConditionalRowSigmas(const gtsam::GaussianConditional& conditional,
+                            Eigen::VectorXd* sigmas);
 
 struct FixedLagConfig {
   double lag = 3.0;
@@ -50,6 +57,17 @@ struct GraphEvaluationSnapshot {
   std::vector<GraphFactorEvaluation> factors;
 };
 
+struct GraphResourceUsage {
+  uint64_t retained_nodes = 0;
+  uint64_t retained_observations = 0;
+  uint64_t factor_slots = 0;
+  uint64_t active_factors = 0;
+  uint64_t archived_values = 0;
+  uint32_t solve_iterations = 0;
+  uint32_t damped_iterations = 0;
+  double maximum_motion_residual = 0;
+};
+
 // All state here, including the nuisance error chain, is global-owned.
 // There is intentionally no output carrying local state/bias corrections.
 class FixedLagGraph {
@@ -72,6 +90,7 @@ class FixedLagGraph {
                  ObservationInnovation* innovation = nullptr);
   bool initialized() const;
   const GlobalState& state() const;
+  GraphResourceUsage ResourceUsage() const;
 
   // Offline evaluation only. Opt in before initialization; archives the exact
   // committed factors/initial values without eviction. Not a production mode.

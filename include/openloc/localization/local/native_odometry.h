@@ -63,6 +63,17 @@ class NativeOdometry {
   // time: conditioning_state may be later, never a substituted measurement time.
   unified::Result PrepareJointLidarScan(uint64_t sequence,
                                        unified::JointLidarScan* scan);
+  // Exact source-aware alternative, not a dense sufficient graph state.
+  // Available only in explicitly enabled structured mode. All raw-point and
+  // temporal dependencies remain queryable; no uncertainty qualification.
+  unified::Result StructuredErrorLookup(
+      double time, unified::StructuredLocalState* state) const;
+  unified::Result PrepareStructuredLidarScan(
+      uint64_t sequence, unified::StructuredLidarScan* scan);
+  // Finite endpoint/motion covariance only; not a Markov graph factor.
+  unified::Result StructuredErrorMotionBetween(
+      double start_time, double end_time, unified::MotionIncrement* motion) const;
+  unified::NativeStructuredResourceUsage StructuredErrorResourceUsage() const;
   // On-demand local linearization includes the smoother's 3D correction-speed
   // memory. It is not a stochastic model or uncertainty qualification.
   unified::Result OutputErrorTransition(
@@ -72,6 +83,11 @@ class NativeOdometry {
   // qualify uncertainty or alter ODOM.
   unified::Result DeskewErrorMap(const unified::LidarScan& scan,
                                 unified::LidarDeskewErrorMap* error_map) const;
+  // Structured support for a fresh scan BEFORE AddLidar. Does not insert raw
+  // drivers, finalize a graph frontier, or replace PrepareJointLidarScan.
+  unified::Result JointLidarInputErrorMap(
+      const unified::LidarScan& scan,
+      unified::JointLidarInputErrorMap* error_map) const;
   // Actual frozen plane support/source identities and anchor/point derivatives.
   // Does not manufacture the missing joint stochastic geometry model.
   unified::Result StoredGeometryErrorMap(

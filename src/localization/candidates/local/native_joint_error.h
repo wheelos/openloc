@@ -6,6 +6,8 @@
 #include <deque>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <set>
 #include <string>
 
 #include "candidates/common/types.h"
@@ -20,6 +22,7 @@ class NativeJointError {
   explicit NativeJointError(const LocalConfig& config) : config_(config) {}
 
   bool active() const { return active_; }
+  bool structured() const { return config_.enable_native_structured_error; }
   const Result& status() const { return status_; }
   void Reset();
   void Fail(const Result& result);
@@ -31,6 +34,18 @@ class NativeJointError {
                           const Eigen::Matrix<double, 21, 21>& covariance);
   void RejectInitialization(const Result& result);
   Eigen::MatrixXd Get(const std::string& key) const;
+  JointErrorExpression Error(const std::string& key) const;
+  struct LinearTerm {
+    Eigen::MatrixXd coefficient;
+    std::string key;
+  };
+  void Linear(const std::string& key, const std::vector<LinearTerm>& terms);
+  void Copy(const std::string& key, const std::string& source);
+  void CopyInternalToOutput();
+  Result StructuredLookup(double time, StructuredLocalState* state) const;
+  Result StructuredMotionBetween(double start, double end,
+                                MotionIncrement* motion) const;
+  NativeStructuredResourceUsage StructuredResourceUsage() const;
   Result CheckAdditionalCapacity(std::size_t rows, std::size_t drivers) const;
   void Set(const std::string& key, const Eigen::MatrixXd& loading);
   void Drop(const std::string& key);
@@ -65,6 +80,7 @@ class NativeJointError {
     LocalState state;
     Eigen::MatrixXd previous_cross;
     std::vector<SourceSampleId> sources;
+    JointErrorExpression output_error;
   };
   LocalConfig config_;
   bool active_ = false;
@@ -82,6 +98,24 @@ class NativeJointError {
   Stamp second_imu_;
   uint64_t next_fork_ = 0;
   std::map<std::string, std::weak_ptr<const int>> forks_;
+  std::map<std::string, JointErrorExpression> structured_memory_;
+  struct Primitive {
+    std::shared_ptr<const int> identity;
+    Eigen::MatrixXd root;
+  };
+  // Shared by task copies so independently replayed sampled drivers retain
+  // their actual common identity.
+  struct PrimitiveRegistry {
+    std::mutex mutex;
+    std::map<std::string, Primitive> entries;
+    uint64_t rows = 0;
+    uint64_t retired_sources = 0;
+    uint64_t retired_rows = 0;
+  };
+  std::shared_ptr<PrimitiveRegistry> primitives_;
+  std::set<std::string> inserted_primitives_;
+  uint64_t publish_queries_ = 0;
+  double publish_query_ms_ = 0;
 };
 
 }  // namespace openloc::localization::unified

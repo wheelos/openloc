@@ -8,10 +8,12 @@
 #include "openloc/localization/local/native_odometry.h"
 #include "openloc/localization/map/scan_to_map.h"
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 
 #include "Eigen/Cholesky"
+#include "Eigen/Eigenvalues"
 #include "gtest/gtest.h"
 
 namespace openloc {
@@ -744,6 +746,350 @@ TEST_P(SharedRawScanGraphTest, ActualSharedRawScanRegistrationFeedsTheSameGraph)
 INSTANTIATE_TEST_SUITE_P(NativeSharedRegistration, SharedRawScanGraphTest,
                         ::testing::Bool());
 
+TEST(FixedLagAlignmentTest, FrozenStructuredNativeMapFamilyFeedsExactGraph) {
+  namespace u = unified;
+  // This frozen four-query family is sufficient only for these observations.
+  // It is not a streaming native state or an arbitrary-future-query adapter.
+  auto local_config = RawNativeConfig();
+  local_config.native_joint_max_dimension = 1024;
+  local_config.history_duration = 0.5;
+  NativeOdometry dense(local_config);
+  local_config.enable_native_structured_error = true;
+  NativeOdometry local(local_config);
+  map::PointCloud::Ptr reference(new map::PointCloud);
+  for (int a = 0; a < 4; ++a)
+    for (int b = 0; b < 4; ++b) {
+      const double x = 0.2 * a + 0.03713, y = 0.2 * b + 0.04317;
+      reference->emplace_back(x, y, 0.45119);
+      reference->emplace_back(2.73713, x, y + 1.6);
+      reference->emplace_back(x, 2.34317, y + 1.6);
+    }
+  map::ScanToMapConfig matcher_config;
+  matcher_config.map_frame = "map";
+  matcher_config.base_frame = matcher_config.cloud_frame = "body";
+  matcher_config.calibration_id = "calibration";
+  matcher_config.algorithm = map::ScanMatchingAlgorithm::kPointToPlaneIcp;
+  matcher_config.retain_joint_error_support = true;
+  matcher_config.scan_voxel_size_m = 0.05;
+  matcher_config.normal_neighbors = 6;
+  matcher_config.minimum_points = matcher_config.icp_minimum_pairs = 20;
+  matcher_config.local_window_radius_m = 10;
+  map::ScanToMapLocalizer matcher(matcher_config);
+  auto metadata = map::MapMetadata();
+  metadata.map_id = "site";
+  metadata.version = "v1";
+  metadata.content_id = "synthetic-map";
+  metadata.map_frame = metadata.source_cloud_frame = "map";
+  metadata.reference_state = map::MapReferenceState::kDiagnosticOnly;
+  metadata.integrity_verified = true;
+  std::string error;
+  ASSERT_TRUE(matcher.Configure(metadata, reference, &error)) << error;
+  std::vector<u::StructuredLocalState> states;
+  std::vector<u::LocalState> dense_states;
+  std::vector<map::ScanToMapResult> maps;
+  std::vector<Eigen::MatrixXd> dense_map_loadings;
+  uint64_t corrections = 0;
+  for (uint64_t index = 1; index <= 15; ++index) {
+    u::ImuSample imu;
+    imu.stamp = {1 + 0.01 * (index - 1), 1 + 0.01 * (index - 1), index, "unix"};
+    imu.acceleration.z() = local_config.gravity;
+    dense.AddImu(imu);
+    local.AddImu(imu);
+    if (index < 3 || (index - 3) % 4 != 0) continue;
+    const uint64_t sequence = (index + 1) / 4;
+    u::LidarScan scan;
+    scan.stamp = local.internal_state().stamp;
+    scan.stamp.sequence = sequence;
+    scan.epoch = local.internal_state().epoch;
+    scan.frame_id = "lidar";
+    scan.calibration_id = "test-lidar";
+    for (const auto& point : *reference)
+      scan.points.push_back({Eigen::Vector3d(point.x, point.y, point.z),
+                             scan.stamp.time - (index == 3 ? 0 : 0.005)});
+    const auto frozen = local.state();
+    const auto decision = local.AddLidar(scan);
+    const auto dense_decision = dense.AddLidar(scan);
+    ASSERT_EQ(decision.reason, dense_decision.reason);
+    ASSERT_TRUE(decision.ok() || decision.reason == u::Reason::GEOMETRY_UNAVAILABLE)
+        << decision.message;
+    if (decision.ok()) ++corrections;
+    u::StructuredLidarScan shared;
+    u::JointLidarScan dense_shared;
+    ASSERT_TRUE(local.PrepareStructuredLidarScan(sequence, &shared).ok());
+    ASSERT_TRUE(dense.PrepareJointLidarScan(sequence, &dense_shared).ok());
+    Eigen::Matrix<double, 6, 15> seed_projection =
+        Eigen::Matrix<double, 6, 15>::Zero();
+    seed_projection.topLeftCorner<3, 3>().setIdentity();
+    seed_projection.block<3, 3>(3, 6) =
+        shared.conditioning_state.state.orientation.toRotationMatrix();
+    map::ScanToMapRequest request;
+    request.timestamp_ns = std::llround(scan.stamp.time * 1e9);
+    request.clock_domain = "unix";
+    request.cloud_frame = "body";
+    request.deskewed = true;
+    request.map_from_base_initial = u::Pose(shared.conditioning_state.state);
+    request.structured_scan = &shared;
+    request.initial_structured_error = u::JointErrorExpression::Combine(
+        6, {{seed_projection, shared.conditioning_state.output_error}});
+    auto match = matcher.Match(request);
+    ASSERT_TRUE(match.valid) << match.reason << ": " << match.detail;
+    ASSERT_TRUE(match.structured_error);
+    ASSERT_TRUE(match.structured_error->assessment.ok())
+        << match.structured_error->assessment.message;
+    request.structured_scan = nullptr;
+    request.initial_structured_error = {};
+    request.joint_scan = &dense_shared;
+    request.initial_joint_jacobian =
+        seed_projection *
+        dense_shared.conditioning_state.joint_error->output_jacobian;
+    const auto oracle = matcher.Match(request);
+    ASSERT_TRUE(oracle.valid);
+    ASSERT_TRUE(oracle.joint_error && oracle.joint_error->assessment.ok());
+    EXPECT_TRUE(match.map_from_base.matrix().isApprox(
+        oracle.map_from_base.matrix(), 0));
+    EXPECT_TRUE(match.structured_error->covariance.isApprox(
+        oracle.joint_error->covariance, 1e-10));
+    states.push_back(shared.conditioning_state);
+    dense_states.push_back(dense_shared.conditioning_state);
+    dense_map_loadings.push_back(oracle.joint_error->pose_jacobian);
+    maps.push_back(std::move(match));
+    EXPECT_TRUE(local.state().position.isApprox(frozen.position, 0));
+    EXPECT_TRUE(local.state().covariance.isApprox(frozen.covariance, 0));
+  }
+  ASSERT_EQ(states.size(), 4);
+  ASSERT_GT(corrections, 0);
+  constexpr Eigen::Index kBlock = 21;
+  const Eigen::Index rows = kBlock * states.size();
+  std::vector<u::JointErrorExpression::Term> terms;
+  for (std::size_t i = 0; i < states.size(); ++i) {
+    Eigen::MatrixXd state = Eigen::MatrixXd::Zero(rows, 15);
+    state.block<15, 15>(kBlock * i, 0).setIdentity();
+    terms.push_back({state, states[i].output_error});
+    Eigen::MatrixXd observation = Eigen::MatrixXd::Zero(rows, 6);
+    observation.block<6, 6>(kBlock * i + 15, 0).setIdentity();
+    terms.push_back({observation, maps[i].structured_error->pose_error});
+  }
+  Eigen::MatrixXd covariance;
+  ASSERT_TRUE(u::JointErrorExpression::Combine(rows, terms)
+                  .Covariance(&covariance).ok());
+  Eigen::MatrixXd oracle = Eigen::MatrixXd::Zero(rows, rows);
+  for (std::size_t i = 0; i < states.size(); ++i)
+    for (std::size_t j = i; j < states.size(); ++j) {
+      Eigen::MatrixXd bridge = dense_states[i].joint_error->covariance;
+      if (i != j) {
+        u::MotionIncrement motion;
+        ASSERT_TRUE(dense.JointErrorMotionBetween(
+            states[i].state.stamp.time, states[j].state.stamp.time, &motion).ok());
+        bridge = motion.joint_cross_covariance;
+      }
+      Eigen::MatrixXd first(kBlock, bridge.rows()), last(kBlock, bridge.cols());
+      first.topRows(15) = dense_states[i].joint_error->output_jacobian;
+      first.bottomRows(6) = dense_map_loadings[i];
+      last.topRows(15) = dense_states[j].joint_error->output_jacobian;
+      last.bottomRows(6) = dense_map_loadings[j];
+      const Eigen::MatrixXd cross = first * bridge * last.transpose();
+      oracle.block(kBlock * i, kBlock * j, kBlock, kBlock) = cross;
+      oracle.block(kBlock * j, kBlock * i, kBlock, kBlock) = cross.transpose();
+    }
+  ASSERT_TRUE((covariance.diagonal().array() > 0).all());
+  const Eigen::VectorXd scale = covariance.diagonal().cwiseSqrt();
+  const Eigen::MatrixXd normalization = scale.cwiseInverse().asDiagonal();
+  EXPECT_LT((normalization * (covariance - oracle) * normalization)
+                .cwiseAbs().maxCoeff(), 1e-9);
+  std::vector<Eigen::MatrixXd> roots;
+  for (const auto& family : {covariance, oracle}) {
+    const Eigen::MatrixXd normalized = normalization * family * normalization;
+    Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> spectrum(normalized);
+    ASSERT_EQ(spectrum.info(), Eigen::Success);
+    const double threshold = 64 * std::numeric_limits<double>::epsilon() *
+        spectrum.eigenvalues().cwiseAbs().maxCoeff();
+    ASSERT_GE(spectrum.eigenvalues().minCoeff(), -threshold);
+    Eigen::Index rank = 0;
+    for (double value : spectrum.eigenvalues()) {
+      ASSERT_FALSE(value > threshold / 8 && value <= threshold)
+          << "Unresolved finite-family covariance rank";
+      if (value > threshold) ++rank;
+    }
+    ASSERT_GE(rank, 15);
+    Eigen::MatrixXd root(rows, rank);
+    if (rank == rows) {
+      // Canonical triangular coordinates avoid arbitrary eigenspace rotations
+      // between the two independently reconstructed, full-rank families.
+      const Eigen::LLT<Eigen::MatrixXd> triangular(normalized);
+      ASSERT_EQ(triangular.info(), Eigen::Success);
+      root = scale.asDiagonal() * Eigen::MatrixXd(triangular.matrixL());
+    } else {
+      Eigen::Index column = 0;
+      for (Eigen::Index i = 0; i < rows; ++i)
+        if (spectrum.eigenvalues()[i] > threshold)
+          root.col(column++) = scale.asDiagonal() *
+              spectrum.eigenvectors().col(i) * std::sqrt(spectrum.eigenvalues()[i]);
+    }
+    EXPECT_LT((normalization * (root * root.transpose() - family) *
+               normalization).cwiseAbs().maxCoeff(), 1e-11);
+    roots.push_back(std::move(root));
+  }
+  ASSERT_EQ(roots[0].cols(), roots[1].cols());
+  RecordProperty("frozen_family_queries", states.size() * 2);
+  RecordProperty("frozen_family_rows", rows);
+  RecordProperty("frozen_family_rank", roots[0].cols());
+  RecordProperty("actual_native_lio_corrections", corrections);
+  // Same frozen family/noise/initialization in four source arms. The first
+  // two map observations are a declared common absolute bootstrap anchor.
+  std::vector<Eigen::Vector3d> arm_positions;
+  double maximum_pose_delta = 0, maximum_covariance_delta = 0;
+  for (int arm = 0; arm < 4; ++arm) {
+    SCOPED_TRACE(arm);
+    std::vector<Eigen::Isometry3d> endpoints;
+    std::vector<Eigen::Matrix<double, 6, 6>> uncertainties;
+    for (int variant = 0; variant < 4; ++variant) {
+      SCOPED_TRACE(variant);
+      const bool batch = variant % 2;
+      const auto& root = roots[variant / 2];
+      const Eigen::Index rank = root.cols();
+      auto config = Config();
+      config.allow_uncalibrated_inputs = true;
+      config.motion_error_model_id = "offline-frozen-native-query-family";
+      // Algebraic sufficiency is proven above for this frozen family only;
+      // input calibration stays false and graph output stays diagnostic.
+      config.motion_error_model_qualified = true;
+      config.maximum_error_dimension = rank;
+      config.verification_frames = 2;
+      config.history_duration_ns = batch ? 1'000'000'000LL : 60'000'000LL;
+      config.maximum_observation_age_ns = config.history_duration_ns;
+      FixedLagGlobalAlignment graph;
+      const auto configured = graph.Configure(config);
+      ASSERT_TRUE(configured.ok()) << configured.message();
+      uint64_t map_updates = 0, gnss_updates = 0;
+      for (std::size_t i = 0; i < states.size(); ++i) {
+        const auto& state = states[i].state;
+        GraphOdometrySample sample;
+        sample.sequence = state.stamp.sequence;
+        sample.odometry.timestamp = {
+            std::llround(state.stamp.time * 1e9), config.clock_domain};
+        sample.receive_time = sample.odometry.timestamp;
+        sample.odometry.epoch = {state.epoch.session, state.epoch.generation};
+        sample.odometry.parent_frame = config.odom_frame;
+        sample.odometry.child_frame = config.base_frame;
+        sample.odometry.pose = {state.position, state.orientation};
+        sample.covariance = state.covariance;
+        sample.covariance_model_valid = true;
+        sample.joint_error = u::JointLocalError{
+            Eigen::MatrixXd::Identity(rank, rank), root.middleRows(kBlock * i, 15)};
+        GraphMotionConnection connection;
+        if (i > 0) {
+          connection.epoch = sample.odometry.epoch;
+          connection.start_time = {
+              std::llround(states[i - 1].state.stamp.time * 1e9), config.clock_domain};
+          connection.end_time = sample.odometry.timestamp;
+          connection.start_sequence = states[i - 1].state.stamp.sequence;
+          connection.end_sequence = sample.sequence;
+          connection.joint_cross_covariance =
+              Eigen::MatrixXd::Identity(rank, rank);
+          connection.cross_covariance =
+              root.middleRows(kBlock * (i - 1), 15) *
+              root.middleRows(kBlock * i, 15).transpose();
+          for (uint64_t sequence = connection.start_sequence;
+               sequence <= sample.sequence; ++sequence)
+            connection.sources.push_back({"imu", sequence});
+        }
+        ASSERT_TRUE(graph.AddOdometry(sample, i ? &connection : nullptr).ok());
+        auto observation = Map(0);
+        observation.context.epoch = sample.odometry.epoch;
+        observation.context.source = "frozen-source-aware-map";
+        observation.context.sequence = i + 1;
+        observation.context.measurement_time =
+            observation.context.receive_time = sample.odometry.timestamp;
+        observation.context.provenance.shared_local_scans =
+            ObservationDependency::kPresent;
+        observation.context.provenance.odometry_deskew =
+            ObservationDependency::kPresent;
+        observation.map_from_base = {
+            maps[i].map_from_base.translation(),
+            Eigen::Quaterniond(maps[i].map_from_base.linear())};
+        const Eigen::MatrixXd map_loading = root.middleRows(kBlock * i + 15, 6);
+        observation.covariance = map_loading * map_loading.transpose();
+        observation.covariance_source = "frozen-native-ICP-fixed-map-family";
+        GraphSourceQualification qualification;
+        qualification.quality_valid = true;
+        qualification.uncertainty_model_id = observation.covariance_source;
+        qualification.local_correlation.emplace();
+        auto& correlation = *qualification.local_correlation;
+        correlation.motion_error_model_id = config.motion_error_model_id;
+        correlation.odometry_sequence = sample.sequence;
+        correlation.conditioning_time = sample.odometry.timestamp;
+        correlation.cross_covariance = map_loading.transpose();
+        correlation.conditional_independence_evidence_id =
+            "entire-selected-output-map-family-root-zero-independent-residual";
+        correlation.conditional_model_qualified = true;
+        correlation.residual_independent_of_history_and_sources = true;
+        if (i < 2 || (arm & 2)) {
+          const auto submitted = graph.SubmitMapObservation(observation, qualification);
+          if (i == 0) EXPECT_FALSE(submitted.ok());
+          else {
+            ASSERT_TRUE(submitted.ok()) << submitted.message();
+            ++map_updates;
+          }
+        }
+        if (i >= 2 && (arm & 1)) {
+          GlobalHorizontalObservation gnss;
+          gnss.context = observation.context;
+          gnss.context.provenance = {};
+          gnss.context.source = "declared-independent-synthetic-GNSS";
+          gnss.position = Eigen::Vector2d(0.01, -0.02);
+          gnss.covariance = 0.04 * Eigen::Matrix2d::Identity();
+          gnss.covariance_source = "synthetic-independent-GNSS-noise";
+          auto independent = Qualification();
+          independent.uncertainty_qualified = false;
+          ASSERT_TRUE(graph.SubmitHorizontalObservation(gnss, independent).ok());
+          ++gnss_updates;
+        }
+      }
+      EXPECT_EQ(map_updates, (arm & 2) ? 3 : 1);
+      EXPECT_EQ(gnss_updates, (arm & 1) ? 2 : 0);
+      FixedLagAlignmentResult result;
+      ASSERT_TRUE(graph.GetResult(
+          {std::llround(states.back().state.stamp.time * 1e9), config.clock_domain},
+          &result).ok());
+      ASSERT_TRUE(result.estimate);
+      EXPECT_TRUE(result.diagnostic_only);
+      EXPECT_FALSE(result.assessment.ok());
+      EXPECT_TRUE(result.estimate->map_from_base.translation.allFinite());
+      Eigen::Isometry3d endpoint = Eigen::Isometry3d::Identity();
+      endpoint.translation() = result.estimate->map_from_base.translation;
+      endpoint.linear() = result.estimate->map_from_base.rotation.toRotationMatrix();
+      endpoints.push_back(endpoint);
+      uncertainties.push_back(result.estimate->alignment_covariance);
+    }
+    // Same-factor fixed-lag/no-eviction numerical agreement is not truth or
+    // an assertion that adding a factor must improve every noisy realization.
+    EXPECT_LT((endpoints[0].matrix() - endpoints[1].matrix()).norm(), 1e-6);
+    EXPECT_LT((endpoints[2].matrix() - endpoints[3].matrix()).norm(), 1e-6);
+    arm_positions.push_back(endpoints.front().translation());
+    for (std::size_t i = 0; i < 2; ++i) {
+      const double pose_delta =
+          (endpoints[i].matrix() - endpoints[i + 2].matrix()).norm();
+      const double covariance_delta =
+          (uncertainties[i] - uncertainties[i + 2]).norm();
+      maximum_pose_delta = std::max(maximum_pose_delta, pose_delta);
+      maximum_covariance_delta =
+          std::max(maximum_covariance_delta, covariance_delta);
+      // The backend's relinearization/hard-residual threshold is 1e-6.
+      // Near-hard factors do not imply bitwise equal nonlinear solve results
+      // for independently rooted covariances agreeing to roundoff.
+      EXPECT_LT(pose_delta, 1e-6);
+      EXPECT_LT(covariance_delta, 1e-6);
+      EXPECT_TRUE(uncertainties[i].allFinite());
+    }
+  }
+  EXPECT_GT((arm_positions[1] - arm_positions[0]).norm(), 1e-6);
+  EXPECT_GT((arm_positions[3] - arm_positions[2]).norm(), 1e-6);
+  RecordProperty("dense_graph_maximum_pose_delta_times_1e9",
+                 std::to_string(maximum_pose_delta * 1e9));
+  RecordProperty("dense_graph_maximum_covariance_delta_times_1e9",
+                 std::to_string(maximum_covariance_delta * 1e9));
+}
+
 TEST(FixedLagAlignmentTest, JointMemoryIsRetainedThroughFacadeBootstrap) {
   FixedLagGlobalAlignment owner;
   auto config = Config();
@@ -1458,6 +1804,234 @@ TEST(FixedLagAlignmentTest, AmbiguityInterruptsVerificationWithoutAnOdomReset) {
       EXPECT_EQ(Odom(0).odometry.epoch, result.epoch);
     }
   }
+}
+
+// Synthetic observation-boundary scenarios, not recorded or raw-ICP recovery.
+TEST(FixedLagAlignmentTest, SyntheticAbsoluteOutageExpiresAndReacquires) {
+  auto config = Config();
+  config.maximum_full_pose_age_ns = 3 * kStep;
+  FixedLagGlobalAlignment owner;
+  ASSERT_TRUE(owner.Configure(config).ok());
+  Bootstrap(&owner);
+  uint64_t before_reacquisition = 0;
+  for (int index = 3; index <= 11; ++index) {
+    const auto sample = Odom(index);
+    const auto motion = Connection(index);
+    ASSERT_TRUE(owner.AddOdometry(sample, &motion).ok());
+    FixedLagAlignmentResult result;
+    ASSERT_TRUE(owner.GetResult(sample.receive_time, &result).ok());
+    EXPECT_TRUE(result.odometry_fresh);
+    EXPECT_EQ(sample.odometry.epoch, result.epoch);
+    if (index <= 8) {
+      ASSERT_TRUE(result.estimate);
+      EXPECT_TRUE(result.estimate->alignment_covariance.allFinite());
+      EXPECT_EQ(index <= 5, result.full_pose_evidence_fresh);
+      if (index >= 6) {
+        EXPECT_FALSE(result.assessment.ok());
+        EXPECT_EQ(LocalizationTrustLevel::kUntrusted, result.trust_level);
+      }
+      if (index == 8) {
+        before_reacquisition = result.estimate->correction_id;
+        EXPECT_GT(sample.odometry.timestamp.nanoseconds -
+                      Odom(2).odometry.timestamp.nanoseconds,
+                  config.maximum_full_pose_age_ns);
+      }
+      continue;
+    }
+    // Default policy revokes the stale graph on the first returning source.
+    // Reacquisition uses all three configured distinct, consistent frames.
+    const auto status = owner.SubmitMapObservation(Map(index), Qualification());
+    ASSERT_TRUE(owner.GetResult(sample.receive_time, &result).ok());
+    std::vector<GraphObservationDecision> decisions;
+    ASSERT_TRUE(owner.GetDecisions(&decisions).ok());
+    const auto& decision = decisions.back().observation;
+    if (index < 11) {
+      EXPECT_EQ(StatusCode::kRejectedMeasurement, status.code());
+      EXPECT_TRUE(result.verification_pending);
+      EXPECT_FALSE(result.estimate);
+      EXPECT_FALSE(result.full_pose_evidence_fresh);
+      EXPECT_FALSE(result.assessment.ok());
+      EXPECT_EQ(LocalizationTrustLevel::kUntrusted, result.trust_level);
+      EXPECT_FALSE(decision.alignment_updated);
+      EXPECT_GE(decision.correction_id, before_reacquisition);
+    } else {
+      ASSERT_TRUE(status.ok()) << status.message();
+      ASSERT_TRUE(result.estimate);
+      EXPECT_FALSE(result.verification_pending);
+      EXPECT_TRUE(result.full_pose_evidence_fresh);
+      // Reacquisition restores a fresh graph, not an exemption from the
+      // uncertainty budget: this harness's ODOM covariance remains too large.
+      EXPECT_EQ(StatusCode::kRejectedMeasurement, result.assessment.code());
+      EXPECT_EQ("COVARIANCE_EXCEEDED: global uncertainty budget exceeded",
+                result.assessment.message());
+      EXPECT_EQ(LocalizationTrustLevel::kDiagnostic, result.trust_level);
+      EXPECT_TRUE(decision.alignment_updated);
+      EXPECT_TRUE(result.estimate->alignment_covariance.allFinite());
+      EXPECT_NEAR(100.0, result.estimate->map_from_odom.translation.x(), 1e-8);
+      EXPECT_NEAR(20.0, result.estimate->map_from_odom.translation.y(), 1e-8);
+      EXPECT_TRUE(result.estimate->map_from_base.translation.isApprox(
+          Map(index).map_from_base.translation, 1e-8));
+    }
+    EXPECT_DOUBLE_EQ(.1 * index, sample.odometry.pose.translation.x());
+    EXPECT_TRUE(sample.covariance.isApprox(Odom(index).covariance, 0.0));
+    EXPECT_EQ(Odom(0).odometry.epoch, sample.odometry.epoch);
+  }
+  RecordProperty("synthetic_outage_ns", std::to_string(7 * kStep));
+  RecordProperty("reacquisition_frames", config.verification_frames);
+}
+
+TEST(FixedLagAlignmentTest, SyntheticNearGateConflictUsesPreUpdateInnovation) {
+  ObservationInnovation probe;
+  {
+    FixedLagGlobalAlignment owner;
+    ASSERT_TRUE(owner.Configure(Config()).ok());
+    Bootstrap(&owner);
+    const auto motion = Connection(3);
+    ASSERT_TRUE(owner.AddOdometry(Odom(3), &motion).ok());
+    GlobalHorizontalObservation fix;
+    fix.context = Context(3, "synthetic-near-gate");
+    fix.position = Map(3).map_from_base.translation.head<2>();
+    fix.covariance = Eigen::Matrix2d::Identity() * .01;
+    fix.covariance_source = "synthetic-independent-xy";
+    ASSERT_TRUE(owner.SubmitHorizontalObservation(fix, Qualification()).ok());
+    std::vector<GraphObservationDecision> decisions;
+    ASSERT_TRUE(owner.GetDecisions(&decisions).ok());
+    probe = decisions.back().observation.innovation;
+  }
+  ASSERT_TRUE(probe.available);
+  ASSERT_EQ(2, probe.covariance.rows());
+  ASSERT_TRUE(probe.covariance.allFinite());
+  ASSERT_GT(probe.gate_threshold, 0.0);
+  const double information_x =
+      probe.covariance.ldlt().solve(Eigen::Vector2d::UnitX()).x();
+  ASSERT_GT(information_x, 0.0);
+  for (const double gate_ratio : {.95, 1.05}) {
+    SCOPED_TRACE(gate_ratio);
+    FixedLagGlobalAlignment owner;
+    ASSERT_TRUE(owner.Configure(Config()).ok());
+    Bootstrap(&owner);
+    const auto motion = Connection(3);
+    ASSERT_TRUE(owner.AddOdometry(Odom(3), &motion).ok());
+    FixedLagAlignmentResult before, after;
+    ASSERT_TRUE(owner.GetResult(Odom(3).receive_time, &before).ok());
+    ASSERT_TRUE(before.estimate);
+    GlobalHorizontalObservation fix;
+    fix.context = Context(3, "synthetic-near-gate");
+    fix.position = Map(3).map_from_base.translation.head<2>();
+    const double bias =
+        std::sqrt(gate_ratio * probe.gate_threshold / information_x);
+    fix.position.x() += bias;
+    fix.covariance = Eigen::Matrix2d::Identity() * .01;
+    fix.covariance_source = "synthetic-independent-xy";
+    const auto status =
+        owner.SubmitHorizontalObservation(fix, Qualification());
+    const bool admitted = gate_ratio < 1;
+    EXPECT_EQ(admitted, status.ok()) << status.message();
+    if (!admitted) {
+      EXPECT_EQ(StatusCode::kRejectedMeasurement, status.code());
+    }
+    std::vector<GraphObservationDecision> decisions;
+    ASSERT_TRUE(owner.GetDecisions(&decisions).ok());
+    const auto& decision = decisions.back().observation;
+    const auto& innovation = decision.innovation;
+    ASSERT_TRUE(innovation.available);
+    EXPECT_TRUE(innovation.residual.allFinite());
+    EXPECT_TRUE(innovation.covariance.allFinite());
+    EXPECT_TRUE(std::isfinite(innovation.nis));
+    EXPECT_NEAR(gate_ratio, innovation.nis / innovation.gate_threshold, 1e-8);
+    EXPECT_NEAR(innovation.nis, innovation.residual.dot(
+        innovation.covariance.ldlt().solve(innovation.residual)), 1e-8);
+    EXPECT_EQ(admitted, decision.alignment_updated);
+    ASSERT_TRUE(owner.GetResult(Odom(3).receive_time, &after).ok());
+    ASSERT_TRUE(after.estimate);
+    EXPECT_TRUE(after.estimate->alignment_covariance.allFinite());
+    if (admitted) {
+      EXPECT_GT(after.estimate->map_from_base.translation.x(),
+                before.estimate->map_from_base.translation.x());
+      EXPECT_GT(after.estimate->correction_id, before.estimate->correction_id);
+    } else {
+      EXPECT_EQ(before.estimate->correction_id, after.estimate->correction_id);
+      EXPECT_TRUE(after.estimate->map_from_odom.translation.isApprox(
+          before.estimate->map_from_odom.translation, 0.0));
+      EXPECT_TRUE(after.estimate->alignment_covariance.isApprox(
+          before.estimate->alignment_covariance, 0.0));
+    }
+    RecordProperty(admitted ? "admitted_bias_m" : "rejected_bias_m",
+                   std::to_string(bias));
+  }
+}
+
+TEST(FixedLagAlignmentTest, SyntheticAdmittedAnomalySurvivesWindowEviction) {
+  auto bounded_config = Config();
+  bounded_config.history_duration_ns = 3 * kStep;
+  bounded_config.maximum_observation_age_ns = bounded_config.history_duration_ns;
+  auto control_config = Config();
+  FixedLagGlobalAlignment bounded, control, clean;
+  ASSERT_TRUE(bounded.Configure(bounded_config).ok());
+  ASSERT_TRUE(control.Configure(control_config).ok());
+  ASSERT_TRUE(clean.Configure(bounded_config).ok());
+  for (auto* owner : {&bounded, &control, &clean}) Bootstrap(owner);
+  double before_eviction_bias = 0;
+  for (int index = 3; index <= 10; ++index) {
+    SCOPED_TRACE(index);
+    const auto motion = Connection(index);
+    for (auto* owner : {&bounded, &control, &clean}) {
+      ASSERT_TRUE(owner->AddOdometry(Odom(index), &motion).ok());
+      if (index == 3) {
+        auto observation = Map(index);
+        // 6 cm is anomalous but stays in the quadratic Huber region:
+        // .06 / sqrt(.001) < the owner's unchanged 2.5 robust threshold.
+        if (owner != &clean) observation.map_from_base.translation.x() += .06;
+        ASSERT_TRUE(owner->SubmitMapObservation(observation, Qualification()).ok());
+        std::vector<GraphObservationDecision> decisions;
+        ASSERT_TRUE(owner->GetDecisions(&decisions).ok());
+        const auto& decision = decisions.back().observation;
+        ASSERT_TRUE(decision.alignment_updated);
+        ASSERT_TRUE(decision.innovation.available);
+        EXPECT_TRUE(std::isfinite(decision.innovation.nis));
+        EXPECT_LT(decision.innovation.nis, decision.innovation.gate_threshold);
+        if (owner != &clean) {
+          EXPECT_GT(decision.innovation.nis, 0.0);
+        }
+      }
+    }
+    FixedLagAlignmentResult result, reference, clean_result;
+    ASSERT_TRUE(bounded.GetResult(Odom(index).receive_time, &result).ok());
+    ASSERT_TRUE(control.GetResult(Odom(index).receive_time, &reference).ok());
+    ASSERT_TRUE(clean.GetResult(Odom(index).receive_time, &clean_result).ok());
+    ASSERT_TRUE(result.estimate);
+    ASSERT_TRUE(reference.estimate);
+    ASSERT_TRUE(clean_result.estimate);
+    EXPECT_TRUE(result.estimate->alignment_covariance.allFinite());
+    EXPECT_TRUE(reference.estimate->alignment_covariance.allFinite());
+    // Same available prefix/factors, not a future-data batch or truth claim.
+    EXPECT_LT((result.estimate->map_from_base.translation -
+               reference.estimate->map_from_base.translation).norm(), 1e-6);
+    EXPECT_LT((result.estimate->alignment_covariance -
+               reference.estimate->alignment_covariance).norm(), 1e-6);
+    const double bias = result.estimate->map_from_base.translation.x() -
+                        clean_result.estimate->map_from_base.translation.x();
+    EXPECT_GT(bias, 0.0);
+    EXPECT_LT(bias, .06);
+    if (index == 3) before_eviction_bias = bias;
+    // At node 3, prior position variance is .001 + .001 (map at node 2
+    // plus one random-walk increment). With observation variance .001,
+    // the gain is 2/3. No later absolute information can erase that offset.
+    EXPECT_NEAR((2.0 / 3.0) * .06, bias, 1e-6);
+  }
+  // Prove the anomalous node has actually left the bounded graph, while the
+  // no-eviction control still admits a factor at that identical old node.
+  auto delayed = Map(3);
+  delayed.context.source = "synthetic-eviction-probe";
+  delayed.context.receive_time = Odom(10).receive_time;
+  delayed.map_from_base.translation.x() += .06;
+  EXPECT_EQ(StatusCode::kOutsideHistory,
+            bounded.SubmitMapObservation(delayed, Qualification()).code());
+  ASSERT_TRUE(control.SubmitMapObservation(delayed, Qualification()).ok());
+  RecordProperty("admitted_anomaly_m", ".06");
+  RecordProperty("retained_offset_m", std::to_string(before_eviction_bias));
+  RecordProperty("evicted_node_time_ns",
+                 std::to_string(Odom(3).receive_time.nanoseconds));
 }
 
 TEST(FixedLagAlignmentTest, DelayedFactorsKeepTheirTimesAndWindowLimits) {

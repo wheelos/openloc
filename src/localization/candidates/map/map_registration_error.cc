@@ -123,27 +123,36 @@ Result LinearizeRawIcp(
     const Cloud& target, double source_voxel_size, double target_voxel_size,
     uint32_t normal_neighbors, uint32_t maximum_registration_points,
     uint32_t maximum_error_points, const std::vector<IcpErrorStep>& steps,
-    RegistrationErrorMap* output) {
+    RegistrationErrorMap* output, bool deterministic_target) {
   if (!output || steps.empty() || normal_neighbors < 3 ||
       maximum_registration_points < 2 ||
       raw_source.size() > maximum_error_points ||
-      raw_target.size() > maximum_error_points)
+      (!deterministic_target && raw_target.size() > maximum_error_points))
     return {Reason::CORRELATION_UNQUALIFIED,
             "Registration raw-error support exceeds its declared capacity"};
   Sources source_members, target_members;
   auto valid = VoxelSources(raw_source, source, source_voxel_size,
                             maximum_registration_points, &source_members);
-  if (!valid.ok()) return valid;
-  valid = VoxelSources(raw_target, target, target_voxel_size,
-                       maximum_registration_points, &target_members);
-  if (!valid.ok()) return valid;
+  if (!valid.ok()) {
+    valid.message = "Source: " + valid.message;
+    return valid;
+  }
+  if (!deterministic_target) {
+    valid = VoxelSources(raw_target, target, target_voxel_size,
+                         maximum_registration_points, &target_members);
+    if (!valid.ok()) {
+      valid.message = "Target: " + valid.message;
+      return valid;
+    }
+  }
   pcl::KdTreeFLANN<pcl::PointXYZ> tree;
   tree.setInputCloud(target.makeShared());
   std::map<std::size_t, NormalLoading> normals;
   RegistrationErrorMap modeled;
   modeled.initial_jacobian.setIdentity();
   modeled.source_point_jacobians.assign(raw_source.size(), Loading::Zero());
-  modeled.target_point_jacobians.assign(raw_target.size(), Loading::Zero());
+  if (!deterministic_target)
+    modeled.target_point_jacobians.assign(raw_target.size(), Loading::Zero());
   for (const auto& step : steps) {
     Eigen::LLT<Matrix6d> solve(step.information);
     if (solve.info() != Eigen::Success)
@@ -179,6 +188,10 @@ Result LinearizeRawIcp(
       for (const auto i : sources)
         modeled.source_point_jacobians[i].noalias() += direction *
             (normal.transpose() * step.before.linear() / sources.size());
+      // A conditional fixed prior has no stochastic target-point/normal
+      // directions. Their voxel/eigenvector derivatives are neither needed
+      // nor qualified by the source-only model.
+      if (deterministic_target) continue;
       const auto& targets = target_members[correspondence.target];
       for (const auto i : targets)
         modeled.target_point_jacobians[i].noalias() -=

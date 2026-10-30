@@ -3,6 +3,7 @@
 
 #include "openloc/localization/local/native_odometry.h"
 
+#include <algorithm>
 #include <cmath>
 
 #include "gtest/gtest.h"
@@ -85,6 +86,264 @@ TEST(NativeOdometryPublicTest, SeparatesIntegrityFromCapabilityAndKeepsFaults) {
   EXPECT_EQ(retained.stamp.sequence, 3);
   EXPECT_EQ(local.AddImu(Imu(1.2, 4)).reason, u::Reason::IMU_GAP);
   EXPECT_FALSE(local.EvaluateIntegrity(1.2).ok());
+}
+
+TEST(NativeOdometryPublicTest, StructuredInputQueriesMatchRetainedPointModel) {
+  auto config = Config();
+  config.enable_native_joint_error = true;
+  NativeOdometry local(config);
+  for (uint64_t i = 1; i <= 6; ++i)
+    local.AddImu(Imu(1 + 0.01 * (i - 1), i));
+  auto scan = Scan(local.state(), 1, 0);
+  for (std::size_t i = 0; i < scan.points.size(); ++i)
+    scan.points[i].time -= 0.005 * (i % 3);
+  const auto nominal = local.state();
+  const auto accepted = local.lidar_health().accepted;
+  u::JointLidarInputErrorMap input;
+  const auto exported = local.JointLidarInputErrorMap(scan, &input);
+  ASSERT_TRUE(exported.ok()) << exported.message;
+  ASSERT_EQ(scan.points.size(), input.deskew.points.size());
+  ASSERT_EQ(input.deskew.history.size(), input.history_loadings.size());
+  EXPECT_EQ(accepted, local.lidar_health().accepted);
+  EXPECT_TRUE(nominal.position.isApprox(local.state().position, 0));
+  EXPECT_TRUE(nominal.covariance.isApprox(local.state().covariance, 0));
+  std::vector<Eigen::MatrixXd> shared;
+  for (const auto& point : input.deskew.points) {
+    Eigen::MatrixXd loading =
+        Eigen::MatrixXd::Zero(3, input.internal_loading.cols());
+    for (const auto& dependency : point.history)
+      loading += dependency.jacobian *
+                 input.history_loadings[dependency.history_index];
+    shared.push_back(std::move(loading));
+  }
+  EXPECT_EQ(u::Reason::GEOMETRY_UNAVAILABLE, local.AddLidar(scan).reason);
+  u::JointLidarScan retained;
+  const auto finalized = local.PrepareJointLidarScan(1, &retained);
+  ASSERT_TRUE(finalized.ok()) << finalized.message;
+  ASSERT_EQ(shared.size(), retained.point_jacobians.size());
+  const auto output =
+      retained.conditioning_state.joint_error->output_jacobian;
+  for (std::size_t i = 0; i < shared.size(); ++i) {
+    EXPECT_TRUE(retained.points_in_reference_base[i].isApprox(
+        input.deskew.points[i].point_in_end_base, 1e-12));
+    const Eigen::MatrixXd cross =
+        input.output_loading.topRows(15) * shared[i].transpose();
+    EXPECT_LE(
+        (cross - output * retained.point_jacobians[i].transpose()).norm(),
+        1e-12 * std::max(1.0, cross.norm()));
+    for (std::size_t j = 0; j < shared.size(); ++j) {
+      Eigen::Matrix3d expected = shared[i] * shared[j].transpose();
+      if (i == j)
+        expected += input.raw_point_variance *
+                    input.deskew.points[i].raw_point *
+                    input.deskew.points[j].raw_point.transpose();
+      EXPECT_LE(
+          (expected - retained.point_jacobians[i] *
+                          retained.point_jacobians[j].transpose()).norm(),
+          1e-12 * std::max(1.0, expected.norm()));
+    }
+  }
+  input.raw_point_variance = 7;
+  EXPECT_EQ(u::Reason::DUPLICATE,
+            local.JointLidarInputErrorMap(scan, &input).reason);
+  EXPECT_EQ(7, input.raw_point_variance);
+  ++scan.stamp.sequence;
+  EXPECT_EQ(u::Reason::DUPLICATE,
+            local.JointLidarInputErrorMap(scan, &input).reason);
+  EXPECT_EQ(7, input.raw_point_variance);
+}
+
+TEST(NativeOdometryPublicTest,
+     StructuredInputQueryRejectsInvalidScopeWithoutMutation) {
+  NativeOdometry disabled(Config());
+  u::JointLidarInputErrorMap output;
+  output.raw_point_variance = 7;
+  EXPECT_FALSE(disabled.JointLidarInputErrorMap({}, &output).ok());
+  auto config = Config();
+  config.enable_native_joint_error = true;
+  NativeOdometry local(config);
+  for (uint64_t i = 1; i <= 6; ++i)
+    local.AddImu(Imu(1 + 0.01 * (i - 1), i));
+  auto scan = Scan(local.state(), 1, 0);
+  EXPECT_EQ(u::Reason::INVALID_INPUT,
+            local.JointLidarInputErrorMap(scan, nullptr).reason);
+  auto invalid = scan;
+  invalid.stamp.sequence = 0;
+  EXPECT_EQ(u::Reason::INVALID_INPUT,
+            local.JointLidarInputErrorMap(invalid, &output).reason);
+  auto stale = scan;
+  stale.stamp.time -= 0.001;
+  EXPECT_EQ(u::Reason::HISTORY_UNAVAILABLE,
+            local.JointLidarInputErrorMap(stale, &output).reason);
+  scan.epoch.generation += 1;
+  EXPECT_EQ(u::Reason::EPOCH_MISMATCH,
+            local.JointLidarInputErrorMap(scan, &output).reason);
+  EXPECT_EQ(7, output.raw_point_variance);
+}
+
+TEST(NativeOdometryPublicTest, StructuredNativeMatchesDenseCorrectionAndFork) {
+  for (const bool delayed : {false, true}) {
+    SCOPED_TRACE(delayed);
+    auto config = Config();
+    config.enable_native_joint_error = true;
+    config.history_duration = 0.035;
+    config.lidar_max_scans = 1;
+    NativeOdometry dense(config);
+    config.enable_native_structured_error = true;
+    NativeOdometry structured(config);
+    for (uint64_t i = 1; i <= 3; ++i)
+      for (auto* owner : {&dense, &structured})
+        owner->AddImu(Imu(1 + 0.01 * (i - 1), i));
+    auto scan = Scan(dense.internal_state(), 1, 0.25);
+    for (auto* owner : {&dense, &structured})
+      ASSERT_EQ(owner->AddLidar(scan).reason, u::Reason::GEOMETRY_UNAVAILABLE);
+    u::JointLidarScan first_dense;
+    u::StructuredLidarScan first_structured;
+    ASSERT_TRUE(dense.PrepareJointLidarScan(1, &first_dense).ok());
+    ASSERT_TRUE(structured.PrepareStructuredLidarScan(1, &first_structured).ok());
+    Eigen::MatrixXd bridge = Eigen::MatrixXd::Identity(
+        first_dense.conditioning_state.joint_error->covariance.rows(),
+        first_dense.conditioning_state.joint_error->covariance.rows());
+    Eigen::MatrixXd bridge_before_last;
+    double previous_time = first_dense.conditioning_state.stamp.time;
+    double before_last_time = previous_time;
+    const auto advance = [&](NativeOdometry* owner, const u::ImuSample& imu) {
+      owner->AddImu(imu);
+      if (owner == &dense) {
+        u::MotionIncrement motion;
+        const auto connected =
+            dense.JointErrorMotionBetween(previous_time, imu.stamp.time, &motion);
+        EXPECT_TRUE(connected.ok()) << connected.message;
+        if (!connected.ok()) return;
+        bridge_before_last = bridge;
+        before_last_time = previous_time;
+        bridge = (bridge * motion.joint_cross_covariance).eval();
+        previous_time = imu.stamp.time;
+      }
+    };
+    for (uint64_t i = 4; i <= 7; ++i)
+      for (auto* owner : {&dense, &structured})
+        advance(owner, Imu(1 + 0.01 * (i - 1), i));
+    scan = Scan(dense.internal_state(), 2, 0.27);
+    scan.points[0].time -= 0.005;
+    for (auto* owner : {&dense, &structured}) {
+      if (delayed) {
+        std::unique_ptr<NativeOdometry::LidarTask> task;
+        ASSERT_TRUE(owner->PrepareLidarTask(scan, &task).ok());
+        ASSERT_TRUE(task->Compute().ok()) << owner->joint_error_status().message;
+        for (uint64_t i = 8; i <= 9; ++i) {
+          const auto imu = Imu(1 + 0.01 * (i - 1), i);
+          advance(owner, imu);
+          task->ReplayImu(imu);
+        }
+        ASSERT_TRUE(owner->CommitLidarTask(task.get()).ok());
+      } else {
+        ASSERT_TRUE(owner->AddLidar(scan).ok());
+      }
+      const auto end = owner->state().stamp;
+      advance(owner, Imu(end.time + 0.01, end.sequence + 1));
+      ASSERT_TRUE(owner->joint_error_status().ok())
+          << owner->joint_error_status().message;
+    }
+    u::JointLidarScan retained_dense;
+    u::StructuredLidarScan retained_structured;
+    ASSERT_TRUE(dense.PrepareJointLidarScan(2, &retained_dense).ok());
+    const auto exported =
+        structured.PrepareStructuredLidarScan(2, &retained_structured);
+    ASSERT_TRUE(exported.ok()) << exported.message;
+    EXPECT_TRUE(dense.state().position.isApprox(structured.state().position, 0));
+    EXPECT_TRUE(dense.state().covariance.isApprox(structured.state().covariance, 0));
+    EXPECT_TRUE(retained_dense.conditioning_state.covariance.isApprox(
+        retained_structured.conditioning_state.state.covariance, 1e-10));
+    const auto& output =
+        retained_dense.conditioning_state.joint_error->output_jacobian;
+    u::MotionIncrement finalized;
+    ASSERT_TRUE(dense.JointErrorMotionBetween(
+        before_last_time, previous_time, &finalized).ok());
+    bridge = (bridge_before_last * finalized.joint_cross_covariance).eval();
+    ASSERT_EQ(retained_dense.point_jacobians.size(),
+              retained_structured.point_errors.size());
+    for (std::size_t i = 0; i < retained_structured.point_errors.size(); ++i) {
+      Eigen::MatrixXd cross;
+      ASSERT_TRUE(retained_structured.point_errors[i].CrossCovariance(
+          retained_structured.conditioning_state.output_error, &cross).ok());
+      const Eigen::MatrixXd expected =
+          retained_dense.point_jacobians[i] * output.transpose();
+      EXPECT_LE((cross - expected).norm(),
+                1e-10 * std::max(1.0, expected.norm()));
+      for (std::size_t j = 0; j < retained_structured.point_errors.size(); ++j) {
+        ASSERT_TRUE(retained_structured.point_errors[i].CrossCovariance(
+            retained_structured.point_errors[j], &cross).ok());
+        const Eigen::MatrixXd point_cross =
+            retained_dense.point_jacobians[i] *
+            retained_dense.point_jacobians[j].transpose();
+        EXPECT_LE((cross - point_cross).norm(),
+                  1e-10 * std::max(1.0, point_cross.norm()));
+      }
+    }
+    // The exported old scan remains queryable after its geometry/history has
+    // retired and after a delayed branch has committed.
+    Eigen::MatrixXd original_covariance;
+    ASSERT_TRUE(first_structured.point_errors[0]
+                    .Covariance(&original_covariance).ok());
+    EXPECT_TRUE(original_covariance.isApprox(
+        first_dense.point_jacobians[0] *
+            first_dense.point_jacobians[0].transpose(), 1e-10));
+    Eigen::MatrixXd retired_cross;
+    ASSERT_TRUE(first_structured.point_errors[0].CrossCovariance(
+        retained_structured.conditioning_state.output_error,
+        &retired_cross).ok());
+    EXPECT_LE((retired_cross - first_dense.point_jacobians[0] *
+                                  bridge * output.transpose()).norm(), 1e-10);
+    for (std::size_t i = 0; i < retained_structured.point_errors.size(); ++i) {
+      ASSERT_TRUE(first_structured.point_errors[0].CrossCovariance(
+          retained_structured.point_errors[i], &retired_cross).ok());
+      EXPECT_LE((retired_cross - first_dense.point_jacobians[0] *
+                                    bridge *
+                                    retained_dense.point_jacobians[i].transpose())
+                    .norm(), 1e-10);
+    }
+    u::LocalState sentinel;
+    sentinel.stamp.sequence = 999;
+    EXPECT_EQ(structured.JointErrorLookup(
+                  structured.state().stamp.time, &sentinel).reason,
+              u::Reason::CORRELATION_UNQUALIFIED);
+    EXPECT_EQ(sentinel.stamp.sequence, 999);
+  }
+}
+
+TEST(NativeOdometryPublicTest, StructuredNativeRetainsEveryLargeScanRawPoint) {
+  auto config = Config();
+  config.enable_native_joint_error = true;
+  config.enable_native_structured_error = true;
+  config.lidar_max_points = 10000;
+  NativeOdometry local(config);
+  for (uint64_t i = 1; i <= 4; ++i)
+    local.AddImu(Imu(1 + 0.01 * (i - 1), i));
+  auto scan = Scan(local.state(), 1, 0.25);
+  const auto original = scan.points;
+  scan.points.clear();
+  for (std::size_t i = 0; i < 7827; ++i)
+    scan.points.push_back(original[i % original.size()]);
+  ASSERT_EQ(local.AddLidar(scan).reason, u::Reason::GEOMETRY_UNAVAILABLE);
+  ASSERT_TRUE(local.joint_error_status().ok())
+      << local.joint_error_status().message;
+  local.AddImu(Imu(1.04, 5));
+  ASSERT_TRUE(local.joint_error_status().ok())
+      << local.joint_error_status().message;
+  u::StructuredLidarScan retained;
+  ASSERT_TRUE(local.PrepareStructuredLidarScan(1, &retained).ok());
+  ASSERT_EQ(retained.point_errors.size(), scan.points.size());
+  Eigen::MatrixXd covariance, cross;
+  ASSERT_TRUE(retained.point_errors.front().Covariance(&covariance).ok());
+  ASSERT_TRUE(retained.point_errors.front().CrossCovariance(
+      retained.point_errors.back(), &cross).ok());
+  EXPECT_TRUE(covariance.isApprox(0.0001 * Eigen::Matrix3d::Identity(), 1e-10));
+  EXPECT_TRUE(cross.isZero(1e-12));
+  EXPECT_FALSE(retained.conditioning_state.state.uncertainty_qualified);
+  u::JointLidarScan dense;
+  EXPECT_EQ(local.PrepareJointLidarScan(1, &dense).reason,
+            u::Reason::CORRELATION_UNQUALIFIED);
 }
 
 TEST(NativeOdometryPublicTest, ExportsActualJointMotionAndRejectsUnmodeledLio) {
@@ -426,6 +685,39 @@ TEST(NativeOdometryPublicTest, JointObserverRejectsCapacityWithoutChangingOdom) 
   EXPECT_EQ(sentinel.stamp.sequence, 999);
   ASSERT_TRUE(local.JointErrorLookup(1.02, &sentinel).ok());
   EXPECT_EQ(sentinel.joint_error->covariance.rows(), 21);
+}
+
+TEST(NativeOdometryPublicTest, StructuredSourceExhaustionLeavesLocalOdometryRunning) {
+  auto config = Config();
+  config.enable_lidar = false;
+  config.lidar_max_points = config.lidar_max_scans = 0;
+  config.max_history_states = 3;
+  NativeOdometry plain(config);
+  config.enable_native_joint_error = true;
+  config.enable_native_structured_error = true;
+  NativeOdometry structured(config);
+  ASSERT_TRUE(plain.ValidateConfig().ok());
+  ASSERT_TRUE(structured.ValidateConfig().ok());
+  bool exhausted = false;
+  for (uint64_t index = 1; index <= 20; ++index) {
+    const auto sample = Imu(1 + .01 * (index - 1), index);
+    plain.AddImu(sample);
+    structured.AddImu(sample);
+    EXPECT_EQ(plain.state().valid, structured.state().valid);
+    if (!plain.state().valid) continue;
+    EXPECT_TRUE(structured.state().position.isApprox(plain.state().position, 1e-12));
+    EXPECT_TRUE(structured.state().covariance.isApprox(plain.state().covariance, 1e-12));
+    EXPECT_TRUE(structured.state().orientation.isApprox(plain.state().orientation, 1e-12));
+    EXPECT_EQ(structured.state().epoch, plain.state().epoch);
+    exhausted |= structured.joint_error_status().message.find(
+                     "source capacity exhausted") != std::string::npos;
+  }
+  ASSERT_TRUE(exhausted);
+  EXPECT_EQ(structured.state().stamp.sequence, 20);
+  EXPECT_TRUE(structured.EvaluateIntegrity(structured.state().stamp.time).ok());
+  u::StructuredLocalState unavailable;
+  EXPECT_FALSE(structured.StructuredErrorLookup(
+      structured.state().stamp.time, &unavailable).ok());
 }
 
 TEST(NativeOdometryPublicTest, ExportsSharedScanAtFinalizedSyncAndDelayedFrontiers) {
