@@ -223,6 +223,51 @@ The input schemas and known-answer/add-source tests are in
 Neither successful optimization nor agreement with batch establishes physical
 accuracy, calibration, causal online operation or runtime readiness.
 
+For the existing `--causal-receive-order` mode,
+[`prepare_keyframe_graph_input.py`](test/integration/map/prepare_keyframe_graph_input.py)
+prepares `odometry.csv`, `lidar.csv` and `graph_measurements.csv` from one frozen
+native replay. Supply `--replay`, `--model`, a new `--output`, and an explicit
+`--maximum-interpolation-gap-ns`. It preserves observation timestamps and lever
+arms; interpolated keyframes become available only after their right IMU
+bracket arrives. Invalid gaps reject rather than bridging an interrupted local
+trajectory. Excluded ambiguous/out-of-support observations, original brackets
+and file hashes are recorded. The caller-supplied independent random-walk model
+and common map anchor remain diagnostic assumptions, not native covariance
+qualification. Run its focused checks with
+`python3 test/integration/map/prepare_keyframe_graph_input_test.py`.
+
+[`run_keyframe_graph_ablation.py`](test/integration/map/run_keyframe_graph_ablation.py)
+freezes a causal bundle and executable, then runs `lio/gnss/map/all` with a
+caller-supplied lag and a finite no-eviction lag covering the complete input.
+Run with `--binary bazel-bin/keyframe_graph_replay --input BUNDLE
+--output NEW_DIRECTORY --lag-s SECONDS`. It records original hashes, logs,
+same-received-prefix translation/rotation differences, admission mismatches
+and resource maxima. No-eviction controls can reach existing capacity limits;
+failure stops the runner, retains logs and does not write a success assessment.
+Runtime libraries are not pinned by this entrypoint. Common map anchors and
+the untrusted independent-keyframe scope remain unchanged. Different admissions
+must not be described as same-factor comparisons; even matching admissions do
+not imply identical robust weights or linearizations. These controls do not
+establish physical accuracy, statistical calibration or health recovery.
+The entrypoint and source-loss/outlier regressions run in the existing
+`keyframe_graph_replay_test.py` command.
+
+The causal engineering replay also accepts an explicit optional
+`temporal_model.csv` with header `decay_rate_per_s` and one positive finite
+scalar lambda (1/s). Without it the existing random-walk model is unchanged.
+With it, the declared 15D error follows a Gauss-Markov transition:
+`Phi = exp(-lambda*dt) * T`, where T transports body attitude error, and
+`Q = diag(rates) * (-expm1(-2*lambda*dt))/(2*lambda)`.
+Diffusion rates are declared in the interval's destination chart; scalar
+decay commutes with attitude transport. This is not a physical bias/ESKF
+model or a native-source independence certificate. `motion_model.csv` records
+Phi, Q, the local marginal and previous/current cross-covariance for independent
+known-answer checks. The temporal file is copied and hashed by the ablation
+entrypoint; non-causal replay rejects it rather than silently ignoring it.
+The ablation report includes source-wise pre-update NIS summaries with rejected
+available samples and isolated event timings. These are not NEES, calibration,
+full-pipeline throughput, or deadline acceptance.
+
 The IMU model requires explicit `native_imu_sample_period`: raw acceleration/
 gyro sample variances are the configured continuous-time PSDs divided by that
 period. Each original sample error is shared by both adjacent trapezoids and

@@ -8,6 +8,9 @@ import sys
 import tempfile
 import unittest
 
+from prepare_keyframe_graph_input import prepare
+from run_keyframe_graph_ablation import run as run_ablation
+
 
 HEADER = ("kind,timestamp_ns,receive_ns,sequence,px,py,pz,qx,qy,qz,qw,"
           "projection,covariance,lever_x,lever_y,lever_z,ambiguous")
@@ -33,6 +36,15 @@ def write(path, header, rows):
 def read(path):
     with path.open() as stream:
         return list(csv.DictReader(stream))
+
+
+def parse_matrix(value):
+    shape, fields = value.split(":")
+    height, width = map(int, shape.split("x"))
+    values = list(map(float, fields.split(";")))
+    if len(values) != height * width:
+        raise ValueError("invalid test matrix")
+    return [values[i * width:(i + 1) * width] for i in range(height)]
 
 
 class KeyframeGraphReplayTest(unittest.TestCase):
@@ -196,6 +208,180 @@ class KeyframeGraphReplayTest(unittest.TestCase):
             self.assertTrue(all(int(row["frontier_dimension"]) == 15 for row in events))
             self.assertEqual("0", read(output / "model_scope.csv")[0]["native_model"])
 
+    def test_prepared_native_outputs_feed_the_same_causal_graph(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            nodes, measurements = self.fixture(root)
+            offset = 1_791_882_563_000_000_001
+            for node in nodes:
+                node[0] += offset
+            for row in measurements:
+                row[1] += offset
+                row[2] += offset
+            write(root / "measurements.csv", HEADER, measurements)
+            self.causal_nodes(root, nodes)
+            control = self.run_causal(root)
+            write(root / "odometry.csv",
+                  "timestamp_ns,receive_ns,valid,px,py,pz,qx,qy,qz,qw",
+                  [[node[0], node[0], 1, *node[1:]] for node in nodes])
+            write(root / "lidar.csv", "reference_ns,bootstrap_stage",
+                  [[node[0], 0] for node in nodes])
+            write(root / "graph_measurements.csv", HEADER, measurements)
+            bundle = root / "prepared"
+            protocol = prepare(root, root / "model.csv", bundle, 1_000_000_000)
+            self.assertFalse(protocol["native_model"])
+            prepared = self.run_causal(bundle)
+            for name in ("decisions.csv", "model_scope.csv"):
+                self.assertEqual(read(control / name), read(prepared / name))
+            expected, actual = read(control / "events.csv"), read(prepared / "events.csv")
+            self.assertEqual(len(expected), len(actual))
+            for a, b in zip(expected, actual):
+                self.assertEqual({k: v for k, v in a.items() if k != "elapsed_ms"},
+                                 {k: v for k, v in b.items() if k != "elapsed_ms"})
+
+    def test_causal_ablation_records_same_prefix_controls_and_gate_divergence(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            nodes, _ = self.fixture(root)
+            self.causal_nodes(root, nodes)
+            assessment = run_ablation(self.binary, root, root / "ablation", 2)
+            for arm in ("lio", "gnss", "map", "all"):
+                row = assessment[arm]
+                self.assertTrue(row["same_admission_outcomes"])
+                self.assertEqual(8, row["control_resources"]["graph_nodes"])
+                self.assertLess(row["window_resources"]["graph_nodes"], 8)
+                self.assertLess(row["maximum_translation_difference_m"], 1e-6)
+                self.assertLess(row["maximum_rotation_difference_rad"], 1e-6)
+                self.assertEqual(0, row["control_resources"]["archived_values"])
+                self.assertEqual(23, row["window_timing"]["event_count"])
+                self.assertGreaterEqual(row["window_timing"]["event_max_ms"],
+                                        row["window_timing"]["event_p95_ms"])
+            gnss = assessment["all"]["window_innovations"]["gnss"]
+            self.assertEqual(7, gnss["available_samples"])
+            self.assertEqual(0, gnss["rejected_available_samples"])
+            rows = read(root / "measurements.csv")
+            header = ",".join(rows[0])
+            late = [list(row.values()) for row in rows]
+            for row in late:
+                if row[0] == "gnss" and int(row[1]) == nodes[1][0]:
+                    row[2] = nodes[-1][0] + 200
+            write(root / "measurements.csv", header, sorted(late, key=lambda row: int(row[2])))
+            changed = run_ablation(self.binary, root, root / "late", 2)
+            for arm in ("gnss", "all"):
+                self.assertFalse(changed[arm]["same_admission_outcomes"])
+                mismatch = changed[arm]["admission_mismatches"]
+                self.assertEqual(1, len(mismatch))
+                self.assertEqual("HISTORY_UNAVAILABLE", mismatch[0]["window_reason"])
+                self.assertEqual("1", mismatch[0]["control_accepted"])
+
+    def test_causal_source_loss_and_outlier_do_not_prevent_later_valid_factors(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            nodes, measurements = self.fixture(root)
+            self.causal_nodes(root, nodes)
+            kept = []
+            for row in measurements:
+                if row[0] == "gnss" and row[3] in (3, 4, 5):
+                    continue
+                if row[0] == "map" and row[3] == 4:
+                    row[4] = 1e6
+                kept.append(row)
+            write(root / "measurements.csv", HEADER, kept)
+            output = self.run_causal(root)
+            decisions = read(output / "decisions.csv")
+            maps = {int(row["sequence"]): row for row in decisions if row["source"] == "map"}
+            self.assertEqual("INNOVATION_REJECTED", maps[4]["reason"])
+            self.assertEqual("0", maps[4]["accepted"])
+            self.assertTrue(all(maps[i]["accepted"] == "1" for i in (5, 6, 7, 8)))
+            gnss = {int(row["sequence"]): row for row in decisions if row["source"] == "gnss"}
+            self.assertEqual({2, 6, 7, 8}, set(gnss))
+            self.assertTrue(all(row["accepted"] == "1" for row in gnss.values()))
+            self.assertEqual("0", read(output / "model_scope.csv")[0]["trusted"])
+
+    def test_causal_ablation_failure_retains_logs_without_success_assessment(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            nodes, _ = self.fixture(root)
+            self.causal_nodes(root, nodes)
+            write(root / "model.csv",
+                  "initial_variances,random_walk_variance_rates,"
+                  "innovation_gate,robust_threshold",
+                  [[matrix(15, 1, [-0.01] * 15),
+                    matrix(15, 1, [0.01] * 15), 100, 1e6]])
+            output = root / "ablation"
+            with self.assertRaises(subprocess.CalledProcessError):
+                run_ablation(self.binary, root, output, 2)
+            self.assertIn("invalid causal random-walk model",
+                          (output / "lio_window.log").read_text())
+            self.assertFalse((output / "assessment.json").exists())
+            self.assertFalse((output / "lio_control.log").exists())
+
+    def test_finite_temporal_model_matches_joint_covariance_known_answer(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            nodes, _ = self.fixture(root)
+            for i, node in enumerate(nodes):
+                node[6], node[7] = math.sin(i * 0.005), math.cos(i * 0.005)
+            self.causal_nodes(root, nodes)
+            write(root / "temporal_model.csv", "decay_rate_per_s", [[0.25]])
+            output = self.run_causal(root)
+            model = read(output / "motion_model.csv")
+            self.assertEqual(7, len(model))
+            prior = 0.01
+            for row in model:
+                decay = math.exp(-0.25)
+                noise = 0.01 * (1 - math.exp(-0.5)) / 0.5
+                variance = decay ** 2 * prior + noise
+                transition = parse_matrix(row["transition"])
+                process = parse_matrix(row["process_covariance"])
+                covariance = parse_matrix(row["state_covariance"])
+                cross = parse_matrix(row["previous_state_cross_covariance"])
+                rotation = [[math.cos(0.01), math.sin(0.01), 0],
+                            [-math.sin(0.01), math.cos(0.01), 0], [0, 0, 1]]
+                for i in range(15):
+                    for j in range(15):
+                        expected = float(i == j)
+                        if 6 <= i < 9 and 6 <= j < 9:
+                            expected = rotation[i - 6][j - 6]
+                        self.assertAlmostEqual(decay * expected, transition[i][j], places=12)
+                        self.assertAlmostEqual(noise * (i == j), process[i][j], places=12)
+                        self.assertAlmostEqual(variance * (i == j), covariance[i][j], places=12)
+                        self.assertAlmostEqual(prior * transition[j][i], cross[i][j], places=12)
+                prior = variance
+            self.assertEqual("closed-frontier-keyframe-gauss-markov",
+                             read(output / "model_scope.csv")[0]["model"])
+            self.assertEqual("0", read(output / "model_scope.csv")[0]["trusted"])
+            assessment = run_ablation(self.binary, root, root / "ablation", 2)
+            self.assertTrue(all(assessment[arm]["same_admission_outcomes"]
+                                for arm in ("lio", "gnss", "map", "all")))
+            self.assertTrue((root / "ablation/input/temporal_model.csv").is_file())
+
+    def test_temporal_model_zero_decay_limit_and_invalid_rate(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            nodes, _ = self.fixture(root)
+            self.causal_nodes(root, nodes)
+            baseline = read(self.run_causal(root) / "motion_model.csv")
+            write(root / "temporal_model.csv", "decay_rate_per_s", [[1e-15]])
+            limiting = read(self.run_causal(root, "limit") / "motion_model.csv")
+            unsupported = subprocess.run(
+                [str(self.binary), str(root), str(root / "noncausal"), "all", "2",
+                 "--experimental-independent-keyframes"],
+                capture_output=True, text=True)
+            self.assertNotEqual(0, unsupported.returncode)
+            self.assertIn("requires causal", unsupported.stderr)
+            self.assertFalse((root / "noncausal").exists())
+            for a, b in zip(baseline, limiting):
+                for key in ("transition", "process_covariance", "state_covariance",
+                            "previous_state_cross_covariance"):
+                    for x, y in zip(parse_matrix(a[key]), parse_matrix(b[key])):
+                        for v, w in zip(x, y):
+                            self.assertAlmostEqual(v, w, places=12)
+            write(root / "temporal_model.csv", "decay_rate_per_s", [[-1]])
+            with self.assertRaises(subprocess.CalledProcessError):
+                run_ablation(self.binary, root, root / "invalid", 2)
+            self.assertFalse((root / "invalid/assessment.json").exists())
+
     def test_causal_late_missing_and_retired_nodes_are_not_retargeted(self):
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
             root = Path(temporary)
@@ -245,6 +431,15 @@ class KeyframeGraphReplayTest(unittest.TestCase):
             self.assertTrue(all(row["frontier_rows"] == "15" for row in events))
             first = max(int(row["factor_slots"]) for row in events[100:320])
             second = max(int(row["factor_slots"]) for row in events[320:])
+            self.assertLessEqual(second, first + 2)
+            write(root / "temporal_model.csv", "decay_rate_per_s", [[0.25]])
+            temporal = read(self.run_causal(root, "temporal", 0.3) / "events.csv")
+            self.assertEqual(len(events), len(temporal))
+            self.assertTrue(all(int(row["graph_nodes"]) <= 5 for row in temporal))
+            self.assertTrue(all(row["frontier_dimension"] == "15" for row in temporal))
+            self.assertTrue(all(row["archived_values"] == "0" for row in temporal))
+            first = max(int(row["factor_slots"]) for row in temporal[100:320])
+            second = max(int(row["factor_slots"]) for row in temporal[320:])
             self.assertLessEqual(second, first + 2)
 
     def test_horizontal_fixes_preserve_feasibility_in_weak_vertical_direction(self):

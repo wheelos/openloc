@@ -76,6 +76,9 @@ void WritePose(std::ostream& out, const Eigen::Isometry3d& pose) {
 void Run(const std::filesystem::path& input,
          const std::filesystem::path& output, const std::string& arm,
          double lag_seconds) {
+  if (std::filesystem::exists(input / "temporal_model.csv"))
+    throw std::runtime_error(
+        "temporal model requires causal receive-order mode");
   if (arm != "lio" && arm != "gnss" && arm != "map" && arm != "all")
     throw std::runtime_error("invalid source arm");
   const auto nodes = csv::ReadRows(
@@ -391,6 +394,16 @@ void RunCausal(const std::filesystem::path& input,
       rates.rows() != 15 || rates.cols() != 1 ||
       (initial.array() <= 0).any() || (rates.array() <= 0).any())
     throw std::runtime_error("invalid causal random-walk model");
+  double decay_rate = 0.0;
+  if (std::filesystem::exists(input / "temporal_model.csv")) {
+    const auto temporal = csv::ReadRows((input / "temporal_model.csv").string(),
+                                        "decay_rate_per_s", 1);
+    if (temporal.size() != 1)
+      throw std::runtime_error("one explicit temporal model required");
+    decay_rate = csv::Number(temporal[0][0]);
+    if (decay_rate <= 0)
+      throw std::runtime_error("temporal decay rate must be positive");
+  }
   CausalRows nodes(input / "nodes.csv",
       "timestamp_ns,px,py,pz,qx,qy,qz,qw,receive_ns", 9, 8);
   CausalRows observations(input / "measurements.csv",
@@ -414,9 +427,17 @@ void RunCausal(const std::filesystem::path& input,
     throw std::runtime_error("causal output must be new");
   std::ofstream scope(output / "model_scope.csv");
   scope << "model,experimental_only,native_model,source_correlation_unmodeled,"
-           "independent_accuracy_verified,trusted,receive_time_order,evaluation_archive\n"
-           "closed-frontier-keyframe-random-walk,1,0,1,0,0,1,0\n";
+           "independent_accuracy_verified,trusted,receive_time_order,"
+           "evaluation_archive\n"
+        << (decay_rate > 0 ? "closed-frontier-keyframe-gauss-markov"
+                           : "closed-frontier-keyframe-random-walk")
+        << ",1,0,1,0,0,1,0\n";
   std::ofstream events(output / "events.csv"), decisions(output / "decisions.csv");
+  std::ofstream motion_models(output / "motion_model.csv");
+  motion_models
+      << std::setprecision(17)
+      << "timestamp_ns,dt_s,decay_rate_per_s,transition,process_covariance,"
+         "state_covariance,previous_state_cross_covariance\n";
   events << std::setprecision(17)
          << "receive_ns,kind,latest_measurement_ns,initialized,px,py,pz,qx,qy,qz,qw,"
             "frontier_rows,frontier_dimension,buffered_nodes,graph_nodes,"
@@ -451,15 +472,37 @@ void RunCausal(const std::filesystem::path& input,
             state.orientation.toRotationMatrix().transpose() *
             previous.orientation.toRotationMatrix();
         const double dt = (stamp - last_stamp) * 1e-9;
+        // Diffusion rates are declared in the interval's destination chart.
+        // Scalar decay commutes with the attitude chart transport.
+        const double decay = std::exp(-decay_rate * dt);
+        transition *= decay;
+        const double noise_time =
+            decay_rate > 0
+                ? -std::expm1(-2 * decay_rate * dt) / (2 * decay_rate)
+                : dt;
+        const Eigen::VectorXd process_variances = noise_time * rates.col(0);
+        if (!process_variances.allFinite() ||
+            (process_variances.array() <= 0).any())
+          throw std::runtime_error(
+              "temporal process variance outside numeric support");
         Require(frontier.Linear("previous", {{u::Matrix15d::Identity(), "state"}}));
-        Require(frontier.Independent("noise",
-            (dt * rates.col(0)).cwiseSqrt().asDiagonal()));
+        Require(frontier.Independent(
+            "noise", process_variances.cwiseSqrt().asDiagonal()));
         Require(frontier.Linear("state", {{transition, "previous"},
                                           {u::Matrix15d::Identity(), "noise"}}));
         Eigen::MatrixXd covariance, cross;
         Require(frontier.CrossCovariance("state", "state", &covariance));
         state.covariance = covariance;
         Require(frontier.CrossCovariance("previous", "state", &cross));
+        motion_models << stamp << ',' << dt << ',' << decay_rate << ',';
+        WriteMatrix(motion_models, transition);
+        motion_models << ',';
+        WriteMatrix(motion_models, process_variances.asDiagonal());
+        motion_models << ',';
+        WriteMatrix(motion_models, covariance);
+        motion_models << ',';
+        WriteMatrix(motion_models, cross);
+        motion_models << '\n';
         Require(u::ComputeMotionIncrement(
             previous, state, cross,
             {{"imu", previous.stamp.sequence}, {"imu", state.stamp.sequence},
@@ -542,7 +585,7 @@ void RunCausal(const std::filesystem::path& input,
                   std::chrono::steady_clock::now() - started).count() << '\n';
     events.flush();
   }
-  for (auto* stream : {&scope, &events, &decisions}) {
+  for (auto* stream : {&scope, &events, &decisions, &motion_models}) {
     stream->flush();
     if (!*stream) throw std::runtime_error("incomplete causal output");
   }
