@@ -19,8 +19,7 @@ namespace unified {
 namespace {
 
 bool ContainsBox(const Eigen::Vector3d& outer_min,
-                 const Eigen::Vector3d& outer_max,
-                 const Region3d& region) {
+                 const Eigen::Vector3d& outer_max, const Region3d& region) {
   return !region.id.empty() && region.minimum.allFinite() &&
          region.maximum.allFinite() &&
          (region.maximum.array() > region.minimum.array()).all() &&
@@ -30,12 +29,12 @@ bool ContainsBox(const Eigen::Vector3d& outer_min,
 
 bool Overlaps(const Region3d& a, const Region3d& b) {
   return ((a.minimum.array() < b.maximum.array()) &&
-          (b.minimum.array() < a.maximum.array())).all();
+          (b.minimum.array() < a.maximum.array()))
+      .all();
 }
 
 bool CoversCell(const Eigen::Vector3d& cell_minimum,
-                const Eigen::Vector3d& cell_maximum,
-                const Region3d& region) {
+                const Eigen::Vector3d& cell_maximum, const Region3d& region) {
   return (cell_minimum.array() >= region.minimum.array()).all() &&
          (cell_maximum.array() <= region.maximum.array()).all();
 }
@@ -47,9 +46,9 @@ bool FieldIdentity::operator==(const FieldIdentity& other) const {
          frame == other.frame && calibration == other.calibration;
 }
 
-Result LikelihoodField::Build(
-    const pcl::PointCloud<pcl::PointXYZ>& map, const FieldConfig& config,
-    std::shared_ptr<const LikelihoodField>* output) {
+Result LikelihoodField::Build(const pcl::PointCloud<pcl::PointXYZ>& map,
+                              const FieldConfig& config,
+                              std::shared_ptr<const LikelihoodField>* output) {
   if (output == nullptr || config.identity.map_id.empty() ||
       config.identity.version.empty() || config.identity.frame.empty() ||
       config.identity.calibration.empty() || !config.minimum.allFinite() ||
@@ -61,10 +60,10 @@ Result LikelihoodField::Build(
       !std::isfinite(config.maximum_distance) ||
       config.maximum_distance <= 0.0 || config.maximum_distance > 1e6 ||
       config.maximum_cells == 0 || config.maximum_cells > 4000000 ||
-      config.maximum_map_points == 0 ||
-      config.maximum_map_points > 2000000 ||
+      config.maximum_map_points == 0 || config.maximum_map_points > 2000000 ||
       config.support_regions.empty() || config.support_regions.size() > 4096 ||
-      config.observed_regions.empty() || config.observed_regions.size() > 4096) {
+      config.observed_regions.empty() ||
+      config.observed_regions.size() > 4096) {
     return {Reason::CONFIG_INVALID, "Invalid bounded likelihood field policy"};
   }
   std::set<std::string> support_ids;
@@ -72,11 +71,13 @@ Result LikelihoodField::Build(
     const auto& region = config.support_regions[i];
     if (!ContainsBox(config.minimum, config.maximum, region) ||
         !support_ids.insert(region.id).second) {
-      return {Reason::CONFIG_INVALID, "Invalid or duplicate search support region"};
+      return {Reason::CONFIG_INVALID,
+              "Invalid or duplicate search support region"};
     }
     for (size_t j = 0; j < i; ++j) {
       if (Overlaps(region, config.support_regions[j])) {
-        return {Reason::CONFIG_INVALID, "Search support regions must not overlap"};
+        return {Reason::CONFIG_INVALID,
+                "Search support regions must not overlap"};
       }
     }
   }
@@ -84,7 +85,8 @@ Result LikelihoodField::Build(
   for (const auto& region : config.observed_regions) {
     if (!ContainsBox(config.minimum, config.maximum, region) ||
         !observed_ids.insert(region.id).second) {
-      return {Reason::CONFIG_INVALID, "Invalid or duplicate observed map region"};
+      return {Reason::CONFIG_INVALID,
+              "Invalid or duplicate observed map region"};
     }
   }
   if (map.empty() || map.size() > config.maximum_map_points) {
@@ -124,23 +126,26 @@ Result LikelihoodField::Build(
   for (size_t z = 0; z < next->dimensions_[2]; ++z) {
     for (size_t y = 0; y < next->dimensions_[1]; ++y) {
       for (size_t x = 0; x < next->dimensions_[0]; ++x) {
-        const Eigen::Vector3d center = config.minimum +
-            config.resolution *
-                Eigen::Vector3d(x + 0.5, y + 0.5, z + 0.5);
+        const Eigen::Vector3d center =
+            config.minimum +
+            config.resolution * Eigen::Vector3d(x + 0.5, y + 0.5, z + 0.5);
         const Eigen::Vector3d cell_minimum =
             config.minimum + config.resolution * Eigen::Vector3d(x, y, z);
-        const Eigen::Vector3d cell_maximum = cell_minimum +
+        const Eigen::Vector3d cell_maximum =
+            cell_minimum +
             (config.maximum - cell_minimum)
                 .cwiseMin(Eigen::Vector3d::Constant(config.resolution));
         const pcl::PointXYZ query(center.x(), center.y(), center.z());
         if (tree.nearestKSearch(query, 1, indices, squared) != 1 ||
             !std::isfinite(squared[0]) || squared[0] < 0.0f) {
-          return {Reason::MAP_NOT_READY, "Distance field neighbor query failed"};
+          return {Reason::MAP_NOT_READY,
+                  "Distance field neighbor query failed"};
         }
         const size_t index =
             (z * next->dimensions_[1] + y) * next->dimensions_[0] + x;
-        next->distances_[index] = static_cast<float>(std::min(
-            config.maximum_distance, std::sqrt(static_cast<double>(squared[0]))));
+        next->distances_[index] = static_cast<float>(
+            std::min(config.maximum_distance,
+                     std::sqrt(static_cast<double>(squared[0]))));
         next->observed_[index] = std::any_of(
             config.observed_regions.begin(), config.observed_regions.end(),
             [&cell_minimum, &cell_maximum](const Region3d& region) {
@@ -160,19 +165,23 @@ bool LikelihoodField::Lookup(const Eigen::Vector3d& point,
 
 FieldCellStatus LikelihoodField::Query(const Eigen::Vector3d& point,
                                        double* distance) const {
-  if (distance == nullptr || distances_.empty() || !point.allFinite() ||
-      (point.array() < config_.minimum.array()).any() ||
-      (point.array() >= config_.maximum.array()).any()) {
+  if (distance == nullptr || distances_.empty()) {
     return FieldCellStatus::OUTSIDE;
   }
-  const Eigen::Vector3d cell =
-      ((point - config_.minimum) / config_.resolution).array().floor();
-  std::array<size_t, 3> index;
+  std::array<size_t, 3> index{};
   for (int axis = 0; axis < 3; ++axis) {
-    index[axis] = static_cast<size_t>(cell(axis));
-    if (index[axis] >= dimensions_[axis]) {
+    const double coordinate = point(axis);
+    const double minimum = config_.minimum(axis);
+    if (!std::isfinite(coordinate) || coordinate < minimum ||
+        coordinate >= config_.maximum(axis)) {
       return FieldCellStatus::OUTSIDE;
     }
+    const double cell = (coordinate - minimum) / config_.resolution;
+    if (!std::isfinite(cell) || cell < 0.0 ||
+        cell >= static_cast<double>(dimensions_[axis])) {
+      return FieldCellStatus::OUTSIDE;
+    }
+    index[axis] = static_cast<size_t>(cell);
   }
   const size_t cell_index =
       (index[2] * dimensions_[1] + index[1]) * dimensions_[0] + index[0];

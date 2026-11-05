@@ -974,7 +974,10 @@ cc_binary(
     name = "horizontal_alignment_dataset_replay",
     testonly = True,
     srcs = ["test/integration/map/horizontal_alignment_replay.cc"],
-    deps = [":online_alignment_smoother"],
+    deps = [
+        ":gnss_alignment_recovery",
+        ":online_alignment_smoother",
+    ],
 )
 
 cc_binary(

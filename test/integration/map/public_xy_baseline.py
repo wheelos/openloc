@@ -150,8 +150,7 @@ def validate(package, reference, output, container):
                    "candidate binary differs from frozen reference")
     source_files = [Path(__file__).resolve(), Path(replay.__file__).resolve(),
                     package / "test/integration/map/public_xy_baseline_test.py",
-                    package / "MODULE.bazel", package / "MODULE.bazel.lock",
-                    package / ".bazelrc"]
+                    package / "MODULE.bazel", package / "BUILD"]
     source_pins = {str(path): replay.digest(path) for path in source_files}
     for path in source_files:
         destination = output / "verifier_source" / path.relative_to(package)

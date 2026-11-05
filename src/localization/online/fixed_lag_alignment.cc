@@ -141,11 +141,6 @@ class FixedLagGlobalAlignment::Impl {
       return Status(StatusCode::kInvalidArgument,
                     "joint error dimension exceeds configured graph capacity");
     }
-    const auto joint = u::ValidateJointLocalError(local);
-    if (!joint.ok()) {
-      owner_->Invalidate(joint.reason);
-      return Convert(joint);
-    }
     const auto* previous = owner_->latest_local();
     if (previous != nullptr &&
         (local.stamp.time <= previous->stamp.time ||
@@ -182,9 +177,6 @@ class FixedLagGlobalAlignment::Impl {
         return RejectMotion(odometry, local, computed);
       }
       motion.joint_cross_covariance = connection->joint_cross_covariance;
-      const auto joint_motion = u::ValidateJointMotion(*previous, local, motion);
-      if (!joint_motion.ok())
-        return RejectMotion(odometry, local, joint_motion);
     }
     status = Convert(owner_->AddLocal(local, connection ? &motion : nullptr));
     RetainOdometry(odometry, local);

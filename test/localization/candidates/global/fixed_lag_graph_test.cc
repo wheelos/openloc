@@ -172,6 +172,18 @@ MotionIncrement JointMotion(const LocalState& start, const LocalState& end) {
   return motion;
 }
 
+LocalState HiddenBasisLocal(uint64_t index, Eigen::Index dimension) {
+  auto state = Local(index);
+  JointLocalError model;
+  model.covariance = Eigen::MatrixXd::Identity(dimension, dimension) * 0.1;
+  model.output_jacobian = Eigen::MatrixXd::Zero(15, dimension);
+  model.output_jacobian.leftCols<15>().setIdentity();
+  state.covariance = model.output_jacobian * model.covariance *
+                     model.output_jacobian.transpose();
+  state.joint_error = std::move(model);
+  return state;
+}
+
 TEST(FixedLagGraphTest, TurningTrajectoryRetainsNonlinearConstraintsAcrossLag) {
   for (const bool shared : {false, true}) {
     FixedLagGraph graph(Policy());
@@ -224,6 +236,32 @@ TEST(FixedLagGraphTest, TurningTrajectoryRetainsNonlinearConstraintsAcrossLag) {
       previous = local;
     }
   }
+}
+
+TEST(FixedLagGraphTest, JointMotionRejectsIndefiniteConditionalNoise) {
+  const auto start = HiddenBasisLocal(0, 17);
+  const auto end = HiddenBasisLocal(1, 17);
+  MotionIncrement motion;
+  ASSERT_TRUE(ComputeMotionIncrement(
+      start, end, Matrix15d::Identity() * 0.1,
+      {{"imu", start.stamp.sequence}, {"imu", end.stamp.sequence}},
+      &motion).ok());
+  motion.joint_cross_covariance =
+      Eigen::MatrixXd::Identity(17, 17) * 0.1;
+  EXPECT_TRUE(ValidateJointMotion(start, end, motion).ok());
+
+  motion.joint_cross_covariance(16, 16) += 1e-12;
+  EXPECT_EQ(Reason::INVALID_INPUT,
+            ValidateJointMotion(start, end, motion).reason);
+
+  motion.joint_cross_covariance =
+      Eigen::MatrixXd::Identity(17, 17) * 0.1;
+  Eigen::Matrix2d hidden_cross;
+  hidden_cross << 1, -1, -1, 1;
+  motion.joint_cross_covariance.bottomRightCorner<2, 2>() =
+      0.1 / std::sqrt(2.0) * hidden_cross;
+  EXPECT_EQ(Reason::INVALID_INPUT,
+            ValidateJointMotion(start, end, motion).reason);
 }
 
 TEST(FixedLagGraphTest, HiddenSharedMemorySurvivesDimensionChangesAndLag) {

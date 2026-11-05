@@ -218,9 +218,15 @@ Result GlobalAlignment::AddLocal(const LocalState& local,
           Reason::HISTORY_UNAVAILABLE,
           "Motion gap revoked global alignment; fresh local history retained"};
     }
-    const auto joint = ValidateJointMotion(history_.back(), local, *motion);
+    const auto joint = ValidateJointMotionWithValidatedLocalErrors(
+        history_.back(), local, *motion);
     if (!joint.ok()) {
       Invalidate(joint.reason);
+      history_.clear();
+      motion_history_.clear();
+      process_reference_in_odom_ = local.position;
+      history_.push_back(local);
+      Invalidate(Reason::HISTORY_UNAVAILABLE);
       return joint;
     }
     motion_history_[local.stamp.time] = *motion;

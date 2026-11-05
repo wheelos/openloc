@@ -8,8 +8,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iomanip>
 #include <limits>
 #include <set>
+#include <sstream>
 #include <utility>
 
 #include "Eigen/Cholesky"
@@ -178,6 +180,12 @@ Result ValidateJointMotion(const LocalState& start, const LocalState& end,
   auto valid = ValidateJointLocalError(start);
   if (valid.ok()) valid = ValidateJointLocalError(end);
   if (!valid.ok()) return valid;
+  return ValidateJointMotionWithValidatedLocalErrors(start, end, motion);
+}
+
+Result ValidateJointMotionWithValidatedLocalErrors(
+    const LocalState& start, const LocalState& end,
+    const MotionIncrement& motion) {
   if (!start.joint_error && !end.joint_error) {
     if (motion.joint_cross_covariance.size() != 0)
       return {Reason::INVALID_INPUT, "Unexpected joint motion without joint states"};
@@ -210,8 +218,14 @@ Result ValidateJointMotion(const LocalState& start, const LocalState& end,
     return {Reason::INVALID_INPUT, "Joint motion decomposition failed"};
   const double tolerance = 64 * std::numeric_limits<double>::epsilon() *
       std::max(1.0, spectrum.eigenvalues().cwiseAbs().maxCoeff());
-  if (spectrum.eigenvalues().minCoeff() < -tolerance)
-    return {Reason::INVALID_INPUT, "Joint motion conditional noise is not PSD"};
+  const double minimum_eigenvalue = spectrum.eigenvalues().minCoeff();
+  if (minimum_eigenvalue < -tolerance) {
+    std::ostringstream message;
+    message << std::setprecision(17)
+            << "Joint motion conditional noise is not PSD (minimum eigenvalue "
+            << minimum_eigenvalue << ", tolerance " << tolerance << ")";
+    return {Reason::INVALID_INPUT, message.str()};
+  }
   return {};
 }
 

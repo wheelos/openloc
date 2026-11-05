@@ -30,6 +30,7 @@ struct DiagnosticRegionConfig {
 
 struct DiagnosticRegionResult {
   std::string status;
+  std::string message;
   unified::Reason reason = unified::Reason::NONE;
   size_t modes = 0;
   size_t verified_modes = 0;
@@ -46,14 +47,15 @@ struct DiagnosticRegionResult {
 class DiagnosticRegionalSearch {
  public:
   DiagnosticRegionalSearch(const DiagnosticRegionConfig& config,
-                           const MapMetadata& metadata, const PointCloud& cloud);
+                           const MapMetadata& metadata,
+                           const PointCloud& cloud);
   ~DiagnosticRegionalSearch();
   DiagnosticRegionalSearch(const DiagnosticRegionalSearch&) = delete;
   DiagnosticRegionalSearch& operator=(const DiagnosticRegionalSearch&) = delete;
   DiagnosticRegionResult Observe(const unified::LocalState& local,
-                                uint64_t scan_sequence,
-                                const ScanToMapRequest& request,
-                                ScanToMapLocalizer* matcher);
+                                 uint64_t scan_sequence,
+                                 const ScanToMapRequest& request,
+                                 ScanToMapLocalizer* matcher);
   void Restart();
 
  private:

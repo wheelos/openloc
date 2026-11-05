@@ -42,6 +42,10 @@ Result ComputeMotionIncrement(const LocalState& start, const LocalState& end,
 Eigen::MatrixXd JointErrorCovariance(const LocalState& state);
 Eigen::MatrixXd JointOutputJacobian(const LocalState& state);
 Result ValidateJointLocalError(const LocalState& state);
+// Both endpoint error states must have passed ValidateJointLocalError.
+Result ValidateJointMotionWithValidatedLocalErrors(
+    const LocalState& start, const LocalState& end,
+    const MotionIncrement& motion);
 Result ValidateJointMotion(const LocalState& start, const LocalState& end,
                            const MotionIncrement& motion);
 
